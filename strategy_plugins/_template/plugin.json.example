@@ -1,0 +1,6 @@
+{
+  "strategy_id": "my_strategy_v1",
+  "api_version": "1",
+  "entrypoint": "strategy.py:create_strategy",
+  "enabled": true
+}

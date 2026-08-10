@@ -1,0 +1,15 @@
+tdx-mock/
+new_tdx64/
+*.zip
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.venv/
+data/
+strategy_v1/outputs/
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts

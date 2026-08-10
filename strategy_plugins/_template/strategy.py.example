@@ -1,0 +1,64 @@
+from __future__ import annotations
+
+from typing import Any
+
+import pandas as pd
+
+from research_platform.models import (
+    DataRequirement,
+    RuntimeAdapter,
+    StrategyMetadata,
+    StrategyScanResult,
+)
+
+
+class MyStrategy:
+    metadata = StrategyMetadata(
+        strategy_id="my_strategy_v1",
+        version="1.0.0",
+        name="My Strategy V1",
+        description="Replace with a stable, testable strategy description.",
+        frequency="1d",
+        requires_approval=True,
+        runtime_adapter=RuntimeAdapter.GENERIC_DAILY,
+        data_requirements=(
+            DataRequirement(
+                "bars",
+                "1d",
+                "front",
+                120,
+                True,
+                ("Open", "High", "Low", "Close", "Volume", "Amount"),
+            ),
+            DataRequirement(
+                "bars",
+                "1d",
+                "none",
+                120,
+                True,
+                ("Open", "Close"),
+            ),
+        ),
+    )
+
+    def scan(
+        self,
+        *,
+        run_id: str,
+        asof: pd.Timestamp,
+        front_bars: dict[str, pd.DataFrame],
+        raw_bars: dict[str, pd.DataFrame],
+        positions: list[dict[str, Any]],
+        **context: Any,
+    ) -> StrategyScanResult:
+        del run_id, front_bars, raw_bars, positions, context
+        return StrategyScanResult(
+            strategy=self.metadata,
+            signals=(),
+            candidates=(),
+            state={"asof": pd.Timestamp(asof).date().isoformat()},
+        )
+
+
+def create_strategy() -> MyStrategy:
+    return MyStrategy()
