@@ -70,6 +70,11 @@ def build_parser() -> argparse.ArgumentParser:
     backtest.add_argument("--refresh-sectors", action="store_true")
     backtest.add_argument("--refresh-data", action="store_true")
     backtest.add_argument(
+        "--playbooks",
+        default="",
+        help="Comma-separated Course49 playbook ids for research backtests",
+    )
+    backtest.add_argument(
         "--execution-cost-multiplier",
         type=float,
         default=1.0,
@@ -159,6 +164,9 @@ def main() -> int:
                 sample_seed=args.sample_seed,
                 execution_cost_multiplier=args.execution_cost_multiplier,
                 refresh_data=args.refresh_data,
+                playbook_ids=[
+                    item.strip() for item in args.playbooks.split(",") if item.strip()
+                ],
             )
         )
     elif args.command == "daily-research":

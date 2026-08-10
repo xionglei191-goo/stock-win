@@ -88,6 +88,9 @@ class StrategyMetadata:
     backtest_enabled: bool = True
     runtime_adapter: RuntimeAdapter = RuntimeAdapter.GENERIC_DAILY
     plugin_api_version: str = "1"
+    framework_id: str = ""
+    policy_version: str = ""
+    archived: bool = False
 
 
 @dataclass(frozen=True)
@@ -108,6 +111,9 @@ class PlatformSignal:
     reason_codes: tuple[str, ...]
     evidence: dict[str, Any] = field(default_factory=dict)
     signal_id: str = field(default_factory=lambda: uuid4().hex)
+    framework_id: str = ""
+    playbook_id: str = ""
+    policy_version: str = ""
 
     def as_record(self) -> dict[str, Any]:
         record = asdict(self)

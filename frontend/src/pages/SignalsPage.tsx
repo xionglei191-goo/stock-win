@@ -32,6 +32,13 @@ const modeNames: Record<string, string> = {
   BROAD_RISK_ON_LOW_CROWDING_RESEAL: '全面风险偏好低拥挤回封',
 }
 
+const playbookNames: Record<string, string> = {
+  recovery_ignition: '修复启动',
+  ferment_second_board: '发酵二板',
+  acceleration_core_relay: '加速核心接力',
+  holding_management: '持仓管理',
+}
+
 const reasonNames: Record<string, string> = {
   SECOND_BOARD_CAPITAL_CONFIRMED: '二板资金确认', SECOND_BOARD_LEADER: '二板龙头',
   SECOND_BOARD_QUALITY_CONFIRMED: '二板封板确认', EARLY_SEAL: '早盘封板', SEALED_ONCE: '一次封板',
@@ -60,6 +67,7 @@ const decisionReasons = [
 ]
 
 const strategyNames: Record<string, string> = {
+  course49_system: '49课体系',
   course49_v10: '49课 V10（留出目标否决）',
   course49_v11: '49课 V11（历史稳健性否决）',
   chan_v1: '缠论',
@@ -231,7 +239,7 @@ export default function SignalsPage() {
     </div>} />
     {signals.isLoading ? <LoadingState /> : signals.error ? <ErrorState error={signals.error} /> : !signals.data?.length ? <EmptyState /> : <section className="table-section table-section--flush"><div className="table-wrap"><table className="signal-table">
       <thead><tr><th>时间</th><th>策略</th><th>代码</th><th>方向</th><th className="numeric">强度</th><th>市场周期</th><th>题材与角色</th><th>龙虎榜资金</th><th>封板行为</th><th>触发依据</th><th>状态</th><th className="actions-column">决策</th></tr></thead>
-      <tbody>{signals.data.map((signal) => <tr key={signal.signal_id}><td>{time(signal.generated_at)}</td><td>{strategyNames[signal.strategy_id] ?? signal.strategy_id}</td><td className="symbol">{signal.code}</td><td className={signal.side === 'BUY' ? 'positive-text' : 'negative-text'}>{signal.side}</td><td className="numeric">{percent(signal.strength)}</td><SignalContext signal={signal} /><td><div className="reason-list">{signal.reason_codes.map((reason) => <span key={reason}>{reasonNames[reason] ?? reason}</span>)}</div></td><td><StatusBadge status={signal.status} /></td><td className="actions-column">{signal.status === 'PROPOSED' && <div className="icon-actions"><button className="icon-button icon-button--approve" title="批准候选" onClick={() => setSelected({ signal, decision: 'APPROVED' })}><Check size={17} /></button><button className="icon-button" title="拒绝候选" onClick={() => setSelected({ signal, decision: 'REJECTED' })}><X size={17} /></button></div>}</td></tr>)}</tbody>
+      <tbody>{signals.data.map((signal) => <tr key={signal.signal_id}><td>{time(signal.generated_at)}</td><td>{strategyNames[signal.strategy_id] ?? signal.strategy_id}{signal.playbook_id && <small className="subline">{playbookNames[signal.playbook_id] ?? signal.playbook_id}</small>}</td><td className="symbol">{signal.code}</td><td className={signal.side === 'BUY' ? 'positive-text' : 'negative-text'}>{signal.side}</td><td className="numeric">{percent(signal.strength)}</td><SignalContext signal={signal} /><td><div className="reason-list">{signal.reason_codes.map((reason) => <span key={reason}>{reasonNames[reason] ?? reason}</span>)}</div></td><td><StatusBadge status={signal.status} /></td><td className="actions-column">{signal.status === 'PROPOSED' && <div className="icon-actions"><button className="icon-button icon-button--approve" title="批准候选" onClick={() => setSelected({ signal, decision: 'APPROVED' })}><Check size={17} /></button><button className="icon-button" title="拒绝候选" onClick={() => setSelected({ signal, decision: 'REJECTED' })}><X size={17} /></button></div>}</td></tr>)}</tbody>
     </table></div></section>}
     {decision.error && <div className="toast toast--error">{decision.error.message}</div>}
     {selected && <DecisionDialog key={`${selected.signal.signal_id}-${selected.decision}`} signal={selected.signal} decision={selected.decision} pending={decision.isPending} onClose={() => setSelected(null)} onConfirm={(payload) => decision.mutate({ id: selected.signal.signal_id, payload })} />}

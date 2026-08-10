@@ -29,7 +29,7 @@
 
 ## 风格基准与板块成分
 
-V2 优先读取 `000300.CSI`、`000852.CSI` 和 `399006.SZ`，沪深300/中证1000允许 `.SH` 兼容回退。`benchmark_actual_codes` 必须记录实际代码；关键大小盘基准缺失时不得产生新仓。
+Course49 体系优先读取 `000300.CSI`、`000852.CSI` 和 `399006.SZ`，沪深300/中证1000允许 `.SH` 兼容回退。`benchmark_actual_codes` 必须记录实际代码；关键大小盘基准缺失时不得产生新仓。
 
 同步、扫描和回测均写入 `sector_membership.parquet` 及内容哈希。回测优先使用交易日前最近快照；本地尚无历史快照时使用当前通达信成员，并标记 `sector_membership_quality=LIMITED`、`source=current_fallback`。该标记是长期题材回测的强制风险提示。
 
@@ -46,15 +46,18 @@ V2 优先读取 `000300.CSI`、`000852.CSI` 和 `399006.SZ`，沪深300/中证10
 - SQLite `data/research.db`：策略、运行状态、信号、人工决策、订单、成交、持仓、权益和回测摘要。
 - Parquet `data/snapshots/`：研究运行实际使用的标准化行情、市场生态、涨停行为和龙虎榜事件快照。
 - `snapshots` 表：快照路径、来源、创建时间和参数，建立运行到数据的追溯链。
+- `strategy_frameworks/strategy_playbooks`：体系与剧本元数据、生命周期和数据需求。
 - `backtest_states`：逐交易日市场周期、风格、适用度、模式和完整状态证据。
+- `backtest_playbook_states`：每日准入、候选、路由、预算、阻断原因和漏斗。
+- `snapshot_dependencies`：行情快照对独立事件片段的不可变引用和清理保护。
 - `strategy_runtime_states`：V2 模拟持仓的连续弱势计数、最高收盘价和原题材。
 - `order_group_intents/legs/decisions`：多腿研究意图、交易腿及人工审批审计。
 - `paper_group_positions/fills`：多腿模拟持仓和原子成交，包含多空方向与入场费用。
 - `research_briefs/ai_signal_reviews`：模型、提示词、输入哈希、结构化简报、候选意见及证据引用。
 - `signal_decisions/decision_outcomes`：人工理由、置信度、模型一致性、实际模拟结果与拒绝信号反事实。
 - `strategy_experiments/experiment_artifacts`：生成源码哈希、隔离校验、回测比较、压力结果和晋级记录。
-- `backtest_trades.evidence/group_key/leg_id`：成交对应的不可变证据和多腿归属。
-- `data_cache_entries`：缓存键、类型、快照、数据时点、覆盖范围、状态、大小和最近访问时间。Schema 版本为 V8。
+- `backtest_trades.evidence/group_key/leg_id/framework_id/playbook_id/policy_version`：成交对应的不可变证据、多腿归属和剧本来源。
+- `data_cache_entries`：缓存键、类型、快照、数据时点、覆盖范围、状态、大小和最近访问时间。Schema 版本为 V9。
 
 ## 模型上下文契约
 

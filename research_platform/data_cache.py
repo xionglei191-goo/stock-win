@@ -385,6 +385,7 @@ class DataCacheManager:
             FROM data_cache_entries GROUP BY entry_type, status"""
         )
         protected = self._protected_snapshot_ids()
+        protected_dependencies = self._protected_dependency_ids()
         protected_bytes = sum(
             directory_size(self.config.snapshot_dir / snapshot_id)
             for snapshot_id in protected
@@ -395,6 +396,7 @@ class DataCacheManager:
             "size_bytes": total,
             "limit_bytes": self.config.performance.disk_cache_bytes,
             "protected_snapshots": len(protected),
+            "protected_dependencies": len(protected_dependencies),
             "protected_bytes": protected_bytes,
             "over_limit_protected": protected_bytes > self.config.performance.disk_cache_bytes,
             "memory": self.memory.status(),
@@ -412,6 +414,7 @@ class DataCacheManager:
         )
         total = sum(int(row.get("size_bytes", 0) or 0) for row in rows)
         protected = self._protected_snapshot_ids()
+        protected_dependencies = self._protected_dependency_ids()
         removed: list[str] = []
         for row in rows:
             failed = str(row.get("status") or "") == "FAILED"
@@ -420,6 +423,11 @@ class DataCacheManager:
             entry_type = str(row.get("entry_type") or "")
             snapshot_id = str(row.get("snapshot_id") or "")
             if entry_type == "SNAPSHOT" and snapshot_id in protected:
+                continue
+            if {
+                str(row.get("cache_key") or ""),
+                snapshot_id,
+            } & protected_dependencies:
                 continue
             path = Path(str(row.get("path") or ""))
             root = self.config.cache_dir if entry_type == "FEATURE" else self.config.snapshot_dir
@@ -453,6 +461,15 @@ class DataCacheManager:
             )
         )
         return protected
+
+    def _protected_dependency_ids(self) -> set[str]:
+        return {
+            str(row["dependency_id"])
+            for row in self.database.query(
+                """SELECT DISTINCT dependency_id FROM snapshot_dependencies
+                WHERE dependency_id<>''"""
+            )
+        }
 
 
 def directory_size(path: Path) -> int:

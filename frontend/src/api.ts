@@ -1,4 +1,4 @@
-import type { Backtest, BacktestDetail, BacktestReplayRequest, BacktestRequest, Dashboard, DecisionRequest, Doctor, FeedbackSummary, Job, OrderGroupIntent, Portfolio, ResearchBrief, Signal, StrategyCatalog, StrategyExperiment, StrategyGroup, StrategyGroupDraft } from './types'
+import type { Backtest, BacktestDetail, BacktestReplayRequest, BacktestRequest, Course49FrameworkDetail, Dashboard, DecisionRequest, Doctor, FeedbackSummary, Job, OrderGroupIntent, Portfolio, ResearchBrief, Signal, StrategyCatalog, StrategyExperiment, StrategyFramework, StrategyGroup, StrategyGroupDraft } from './types'
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -22,6 +22,8 @@ export const api = {
   backtest: (id: string) => request<BacktestDetail>(`/api/backtests/${id}`),
   sources: () => request<Array<Record<string, unknown>>>('/api/sources'),
   strategyCatalog: () => request<StrategyCatalog>('/api/strategy-catalog'),
+  frameworks: () => request<StrategyFramework[]>('/api/frameworks'),
+  framework: (id: string) => request<Course49FrameworkDetail>('/api/frameworks/' + id),
   reloadStrategyCatalog: () => request<StrategyCatalog>('/api/strategy-catalog/reload', {
     method: 'POST',
   }),

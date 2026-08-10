@@ -25,6 +25,10 @@
 
 `generic_daily` 已同时支持单腿和多腿回测。`chan_daily` 与 `course49_daily` 是平台保留适配器，只供内置兼容层使用。本地插件不得声明这两个适配器。
 
+## Course49 剧本开发
+
+49课内部扩展使用 `Course49Playbook`，不创建新的 `course49_v12/v13`。剧本只实现元数据和 `evaluate(context)`，不得获取数据、访问存储或执行订单；候选必须返回评分、目标权重、阻断原因、证据和退出建议。新剧本默认 `RESEARCH`，完成防未来、250 日、30 笔平仓、样本外、双倍成本和集中度门禁后，才可显式晋级 `PRODUCTION`。研究回测可用 `playbook_ids` 隔离剧本，正式扫描不可临时覆盖生产配置。
+
 ## 组合模式
 
 `capital_sleeves` 为成员分配独立资金，适合逻辑和执行模型不同的策略；`score_fusion` 合并同标的方向与强度；`intersection` 要求多个 Alpha 同向；`risk_overlay` 允许风险策略否决开仓；`comparison` 仅用于同快照对照。

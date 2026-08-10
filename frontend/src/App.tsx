@@ -1,6 +1,6 @@
 import { lazy, Suspense } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Activity, BarChart3, BrainCircuit, Database, FlaskConical, LayoutDashboard, ListChecks, WalletCards } from 'lucide-react'
+import { Activity, BarChart3, BrainCircuit, Database, FlaskConical, LayoutDashboard, ListChecks, Network, WalletCards } from 'lucide-react'
 import { NavLink, Route, Routes } from 'react-router-dom'
 import { api } from './api'
 import { LoadingState, StatusBadge } from './components'
@@ -12,12 +12,14 @@ const PortfolioPage = lazy(() => import('./pages/PortfolioPage'))
 const ResearchPage = lazy(() => import('./pages/ResearchPage'))
 const SignalsPage = lazy(() => import('./pages/SignalsPage'))
 const StrategiesPage = lazy(() => import('./pages/StrategiesPage'))
+const Course49Page = lazy(() => import('./pages/Course49Page'))
 
 const navigation = [
   { to: '/', label: '总览', icon: LayoutDashboard },
   { to: '/signals', label: '候选', icon: ListChecks },
   { to: '/research', label: '研究', icon: BrainCircuit },
   { to: '/strategies', label: '策略', icon: FlaskConical },
+  { to: '/course49', label: '49课', icon: Network },
   { to: '/portfolio', label: '组合', icon: WalletCards },
   { to: '/backtests', label: '回测', icon: BarChart3 },
   { to: '/data', label: '数据', icon: Database },
@@ -50,6 +52,7 @@ export default function App() {
               <Route path="/signals" element={<SignalsPage />} />
               <Route path="/research" element={<ResearchPage />} />
               <Route path="/strategies" element={<StrategiesPage />} />
+              <Route path="/course49" element={<Course49Page />} />
               <Route path="/portfolio" element={<PortfolioPage />} />
               <Route path="/backtests" element={<BacktestsPage />} />
               <Route path="/data" element={<DataPage />} />

@@ -27,11 +27,12 @@ class ApiTests(unittest.TestCase):
             {
                 "chan_v1", "course49_v1", "course49_v2", "course49_v3", "course49_v4", "course49_v5", "course49_v6",
                 "course49_v7", "course49_v8", "course49_v9", "course49_v10", "course49_v11",
+                "course49_system",
                 "pairs_arbitrage_v1",
             },
         )
         self.assertEqual(dashboard.status_code, 200)
-        self.assertEqual(len(dashboard.json()["accounts"]), 13)
+        self.assertEqual(len(dashboard.json()["accounts"]), 14)
 
     def test_strategy_catalog_and_custom_group_crud(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -54,6 +55,12 @@ class ApiTests(unittest.TestCase):
             deleted = client.delete("/api/strategy-groups/test_sleeves")
         self.assertEqual(catalog.status_code, 200)
         self.assertIn("adaptive_multi_strategy", {item["group_id"] for item in catalog.json()["groups"]})
+        self.assertEqual(
+            {item["strategy_id"] for item in catalog.json()["strategies"]},
+            {"chan_v1", "course49_system", "pairs_arbitrage_v1"},
+        )
+        self.assertEqual(len(catalog.json()["archived_strategies"]), 11)
+        self.assertEqual(catalog.json()["frameworks"][0]["framework_id"], "course49")
         self.assertEqual(reloaded.status_code, 200)
         self.assertEqual(reloaded.json()["plugin_issues"], [])
         self.assertEqual(

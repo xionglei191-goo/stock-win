@@ -1,6 +1,6 @@
 # 通达信多策略投研平台
 
-本项目以本地通达信为首要行情与板块数据底座，在其上建立可复现的数据契约、策略插件、组合编排、Python 回测、模拟组合和 Web 展示。缠论、“49 课”和配对套利是彼此独立的策略插件；平台不调用真实下单接口。
+本项目以本地通达信为首要行情与板块数据底座，在其上建立可复现的数据契约、策略框架、插件、组合编排、Python 回测、模拟组合和 Web 展示。缠论与配对套利是独立策略；“49 课”是共享市场、题材、龙头和资金上下文的多剧本体系。平台不调用真实下单接口。
 
 ## 当前能力
 
@@ -8,7 +8,7 @@
 - 数据健康检查、SQLite 元数据、Parquet 研究快照和来源登记。
 - 策略驱动 `DataPlan`、历史区间读取、24GB 内存/50GB 磁盘两级缓存、8线程本地处理和三作业调度；TQ 始终单通道。
 - `chan_v1`：市场/板块/龙头过滤后的日线中枢突破与退出。
-- `course49_v1/v2/v3`：题材龙头基线、市场风格自适应版与局部加速核心实验版，买入信号必须人工批准。
+- `course49_system`：正式的 49 课体系入口，统一路由修复启动、发酵二板和加速核心接力三个生产剧本；V1-V11 保留为默认隐藏的研究归档。
 - `pairs_arbitrage_v1`：固定同行业股票对的价差均值回归研究，使用原子多腿意图和仅模拟做空。
 - API V1 本地策略插件、热重载、数据依赖声明和自定义组合；支持资金分舱、信号加权、交集确认和风险覆盖。
 - 通用日线单腿/多腿回测适配器；新增普通策略或套利策略不需要修改扫描和回测主流程。
@@ -33,7 +33,9 @@ pnpm build
 cd ..
 
 py -3 -m research_platform catalog
+py -3 -m research_platform scan --strategies course49_system
 py -3 -m research_platform scan --strategies adaptive_multi_strategy
+py -3 -m research_platform backtest --strategy course49_system --playbooks recovery_ignition,ferment_second_board,acceleration_core_relay
 py -3 -m research_platform backtest --strategy adaptive_multi_strategy --daily-bars 180
 py -3 -m research_platform diagnose-course49 --backtest-id <BACKTEST_ID>
 py -3 -m research_platform daily-research
@@ -41,7 +43,7 @@ py -3 -m research_platform refresh-feedback
 py -3 -m research_platform serve
 ```
 
-打开 `http://127.0.0.1:8000`。扫描默认只写本地研究库；仅在确认需要更新通达信客户端时增加 `--push-tdx`。
+打开 `http://127.0.0.1:8000`，在“49课”工作台查看上下文、漏斗、剧本、路由候选和持仓风险。扫描默认只写本地研究库；仅在确认需要更新通达信客户端时增加 `--push-tdx`，正式候选写入 `RP49_SYS`。
 
 ## 目录
 

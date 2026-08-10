@@ -43,6 +43,12 @@ class PaperPortfolio:
             return
         with self.database.connect() as connection:
             for signal in rows:
+                account = connection.execute(
+                    "SELECT frozen FROM paper_accounts WHERE strategy_id=?",
+                    (signal.strategy_id,),
+                ).fetchone()
+                if account is not None and bool(account["frozen"]):
+                    continue
                 connection.execute(
                     """INSERT OR IGNORE INTO paper_orders
                     (order_id, signal_id, strategy_id, code, side, status, signal_time, target_weight, reason)

@@ -52,6 +52,7 @@ export default function StrategiesPage() {
   const orderGroups = useQuery({ queryKey: ['order-groups'], queryFn: api.orderGroups, refetchInterval: 20_000 })
   const [draft, setDraft] = useState<StrategyGroupDraft>(emptyGroup)
   const [editingBuiltIn, setEditingBuiltIn] = useState(false)
+  const [showArchived, setShowArchived] = useState(false)
   const totalWeight = useMemo(() => draft.members.reduce((sum, item) => sum + item.weight, 0), [draft.members])
   const save = useMutation({
     mutationFn: api.saveStrategyGroup,
@@ -106,19 +107,33 @@ export default function StrategiesPage() {
   return <>
     <PageHeader title="策略实验室" actions={<><button className="icon-button" title="重新加载本地策略插件" disabled={reload.isPending} onClick={() => reload.mutate()}><RefreshCw size={17} /></button><button className="button button--secondary" onClick={() => { setDraft(emptyGroup()); setEditingBuiltIn(false) }}><Plus size={17} />新建组合</button></>} />
     <section className="metrics-band metrics-band--compact">
-      <div><span>策略插件</span><strong>{data.strategies.length}</strong></div>
+      <div><span>正式策略</span><strong>{data.strategies.length}</strong></div>
       <div><span>策略组合</span><strong>{data.groups.length}</strong></div>
       <div><span>多腿策略</span><strong>{data.strategies.filter((item) => item.execution_model === 'MULTI_LEG').length}</strong></div>
       <div><span>待批多腿</span><strong>{orderGroups.data!.filter((item) => item.status === 'PROPOSED').length}</strong></div>
       <div><span>加载问题</span><strong>{data.plugin_issues.length}</strong></div>
+      <div><span>研究归档</span><strong>{data.archived_strategies?.length ?? 0}</strong></div>
     </section>
 
     <section className="table-section">
-      <div className="section-heading"><h2>策略目录</h2><span>版本与数据契约</span></div>
+      <div className="section-heading"><h2>策略目录</h2><button className="button button--secondary" type="button" onClick={() => setShowArchived((value) => !value)}>{showArchived ? '隐藏研究归档' : '显示研究归档'}</button></div>
       <div className="table-wrap"><table className="strategy-catalog-table"><thead><tr><th>策略</th><th>版本</th><th>状态</th><th>来源</th><th>频率</th><th>执行</th><th>资产</th><th>数据需求</th><th>审批</th></tr></thead><tbody>
         {data.strategies.map((strategy) => <tr key={strategy.strategy_id}><td><strong>{strategy.name}</strong><small className="subline">{strategy.strategy_id}</small></td><td>{strategy.version}<small className="subline">API {strategy.plugin_api_version}</small></td><td><StatusBadge status={lifecycleStatus(strategy.lifecycle)} label={lifecycleLabel(strategy.lifecycle)} /></td><td>{strategy.plugin_origin}<small className="subline">{strategy.runtime_adapter}</small></td><td>{strategy.frequency}</td><td>{strategy.execution_model === 'MULTI_LEG' ? '多腿' : '单腿'}{strategy.supports_short ? ' · 可做空' : ''}<small className="subline">{capabilityLabel(strategy.scan_enabled, strategy.backtest_enabled)}</small></td><td>{strategy.asset_classes.join(' / ')}</td><td><div className="requirement-list">{strategy.data_requirements.map((item, index) => <span key={`${item.dataset}-${index}`} className={item.available === false ? 'negative-text' : ''}>{item.dataset} · {item.frequency} · {item.adjustment} · {item.provider ?? '-'}</span>)}</div></td><td><StatusBadge status={strategy.requires_approval ? 'REQUIRED' : 'AUTO'} label={strategy.requires_approval ? '需审批' : '自动'} /></td></tr>)}
       </tbody></table></div>
     </section>
+
+    {showArchived && <section className="table-section">
+      <div className="section-heading"><h2>研究归档</h2><span>保留直接回测，不参与普通扫描</span></div>
+      <div className="table-wrap"><table><thead><tr><th>策略</th><th>版本</th><th>历史状态</th><th>能力</th><th>规则族</th></tr></thead><tbody>
+        {(data.archived_strategies ?? []).map((strategy) => <tr key={strategy.strategy_id}>
+          <td><strong>{strategy.name}</strong><small className="subline">{strategy.strategy_id}</small></td>
+          <td>{strategy.version}</td>
+          <td><StatusBadge status="ARCHIVED" label={lifecycleLabel(strategy.lifecycle)} /></td>
+          <td>{capabilityLabel(strategy.scan_enabled, strategy.backtest_enabled)}</td>
+          <td className="symbol">{strategy.strategy_family}</td>
+        </tr>)}
+      </tbody></table></div>
+    </section>}
 
     {data.plugin_issues.length > 0 && <section className="table-section">
       <div className="section-heading"><h2>目录加载问题</h2><span>{data.plugin_issues.length} 项</span></div>

@@ -14,6 +14,9 @@ export type Signal = {
   status: string
   reason_codes: string[]
   evidence: Record<string, unknown>
+  framework_id?: string
+  playbook_id?: string
+  policy_version?: string
   ai_review?: AiSignalReview | null
 }
 
@@ -124,6 +127,7 @@ export type Account = {
   initial_cash: number
   cash: number
   updated_at: string
+  frozen?: number
 }
 
 export type Position = {
@@ -200,6 +204,7 @@ export type BacktestRequest = {
   sample_seed: number
   execution_cost_multiplier: number
   refresh_data: boolean
+  playbook_ids?: string[]
 }
 
 export type BacktestReplayRequest = {
@@ -290,11 +295,13 @@ export type BacktestMetrics = {
   runtime_adapter?: string
   execution_model?: 'SINGLE_LEG' | 'MULTI_LEG'
   components?: Record<string, BacktestMetrics>
+  playbook_attribution?: AttributionRow[]
 }
 
 export type AttributionRow = {
   market_style?: string
   trade_mode?: string
+  playbook_id?: string
   entries: number
   closed: number
   wins: number
@@ -322,6 +329,9 @@ export type BacktestTrade = {
   evidence: Record<string, unknown>
   group_key?: string
   leg_id?: string
+  framework_id?: string
+  playbook_id?: string
+  policy_version?: string
 }
 
 export type BacktestState = {
@@ -356,6 +366,8 @@ export type BacktestDetail = Backtest & {
   position_changes: PositionChange[]
   comparison: StrategyComparison[]
   states: BacktestState[]
+  playbook_states: PlaybookState[]
+  playbook_attribution?: AttributionRow[]
 }
 
 export type Job = {
@@ -404,6 +416,9 @@ export type StrategyPlugin = {
   runtime_adapter: 'chan_daily' | 'course49_daily' | 'generic_daily'
   plugin_api_version: string
   plugin_origin: string
+  framework_id: string
+  policy_version: string
+  archived: boolean
 }
 
 export type StrategyGroupMember = {
@@ -427,6 +442,7 @@ export type StrategyGroup = {
   scan_block_reason: string
   backtest_block_reason: string
   members: StrategyGroupMember[]
+  category?: 'framework' | 'independent' | 'research_archive'
 }
 
 export type StrategyGroupDraft = Omit<
@@ -443,8 +459,56 @@ export type PluginLoadIssue = {
 
 export type StrategyCatalog = {
   strategies: StrategyPlugin[]
+  archived_strategies: StrategyPlugin[]
   groups: StrategyGroup[]
+  frameworks: StrategyFramework[]
   plugin_issues: PluginLoadIssue[]
+}
+
+export type PlaybookState = {
+  timestamp: string
+  playbook_id: string
+  lifecycle: string
+  admitted: number
+  candidate_count: number
+  routed_count: number
+  budget: number
+  blocked_reasons: string[]
+  funnel?: Record<string, number>
+}
+
+export type StrategyPlaybook = {
+  playbook_id: string
+  framework_id: string
+  version: string
+  name: string
+  description: string
+  lifecycle: string
+  base_weight: number
+  market_phase: string
+}
+
+export type StrategyFramework = {
+  framework_id: string
+  version: string
+  name: string
+  description: string
+  strategy_id: string
+  policy_version: string
+  enabled: number
+  playbooks: StrategyPlaybook[]
+}
+
+export type Course49FrameworkDetail = StrategyFramework & {
+  latest_run: Record<string, unknown> | null
+  latest_backtest: Backtest | null
+  state: Record<string, unknown>
+  candidates: Array<Record<string, unknown>>
+  signals: Signal[]
+  positions: Array<Position & { evidence?: Record<string, unknown> }>
+  runtime_states: Array<{ scope: string; asof: string; state: Record<string, unknown> }>
+  history: BacktestState[]
+  playbook_history: PlaybookState[]
 }
 
 export type OrderGroupLeg = {

@@ -129,6 +129,10 @@ tbody tr:hover { background: #fafbf9; }
 .field--action { grid-column: -2 / -1; }
 .field--action .button { width: 100%; }
 .field--refresh { grid-column: span 2; white-space: nowrap; }
+.playbook-selector { grid-column: 1 / -1; min-width: 0; margin: 0; padding: 9px 11px; border: 1px solid var(--line); }
+.playbook-selector legend { padding: 0 5px; color: var(--muted); font-size: 10px; }
+.playbook-selector label { display: inline-flex; align-items: center; gap: 5px; margin-right: 18px; font-size: 11px; }
+.playbook-selector input { accent-color: var(--green); }
 .form-error { margin-top: 11px; padding-top: 10px; border-top: 1px solid #ead1ce; color: var(--red); font-size: 12px; }
 .backtest-layout { display: grid; grid-template-columns: 270px minmax(0, 1fr); gap: 18px; }
 .run-list { padding: 14px; max-height: 650px; overflow-y: auto; }
@@ -196,6 +200,33 @@ tbody tr:hover { background: #fafbf9; }
 .compact-field input, .compact-field select { width: 100%; height: 32px; border: 1px solid var(--line-strong); border-radius: 4px; padding: 0 7px; background: white; }
 .editor-actions { display: flex; justify-content: flex-end; padding-top: 14px; }
 .order-group-table { min-width: 1050px; }
+
+.framework-context { margin-bottom: 18px; }
+.framework-context .section-heading > div { display: grid; gap: 4px; }
+.framework-context .section-heading span { color: var(--muted); font-size: 10px; }
+.context-facts { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); border-top: 1px solid var(--line); }
+.context-facts > div { min-height: 66px; padding: 12px 12px 10px 0; display: grid; gap: 5px; }
+.context-facts span { color: var(--muted); font-size: 10px; }
+.context-facts strong { font-size: 14px; }
+.framework-block-reason { padding-top: 10px; border-top: 1px solid var(--line); color: var(--red); font-size: 11px; }
+.framework-section { margin-bottom: 18px; }
+.funnel-strip { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); border: 1px solid var(--line); background: var(--surface); }
+.funnel-step { position: relative; min-height: 74px; padding: 13px 18px; border-right: 1px solid var(--line); display: grid; align-content: center; gap: 4px; }
+.funnel-step:last-child { border-right: 0; }
+.funnel-step span { color: var(--muted); font-size: 10px; }
+.funnel-step strong { font-size: 21px; }
+.funnel-step i { position: absolute; right: -6px; top: 24px; z-index: 2; width: 12px; height: 22px; background: var(--surface); color: var(--muted); font-style: normal; font-size: 18px; text-align: center; }
+.playbook-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+.playbook-card { min-width: 0; padding: 15px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+.playbook-card > div:first-child { display: flex; align-items: center; justify-content: space-between; gap: 9px; }
+.playbook-card > div:first-child strong { font-size: 13px; }
+.playbook-card p { min-height: 38px; margin: 10px 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
+.playbook-card dl { margin: 0; display: grid; grid-template-columns: 1fr 1fr; border-top: 1px solid var(--line); }
+.playbook-card dl > div { padding: 9px 0; display: grid; gap: 3px; }
+.playbook-card dt { color: var(--muted); font-size: 9px; }
+.playbook-card dd { margin: 0; font-size: 12px; }
+.playbook-card > small { display: block; padding-top: 8px; border-top: 1px solid var(--line); color: var(--muted); font-size: 9px; overflow-wrap: anywhere; }
+.framework-candidates { min-width: 1050px; }
 
 .modal-backdrop { position: fixed; inset: 0; z-index: 80; display: grid; place-items: center; padding: 20px; background: rgba(25, 29, 26, .52); }
 .decision-dialog { width: min(620px, 100%); max-height: calc(100vh - 40px); overflow-y: auto; padding: 18px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface); box-shadow: 0 18px 50px rgba(20, 26, 21, .22); }
@@ -290,6 +321,10 @@ tbody tr:hover { background: #fafbf9; }
   .strategy-workbench { grid-template-columns: 1fr; }
   .strategy-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .claim-columns { grid-template-columns: 1fr; }
+  .context-facts { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .funnel-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .funnel-step:nth-child(3) { border-right: 0; }
+  .playbook-grid { grid-template-columns: 1fr; }
   .experiment-form-grid { grid-template-columns: 1fr 1fr; }
   .experiment-form-grid .button { grid-column: 2; }
 }
@@ -298,7 +333,7 @@ tbody tr:hover { background: #fafbf9; }
   .app-shell { display: block; padding-bottom: 58px; }
   .sidebar { position: fixed; inset: auto 0 0 0; height: 58px; padding: 0; }
   .brand, .sidebar-footer { display: none; }
-  .sidebar nav { height: 58px; margin: 0; display: grid; grid-template-columns: repeat(7, 1fr); gap: 0; }
+  .sidebar nav { height: 58px; margin: 0; display: grid; grid-template-columns: repeat(8, 1fr); gap: 0; }
   .sidebar nav a { height: 58px; flex-direction: column; gap: 3px; border-left: 0; border-top: 2px solid transparent; font-size: 9px; }
   .sidebar nav a span { display: block; }
   .sidebar nav a.active { border-left: 0; border-top-color: #58a28f; }
@@ -326,6 +361,10 @@ tbody tr:hover { background: #fafbf9; }
   .field--wide, .field--action { grid-column: 1 / -1; }
   .field--refresh { grid-column: 1 / -1; }
   .pool-facts { grid-template-columns: 1fr 1fr; }
+  .context-facts { grid-template-columns: 1fr 1fr; }
+  .funnel-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .funnel-step:nth-child(3) { border-right: 1px solid var(--line); }
+  .funnel-step:nth-child(2n) { border-right: 0; }
   .strategy-form-grid { grid-template-columns: 1fr; }
   .field--description { grid-column: 1; }
   .member-row { grid-template-columns: minmax(150px, 1fr) 82px 82px; }

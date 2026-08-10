@@ -94,14 +94,27 @@ def built_in_groups() -> tuple[StrategyGroupDefinition, ...]:
     return (
         StrategyGroupDefinition(
             group_id="combined",
-            version="2.0.0",
-            name="组合策略（缠论 + 49课 V2）",
-            description="缠论与49课V2各使用50%独立资金，风险和归因互相隔离。",
+            version="3.0.0",
+            name="组合策略（缠论 + 49课体系）",
+            description="缠论与49课体系各使用50%独立资金，风险和归因互相隔离。",
             composition_mode=CompositionMode.CAPITAL_SLEEVES,
             conflict_policy=ConflictPolicy.RISK_FIRST,
             members=(
                 StrategyGroupMember("chan_v1", 0.50, priority=10),
-                StrategyGroupMember("course49_v2", 0.50, priority=20),
+                StrategyGroupMember("course49_system", 0.50, priority=20),
+            ),
+            built_in=True,
+        ),
+        StrategyGroupDefinition(
+            group_id="course49_system_compare",
+            version="1.0.0",
+            name="49课 V2 / 体系影子对比",
+            description="在同一不可变数据快照上比较归档V2与正式体系，验证信号和执行等价性。",
+            composition_mode=CompositionMode.COMPARISON,
+            conflict_policy=ConflictPolicy.RISK_FIRST,
+            members=(
+                StrategyGroupMember("course49_v2", 0.50, priority=10),
+                StrategyGroupMember("course49_system", 0.50, priority=20),
             ),
             built_in=True,
         ),
@@ -211,13 +224,13 @@ def built_in_groups() -> tuple[StrategyGroupDefinition, ...]:
         ),
         StrategyGroupDefinition(
             group_id="adaptive_multi_strategy",
-            version="1.0.0",
+            version="2.0.0",
             name="自适应多策略组合",
             description="49课、缠论与配对套利按独立资金分舱组合。",
             composition_mode=CompositionMode.CAPITAL_SLEEVES,
             conflict_policy=ConflictPolicy.RISK_FIRST,
             members=(
-                StrategyGroupMember("course49_v2", 0.35, priority=10),
+                StrategyGroupMember("course49_system", 0.35, priority=10),
                 StrategyGroupMember("chan_v1", 0.25, priority=20),
                 StrategyGroupMember("pairs_arbitrage_v1", 0.40, priority=30),
             ),
@@ -297,10 +310,10 @@ class StrategyCatalog:
 
     def as_records(self) -> dict[str, list[dict[str, object]]]:
         strategies = []
+        archived_strategies = []
         for strategy_id in sorted(self.strategies):
             metadata = self.metadata(strategy_id)
-            strategies.append(
-                {
+            record = {
                     "strategy_id": strategy_id,
                     "version": metadata.version,
                     "name": metadata.name,
@@ -318,9 +331,12 @@ class StrategyCatalog:
                     "runtime_adapter": RuntimeAdapter(metadata.runtime_adapter).value,
                     "plugin_api_version": metadata.plugin_api_version,
                     "plugin_origin": getattr(self.strategies[strategy_id], "__plugin_origin__", "builtin"),
+                    "framework_id": metadata.framework_id,
+                    "policy_version": metadata.policy_version,
+                    "archived": metadata.archived,
                     "data_requirements": [requirement.__dict__ for requirement in metadata.data_requirements],
                 }
-            )
+            (archived_strategies if metadata.archived else strategies).append(record)
         groups = []
         for group_id in sorted(self.groups):
             group = self.groups[group_id]
@@ -345,6 +361,13 @@ class StrategyCatalog:
                         CompositionMode.COMPARISON,
                     },
                     "members": [member.__dict__ for member in group.members],
+                    "category": (
+                        "framework"
+                        if group.group_id in {"combined", "adaptive_multi_strategy", "course49_system_compare"}
+                        else "research_archive"
+                        if any(item.archived for item in member_metadata)
+                        else "independent"
+                    ),
                     "scan_block_reason": (
                         ""
                         if all(item.scan_enabled for item in member_metadata)
@@ -368,7 +391,11 @@ class StrategyCatalog:
                     ),
                 }
             )
-        return {"strategies": strategies, "groups": groups}
+        return {
+            "strategies": strategies,
+            "archived_strategies": archived_strategies,
+            "groups": groups,
+        }
 
 
 class CompositionEngine:

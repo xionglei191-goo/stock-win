@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from contextlib import AbstractContextManager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -117,6 +118,7 @@ class TdxAdapter(AbstractContextManager["TdxAdapter"]):
         self.successful_batch_sizes: list[int] = []
         self._tq = None
         self._connection_lock_acquired = False
+        self._process_lock_handle = None
 
     def __enter__(self) -> "TdxAdapter":
         if sys.platform != "win32":
@@ -127,6 +129,7 @@ class TdxAdapter(AbstractContextManager["TdxAdapter"]):
         _TQ_CONNECTION_LOCK.acquire()
         self._connection_lock_acquired = True
         try:
+            self._acquire_process_lock()
             sys.path.insert(0, str(self.config.tq_user_dir))
             from tqcenter import tq
 
@@ -146,9 +149,41 @@ class TdxAdapter(AbstractContextManager["TdxAdapter"]):
             self._release_connection_lock()
 
     def _release_connection_lock(self) -> None:
+        self._release_process_lock()
         if self._connection_lock_acquired:
             self._connection_lock_acquired = False
             _TQ_CONNECTION_LOCK.release()
+
+    def _acquire_process_lock(self) -> None:
+        import msvcrt
+
+        self.config.ensure_runtime_dirs()
+        lock_path = self.config.cache_dir / "tq_channel.lock"
+        handle = lock_path.open("a+b")
+        if lock_path.stat().st_size == 0:
+            handle.write(b"\0")
+            handle.flush()
+        while True:
+            try:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                self._process_lock_handle = handle
+                return
+            except OSError:
+                time.sleep(0.1)
+
+    def _release_process_lock(self) -> None:
+        handle = self._process_lock_handle
+        self._process_lock_handle = None
+        if handle is None:
+            return
+        try:
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            handle.close()
 
     @property
     def tq(self):

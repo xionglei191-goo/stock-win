@@ -7,11 +7,13 @@ import { EmptyState, ErrorState, LoadingState, PageHeader, StatusBadge, time } f
 import type { AttributionRow, BacktestRequest, BacktestState, BacktestUniverse, SamplingMode } from '../types'
 
 const fallbackStrategyNames: Record<string, string> = {
+  course49_system: '49课体系',
+  course49_system_compare: '49课 V2 / 体系影子对比',
   course49_v10: '49课 V10 市场奖励过滤（留出目标否决）',
   course49_v11: '49课 V11 三次开板回封（历史稳健性否决）',
   course49_v10_compare: '49课 V9 / V10 市场奖励过滤对比',
   course49_v11_compare: '49课 V9 / V11 回封强度对比',
-  combined: '组合策略（缠论 + 49课 V2）',
+  combined: '组合策略（缠论 + 49课体系）',
   chan_v1: '缠论结构',
   course49_v1: '49课 V1 基线',
   course49_v2: '49课 V2 自适应',
@@ -59,6 +61,7 @@ const universeNames: Record<BacktestUniverse, string> = {
 }
 
 const lineColors: Record<string, string> = {
+  course49_system: '#146c5a',
   course49_v10: '#6f5b3e',
   course49_v11: '#267067',
   chan_v1: '#146c5a',
@@ -116,6 +119,7 @@ type FormState = {
   universe: BacktestUniverse
   stockCodes: string
   refreshData: boolean
+  playbookIds: string[]
 }
 
 function localDate(offsetDays = 0) {
@@ -193,6 +197,7 @@ export default function BacktestsPage() {
   const [selected, setSelected] = useState<string | null>(null)
   const [jobId, setJobId] = useState<string | null>(null)
   const [formError, setFormError] = useState('')
+  const [showArchived, setShowArchived] = useState(false)
   const [form, setForm] = useState<FormState>({
     strategyId: 'combined',
     startDate: localDate(-365),
@@ -205,6 +210,7 @@ export default function BacktestsPage() {
     universe: 'all_a',
     stockCodes: '',
     refreshData: false,
+    playbookIds: ['recovery_ignition', 'ferment_second_board', 'acceleration_core_relay'],
   })
 
   const list = useQuery({ queryKey: ['backtests'], queryFn: api.backtests, refetchInterval: 20_000 })
@@ -215,16 +221,29 @@ export default function BacktestsPage() {
       item.strategy_id,
       strategyCatalogDisplayName(item.name, item.lifecycle),
     ])),
+    ...Object.fromEntries((catalog.data?.archived_strategies ?? []).map((item) => [
+      item.strategy_id,
+      strategyCatalogDisplayName(item.name, item.lifecycle),
+    ])),
     ...Object.fromEntries((catalog.data?.groups ?? []).map((item) => [item.group_id, item.name])),
   }), [catalog.data])
   const strategyOptions = useMemo(() => [
-    ...(catalog.data?.groups ?? []).filter((item) => item.backtest_supported).map((item) => ({ id: item.group_id, name: item.name, type: '组合' })),
+    ...(catalog.data?.groups ?? []).filter((item) => item.backtest_supported && (showArchived || item.category !== 'research_archive')).map((item) => ({
+      id: item.group_id,
+      name: item.name,
+      type: item.category === 'framework' ? '体系' : item.category === 'research_archive' ? '研究归档' : '组合',
+    })),
     ...(catalog.data?.strategies ?? []).map((item) => ({
       id: item.strategy_id,
       name: strategyCatalogDisplayName(item.name, item.lifecycle),
-      type: '策略',
+      type: item.framework_id ? '体系' : '独立策略',
     })),
-  ], [catalog.data])
+    ...(showArchived ? (catalog.data?.archived_strategies ?? []).map((item) => ({
+      id: item.strategy_id,
+      name: strategyCatalogDisplayName(item.name, item.lifecycle),
+      type: '研究归档',
+    })) : []),
+  ], [catalog.data, showArchived])
   const activeId = selected ?? list.data?.[0]?.backtest_id ?? null
   const detail = useQuery({
     queryKey: ['backtest', activeId],
@@ -277,7 +296,8 @@ export default function BacktestsPage() {
   const trades = useMemo(() => [...(detail.data?.trades ?? [])].reverse(), [detail.data])
   const positionChanges = useMemo(() => [...(detail.data?.position_changes ?? [])].reverse(), [detail.data])
   const metrics = detail.data?.metrics
-  const course49Metrics = metrics?.components?.course49_v11
+  const course49Metrics = metrics?.components?.course49_system
+    ?? metrics?.components?.course49_v11
     ?? metrics?.components?.course49_v10
     ?? metrics?.components?.course49_v9
     ?? metrics?.components?.course49_v8
@@ -296,6 +316,7 @@ export default function BacktestsPage() {
   const styleAttribution = course49Metrics?.style_attribution ?? []
   const modeAttribution = course49Metrics?.trade_mode_attribution ?? []
   const exitAttribution = course49Metrics?.exit_reason_attribution ?? []
+  const playbookAttribution = course49Metrics?.playbook_attribution ?? detail.data?.playbook_attribution ?? []
   const closedTrades = attribution.length
     ? attribution.reduce((total, item) => total + (item.closed ?? 0), 0)
     : (course49Metrics?.closed_trades ?? Math.floor((course49Metrics?.trades ?? 0) / 2))
@@ -307,7 +328,7 @@ export default function BacktestsPage() {
   const states = useMemo(
     () => {
       const all = detail.data?.states ?? []
-      for (const strategyId of ['course49_v11', 'course49_v10', 'course49_v9', 'course49_v8', 'course49_v7', 'course49_v6', 'course49_v5', 'course49_v4', 'course49_v3', 'course49_v2']) {
+      for (const strategyId of ['course49_system', 'course49_v11', 'course49_v10', 'course49_v9', 'course49_v8', 'course49_v7', 'course49_v6', 'course49_v5', 'course49_v4', 'course49_v3', 'course49_v2']) {
         const adaptive = all.filter((item) => item.strategy_id === strategyId)
         if (adaptive.length) return adaptive
       }
@@ -319,7 +340,10 @@ export default function BacktestsPage() {
   const distribution = detail.data?.parameters?.universe_distribution
   const activeJob = run.isPending || replay.isPending || ['QUEUED', 'RUNNING'].includes(job.data?.status ?? '')
   const canReplayCourse49 = Boolean(
-    detail.data?.snapshot_id && /^course49_v\d+$/.test(detail.data?.strategy_id ?? ''),
+    detail.data?.snapshot_id && (
+      /^course49_v\d+$/.test(detail.data?.strategy_id ?? '')
+      || detail.data?.strategy_id === 'course49_system'
+    ),
   )
 
   function update<K extends keyof FormState>(key: K, value: FormState[K]) {
@@ -350,6 +374,7 @@ export default function BacktestsPage() {
       universe: form.universe,
       stock_codes: stockCodes,
       refresh_data: form.refreshData,
+      playbook_ids: form.strategyId === 'course49_system' ? form.playbookIds : [],
     })
   }
 
@@ -372,8 +397,9 @@ export default function BacktestsPage() {
       </div>
       <form className="config-grid" onSubmit={submit}>
         <label className="field"><span>策略</span><select value={form.strategyId} onChange={(event) => update('strategyId', event.target.value as FormState['strategyId'])}>
-          {strategyOptions.length ? strategyOptions.map((item) => <option key={item.id} value={item.id}>{item.type} · {item.name}</option>) : <option value="combined">组合策略（缠论 + 49课 V2）</option>}
+          {strategyOptions.length ? strategyOptions.map((item) => <option key={item.id} value={item.id}>{item.type} · {item.name}</option>) : <option value="combined">组合策略（缠论 + 49课体系）</option>}
         </select></label>
+        <label className="field toggle-field"><input type="checkbox" checked={showArchived} onChange={(event) => setShowArchived(event.target.checked)} /><span>显示研究归档</span></label>
         <label className="field"><span>开始日期</span><input type="date" value={form.startDate} max={form.endDate || undefined} onChange={(event) => update('startDate', event.target.value)} /></label>
         <label className="field"><span>结束日期</span><input type="date" value={form.endDate} min={form.startDate || undefined} onChange={(event) => update('endDate', event.target.value)} /></label>
         <label className="field"><span>股票池</span><select value={form.universe} onChange={(event) => update('universe', event.target.value as BacktestUniverse)}>
@@ -387,6 +413,14 @@ export default function BacktestsPage() {
         {form.samplingMode === 'stratified' && <label className="field"><span>抽样种子</span><input type="number" value={form.sampleSeed} onChange={(event) => update('sampleSeed', event.target.value)} /></label>}
         <label className="field"><span>执行成本</span><select value={form.executionCostMultiplier} onChange={(event) => update('executionCostMultiplier', event.target.value)}><option value="1">标准成本</option><option value="2">2 倍压力</option></select></label>
         <label className="field field--refresh toggle-field"><input type="checkbox" checked={form.refreshData} onChange={(event) => update('refreshData', event.target.checked)} /><span>重新读取通达信数据</span></label>
+        {form.strategyId === 'course49_system' && <fieldset className="playbook-selector">
+          <legend>研究回测剧本</legend>
+          {[
+            ['recovery_ignition', '修复启动'],
+            ['ferment_second_board', '发酵二板'],
+            ['acceleration_core_relay', '加速核心接力'],
+          ].map(([id, label]) => <label key={id}><input type="checkbox" checked={form.playbookIds.includes(id)} onChange={(event) => update('playbookIds', event.target.checked ? [...form.playbookIds, id] : form.playbookIds.filter((item) => item !== id))} />{label}</label>)}
+        </fieldset>}
         {form.universe === 'custom' && <label className="field field--wide"><span>股票代码</span><textarea rows={2} value={form.stockCodes} onChange={(event) => update('stockCodes', event.target.value)} /></label>}
         <div className="field field--action"><button className="button" type="submit" disabled={activeJob}><FlaskConical size={17} />{activeJob ? '回测运行中' : '运行回测'}</button></div>
       </form>
@@ -485,11 +519,16 @@ export default function BacktestsPage() {
       </div>
     </section> : null}
 
-    {(styleAttribution.length || modeAttribution.length || exitAttribution.length) ? <section className="table-section">
+    {(styleAttribution.length || modeAttribution.length || playbookAttribution.length || exitAttribution.length) ? <section className="table-section">
       <div className="section-heading"><h2>49课策略归因</h2><span>风格、交易模式与退出原因</span></div>
       <div className="attribution-grid">
         {styleAttribution.length ? <AttributionTable title="市场风格" rows={styleAttribution} field="market_style" names={styleNames} /> : null}
         {modeAttribution.length ? <AttributionTable title="交易模式" rows={modeAttribution} field="trade_mode" names={modeNames} /> : null}
+        {playbookAttribution.length ? <AttributionTable title="来源剧本" rows={playbookAttribution} field="playbook_id" names={{
+          recovery_ignition: '修复启动',
+          ferment_second_board: '发酵二板',
+          acceleration_core_relay: '加速核心接力',
+        }} /> : null}
         {exitAttribution.length ? <div className="attribution-block"><h3>退出原因</h3><div className="table-wrap"><table><thead><tr><th>原因</th><th className="numeric">次数</th><th className="numeric">盈利</th><th className="numeric">累计盈亏</th></tr></thead><tbody>{exitAttribution.map((item) => <tr key={item.reason}><td>{exitNames[item.reason] ?? item.reason}</td><td className="numeric">{item.count}</td><td className="numeric">{item.wins}</td><td className={`numeric ${item.total_pnl >= 0 ? 'positive-text' : 'negative-text'}`}>{money2(item.total_pnl)}</td></tr>)}</tbody></table></div></div> : null}
       </div>
     </section> : null}
@@ -522,7 +561,7 @@ export default function BacktestsPage() {
 function AttributionTable({ title, rows, field, names }: {
   title: string
   rows: AttributionRow[]
-  field: 'market_style' | 'trade_mode'
+  field: 'market_style' | 'trade_mode' | 'playbook_id'
   names: Record<string, string>
 }) {
   return <div className="attribution-block"><h3>{title}</h3><div className="table-wrap"><table><thead><tr><th>{title}</th><th className="numeric">入场</th><th className="numeric">平仓</th><th className="numeric">胜率</th><th className="numeric">累计盈亏</th></tr></thead><tbody>{rows.map((item) => {

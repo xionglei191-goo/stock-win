@@ -1,3 +1,4 @@
+from dataclasses import replace
 from typing import Any
 
 from .base import Strategy
@@ -21,6 +22,7 @@ from .course49_v8 import Course49V8Strategy
 from .course49_v9 import Course49V9Strategy
 from .course49_v10 import Course49V10Strategy
 from .course49_v11 import Course49V11Strategy
+from .course49_system import Course49SystemStrategy
 from .pairs_arbitrage import DEFAULT_PAIRS, PairSpec, PairsArbitrageStrategy
 
 
@@ -38,9 +40,18 @@ def create_strategy_registry() -> dict[str, Any]:
         Course49V9Strategy(),
         Course49V10Strategy(),
         Course49V11Strategy(),
+        Course49SystemStrategy(),
         PairsArbitrageStrategy(),
     )
-    return {plugin.metadata.strategy_id: plugin for plugin in plugins}
+    registry = {plugin.metadata.strategy_id: plugin for plugin in plugins}
+    for strategy_id, plugin in registry.items():
+        if strategy_id.startswith("course49_v") and strategy_id[10:].isdigit():
+            plugin.metadata = replace(
+                plugin.metadata,
+                archived=True,
+                scan_enabled=False,
+            )
+    return registry
 
 __all__ = [
     "Strategy",
@@ -57,6 +68,7 @@ __all__ = [
     "Course49V9Strategy",
     "Course49V10Strategy",
     "Course49V11Strategy",
+    "Course49SystemStrategy",
     "select_trade_mode_v3",
     "build_course49_eligibility_matrix",
     "build_course49_feature_matrix",

@@ -53,6 +53,7 @@ class BacktestRequest(BaseModel):
     sample_seed: int = 49
     execution_cost_multiplier: float = Field(default=1.0, ge=0.0, le=5.0)
     refresh_data: bool = False
+    playbook_ids: list[str] = Field(default_factory=list, max_length=20)
 
 
 class BacktestReplayRequest(BaseModel):
@@ -148,6 +149,17 @@ def create_app(config: PlatformConfig | None = None) -> FastAPI:
     @app.get("/api/strategy-catalog")
     def strategy_catalog() -> dict[str, Any]:
         return service.strategy_catalog()
+
+    @app.get("/api/frameworks")
+    def frameworks() -> list[dict[str, Any]]:
+        return _decode_rows(service.frameworks())
+
+    @app.get("/api/frameworks/{framework_id}")
+    def framework_detail(framework_id: str) -> dict[str, Any]:
+        try:
+            return _decode_row(service.framework_detail(framework_id))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Framework not found") from exc
 
     @app.post("/api/strategy-catalog/reload")
     def reload_strategy_catalog() -> dict[str, Any]:
@@ -247,6 +259,14 @@ def create_app(config: PlatformConfig | None = None) -> FastAPI:
         limit: int = Query(default=200, ge=1, le=1000),
     ) -> list[dict[str, Any]]:
         rows = _decode_rows(service.database.list_signals(limit=limit, status=status))
+        if status == SignalStatus.PROPOSED.value:
+            archived = {
+                str(item["strategy_id"])
+                for item in service.database.query(
+                    "SELECT strategy_id FROM strategies WHERE archived=1"
+                )
+            }
+            rows = [item for item in rows if str(item.get("strategy_id", "")) not in archived]
         return _attach_latest_reviews(service.database, rows)
 
     @app.post("/api/signals/{signal_id}/decision")
@@ -316,6 +336,7 @@ def create_app(config: PlatformConfig | None = None) -> FastAPI:
             sample_seed=request.sample_seed,
             execution_cost_multiplier=request.execution_cost_multiplier,
             refresh_data=request.refresh_data,
+            playbook_ids=request.playbook_ids,
         )
         return {"job_id": job_id, "status": "QUEUED"}
 
@@ -357,6 +378,21 @@ def create_app(config: PlatformConfig | None = None) -> FastAPI:
                 "SELECT * FROM backtest_states WHERE backtest_id=? ORDER BY timestamp, strategy_id",
                 (backtest_id,),
             )
+        )
+        payload["playbook_states"] = _decode_rows(
+            service.database.query(
+                """SELECT * FROM backtest_playbook_states
+                WHERE backtest_id=? ORDER BY timestamp, playbook_id""",
+                (backtest_id,),
+            )
+        )
+        metrics = payload.get("metrics") or {}
+        payload["playbook_attribution"] = (
+            metrics.get("components", {})
+            .get("course49_system", {})
+            .get("playbook_attribution", [])
+            if isinstance(metrics, dict)
+            else []
         )
         return payload
 
@@ -576,6 +612,8 @@ def _decode_row(row: dict[str, Any]) -> dict[str, Any]:
         "candidate_metrics_json",
         "stress_metrics_json",
         "reason_tags",
+        "blocked_reasons",
+        "funnel_json",
     }
     for key, value in row.items():
         if isinstance(value, list):

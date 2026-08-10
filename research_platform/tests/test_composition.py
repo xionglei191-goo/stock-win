@@ -15,6 +15,7 @@ from research_platform.models import PlatformSignal, SignalStatus, StrategyScanR
 from research_platform.strategies import (
     ChanStrategy,
     Course49Strategy,
+    Course49SystemStrategy,
     Course49V2Strategy,
     Course49V3Strategy,
     Course49V4Strategy,
@@ -75,6 +76,7 @@ class CompositionTests(unittest.TestCase):
             "course49_v9": Course49V9Strategy(),
             "course49_v10": Course49V10Strategy(),
             "course49_v11": Course49V11Strategy(),
+            "course49_system": Course49SystemStrategy(),
             "pairs_arbitrage_v1": PairsArbitrageStrategy(),
         }
 

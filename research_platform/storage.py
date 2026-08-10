@@ -29,7 +29,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 def _file_sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
@@ -64,6 +64,9 @@ CREATE TABLE IF NOT EXISTS strategies (
     runtime_adapter TEXT NOT NULL DEFAULT 'generic_daily',
     plugin_api_version TEXT NOT NULL DEFAULT '1',
     plugin_origin TEXT NOT NULL DEFAULT 'builtin',
+    framework_id TEXT NOT NULL DEFAULT '',
+    policy_version TEXT NOT NULL DEFAULT '',
+    archived INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS strategy_groups (
@@ -116,6 +119,9 @@ CREATE TABLE IF NOT EXISTS signals (
     status TEXT NOT NULL,
     reason_codes TEXT NOT NULL,
     evidence TEXT NOT NULL,
+    framework_id TEXT NOT NULL DEFAULT '',
+    playbook_id TEXT NOT NULL DEFAULT '',
+    policy_version TEXT NOT NULL DEFAULT '',
     FOREIGN KEY(run_id) REFERENCES runs(run_id)
 );
 CREATE INDEX IF NOT EXISTS idx_signals_time ON signals(generated_at DESC);
@@ -173,7 +179,8 @@ CREATE TABLE IF NOT EXISTS paper_accounts (
     strategy_id TEXT PRIMARY KEY,
     initial_cash REAL NOT NULL,
     cash REAL NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    frozen INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS paper_positions (
     strategy_id TEXT NOT NULL,
@@ -285,7 +292,10 @@ CREATE TABLE IF NOT EXISTS backtest_trades (
     reason TEXT NOT NULL,
     evidence TEXT NOT NULL DEFAULT '{}',
     group_key TEXT NOT NULL DEFAULT '',
-    leg_id TEXT NOT NULL DEFAULT ''
+    leg_id TEXT NOT NULL DEFAULT '',
+    framework_id TEXT NOT NULL DEFAULT '',
+    playbook_id TEXT NOT NULL DEFAULT '',
+    policy_version TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS backtest_states (
     backtest_id TEXT NOT NULL,
@@ -306,6 +316,53 @@ CREATE TABLE IF NOT EXISTS strategy_runtime_states (
     state_json TEXT NOT NULL DEFAULT '{}',
     updated_at TEXT NOT NULL,
     PRIMARY KEY(strategy_id, scope)
+);
+CREATE TABLE IF NOT EXISTS strategy_frameworks (
+    framework_id TEXT PRIMARY KEY,
+    version TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    policy_version TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS strategy_playbooks (
+    playbook_id TEXT PRIMARY KEY,
+    framework_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    lifecycle TEXT NOT NULL,
+    base_weight REAL NOT NULL DEFAULT 0,
+    market_phase TEXT NOT NULL DEFAULT '',
+    data_requirements_json TEXT NOT NULL DEFAULT '[]',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(framework_id) REFERENCES strategy_frameworks(framework_id)
+);
+CREATE TABLE IF NOT EXISTS backtest_playbook_states (
+    backtest_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    playbook_id TEXT NOT NULL,
+    lifecycle TEXT NOT NULL,
+    admitted INTEGER NOT NULL DEFAULT 0,
+    candidate_count INTEGER NOT NULL DEFAULT 0,
+    routed_count INTEGER NOT NULL DEFAULT 0,
+    budget REAL NOT NULL DEFAULT 0,
+    blocked_reasons TEXT NOT NULL DEFAULT '[]',
+    funnel_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(backtest_id, strategy_id, timestamp, playbook_id)
+);
+CREATE TABLE IF NOT EXISTS snapshot_dependencies (
+    snapshot_id TEXT NOT NULL,
+    dependency_type TEXT NOT NULL,
+    dependency_id TEXT NOT NULL,
+    coverage_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(snapshot_id, dependency_type, dependency_id)
 );
 CREATE TABLE IF NOT EXISTS data_snapshots (
     snapshot_id TEXT PRIMARY KEY,
@@ -483,12 +540,33 @@ class Database:
                 connection.execute(
                     "ALTER TABLE backtest_trades ADD COLUMN leg_id TEXT NOT NULL DEFAULT ''"
                 )
+            for column in ("framework_id", "playbook_id", "policy_version"):
+                if column not in trade_columns:
+                    connection.execute(
+                        f"ALTER TABLE backtest_trades ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                    )
+            signal_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(signals)").fetchall()
+            }
+            for column in ("framework_id", "playbook_id", "policy_version"):
+                if column not in signal_columns:
+                    connection.execute(
+                        f"ALTER TABLE signals ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                    )
             order_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(paper_orders)")
             }
             if "block_reason" not in order_columns:
                 connection.execute(
                     "ALTER TABLE paper_orders ADD COLUMN block_reason TEXT NOT NULL DEFAULT ''"
+                )
+            account_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(paper_accounts)").fetchall()
+            }
+            if "frozen" not in account_columns:
+                connection.execute(
+                    "ALTER TABLE paper_accounts ADD COLUMN frozen INTEGER NOT NULL DEFAULT 0"
                 )
             strategy_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(strategies)").fetchall()
@@ -505,6 +583,9 @@ class Database:
                 "runtime_adapter": "TEXT NOT NULL DEFAULT 'generic_daily'",
                 "plugin_api_version": "TEXT NOT NULL DEFAULT '1'",
                 "plugin_origin": "TEXT NOT NULL DEFAULT 'builtin'",
+                "framework_id": "TEXT NOT NULL DEFAULT ''",
+                "policy_version": "TEXT NOT NULL DEFAULT ''",
+                "archived": "INTEGER NOT NULL DEFAULT 0",
             }
             for column, definition in strategy_migrations.items():
                 if column not in strategy_columns:
@@ -543,12 +624,17 @@ class Database:
                 "course49_v1",
                 "course49_v2",
                 "course49_v3",
+                "course49_system",
                 "pairs_arbitrage_v1",
             ):
                 connection.execute(
                     "INSERT OR IGNORE INTO paper_accounts(strategy_id, initial_cash, cash, updated_at) VALUES (?, ?, ?, ?)",
                     (strategy_id, initial, initial, now),
                 )
+            connection.execute(
+                """UPDATE paper_accounts SET frozen=1
+                WHERE strategy_id GLOB 'course49_v[0-9]*'"""
+            )
 
     def execute(self, sql: str, params: Iterable[Any] = ()) -> None:
         with self.connect() as connection:
@@ -570,9 +656,10 @@ class Database:
                 """INSERT INTO strategies
                    (strategy_id, version, name, description, frequency, requires_approval, enabled,
                     asset_classes, execution_model, supports_short, data_requirements_json,
-                    strategy_family, lifecycle, scan_enabled, backtest_enabled, runtime_adapter,
-                    plugin_api_version, plugin_origin, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   strategy_family, lifecycle, scan_enabled, backtest_enabled, runtime_adapter,
+                    plugin_api_version, plugin_origin, framework_id, policy_version, archived,
+                    updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(strategy_id) DO UPDATE SET version=excluded.version, name=excluded.name,
                    description=excluded.description, frequency=excluded.frequency,
                    requires_approval=excluded.requires_approval, enabled=excluded.enabled,
@@ -584,6 +671,9 @@ class Database:
                    runtime_adapter=excluded.runtime_adapter,
                    plugin_api_version=excluded.plugin_api_version,
                    plugin_origin=excluded.plugin_origin,
+                   framework_id=excluded.framework_id,
+                   policy_version=excluded.policy_version,
+                   archived=excluded.archived,
                    updated_at=excluded.updated_at""",
                 (
                     metadata.strategy_id,
@@ -607,6 +697,9 @@ class Database:
                     RuntimeAdapter(metadata.runtime_adapter).value,
                     metadata.plugin_api_version,
                     plugin_origin,
+                    metadata.framework_id,
+                    metadata.policy_version,
+                    int(metadata.archived),
                     now,
                 ),
             )
@@ -615,6 +708,11 @@ class Database:
                 "INSERT OR IGNORE INTO paper_accounts(strategy_id, initial_cash, cash, updated_at) VALUES (?, ?, ?, ?)",
                 (metadata.strategy_id, initial, initial, now),
             )
+            if metadata.archived:
+                connection.execute(
+                    "UPDATE paper_accounts SET frozen=1 WHERE strategy_id=?",
+                    (metadata.strategy_id,),
+                )
 
     def upsert_strategy_group(self, group: StrategyGroupDefinition) -> None:
         now = datetime.now().astimezone().isoformat()
@@ -882,6 +980,13 @@ class Database:
                 raise KeyError(signal_id)
             if signal["status"] != SignalStatus.PROPOSED.value:
                 raise ValueError(f"Signal is not pending approval: {signal['status']}")
+            if decision == SignalStatus.APPROVED:
+                account = connection.execute(
+                    "SELECT frozen FROM paper_accounts WHERE strategy_id=?",
+                    (signal["strategy_id"],),
+                ).fetchone()
+                if account is not None and bool(account["frozen"]):
+                    raise ValueError("Archived strategy account is frozen")
             if now > signal["valid_until"]:
                 connection.execute(
                     "UPDATE signals SET status=? WHERE signal_id=?",
@@ -1029,6 +1134,113 @@ class Database:
                 trade_mode,
                 int(bool(state.get("entry_allowed", False))),
                 json.dumps(state, ensure_ascii=False),
+            ),
+        )
+        playbook_states = state.get("playbook_states")
+        if isinstance(playbook_states, list):
+            with self.connect() as connection:
+                for item in playbook_states:
+                    if not isinstance(item, dict) or not item.get("playbook_id"):
+                        continue
+                    connection.execute(
+                        """INSERT OR REPLACE INTO backtest_playbook_states
+                        (backtest_id, strategy_id, timestamp, playbook_id, lifecycle,
+                         admitted, candidate_count, routed_count, budget, blocked_reasons,
+                         funnel_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            backtest_id,
+                            strategy_id,
+                            timestamp,
+                            str(item["playbook_id"]),
+                            str(item.get("lifecycle", "")),
+                            int(bool(item.get("admitted", False))),
+                            int(item.get("candidate_count", 0) or 0),
+                            int(item.get("routed_count", 0) or 0),
+                            float(item.get("budget", 0.0) or 0.0),
+                            json.dumps(item.get("blocked_reasons") or [], ensure_ascii=False),
+                            json.dumps(state.get("funnel") or {}, ensure_ascii=False),
+                        ),
+                    )
+
+    def register_framework(
+        self,
+        framework: dict[str, Any],
+        playbooks: Iterable[dict[str, Any]],
+        *,
+        policy_version: str,
+    ) -> None:
+        now = datetime.now().astimezone().isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE strategy_playbooks SET enabled=0 WHERE framework_id=?",
+                (str(framework["framework_id"]),),
+            )
+            connection.execute(
+                """INSERT INTO strategy_frameworks
+                (framework_id, version, name, description, strategy_id, policy_version,
+                 enabled, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(framework_id) DO UPDATE SET
+                version=excluded.version, name=excluded.name,
+                description=excluded.description, strategy_id=excluded.strategy_id,
+                policy_version=excluded.policy_version, enabled=1,
+                updated_at=excluded.updated_at""",
+                (
+                    str(framework["framework_id"]),
+                    str(framework["version"]),
+                    str(framework["name"]),
+                    str(framework["description"]),
+                    str(framework["strategy_id"]),
+                    policy_version,
+                    now,
+                    now,
+                ),
+            )
+            for playbook in playbooks:
+                connection.execute(
+                    """INSERT INTO strategy_playbooks
+                    (playbook_id, framework_id, version, name, description, lifecycle,
+                     base_weight, market_phase, data_requirements_json, enabled, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                    ON CONFLICT(playbook_id) DO UPDATE SET
+                    framework_id=excluded.framework_id, version=excluded.version,
+                    name=excluded.name, description=excluded.description,
+                    lifecycle=excluded.lifecycle, base_weight=excluded.base_weight,
+                    market_phase=excluded.market_phase,
+                    data_requirements_json=excluded.data_requirements_json,
+                    enabled=excluded.enabled, updated_at=excluded.updated_at""",
+                    (
+                        str(playbook["playbook_id"]),
+                        str(playbook["framework_id"]),
+                        str(playbook["version"]),
+                        str(playbook["name"]),
+                        str(playbook["description"]),
+                        str(playbook["lifecycle"]),
+                        float(playbook.get("base_weight", 0.0) or 0.0),
+                        str(playbook.get("market_phase", "")),
+                        json.dumps(playbook.get("data_requirements") or [], ensure_ascii=False),
+                        now,
+                    ),
+                )
+
+    def add_snapshot_dependency(
+        self,
+        snapshot_id: str,
+        dependency_type: str,
+        dependency_id: str,
+        coverage: dict[str, Any] | None = None,
+    ) -> None:
+        self.execute(
+            """INSERT OR REPLACE INTO snapshot_dependencies
+            (snapshot_id, dependency_type, dependency_id, coverage_json, created_at)
+            VALUES (?, ?, ?, ?, ?)""",
+            (
+                snapshot_id,
+                dependency_type,
+                dependency_id,
+                json.dumps(coverage or {}, ensure_ascii=False),
+                datetime.now().astimezone().isoformat(),
             ),
         )
 

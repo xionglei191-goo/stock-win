@@ -43,6 +43,11 @@ from .models import (
 from .plugin_loader import load_strategy_registry
 from .registry import SourceRegistry
 from .storage import Database, ParquetSnapshotStore
+from .strategies.course49_system import (
+    CONTEXT_VERSION,
+    POLICY_VERSION,
+    framework_metadata,
+)
 from .strategies import (
     build_course49_eligibility_matrix,
     build_course49_feature_matrix,
@@ -107,6 +112,13 @@ class BacktestService:
                 strategy.metadata,
                 getattr(strategy, "__plugin_origin__", "builtin"),
             )
+        system = self.strategies.get("course49_system")
+        if system is not None:
+            self.database.register_framework(
+                framework_metadata().as_record(),
+                [item.metadata.as_record() for item in system.playbooks],
+                policy_version=POLICY_VERSION,
+            )
         for group in built_in_groups():
             self.database.upsert_strategy_group(group)
         self.catalog = StrategyCatalog(self.strategies, self.database.load_strategy_groups())
@@ -124,6 +136,13 @@ class BacktestService:
             self.database.register_strategy(
                 strategy.metadata,
                 getattr(strategy, "__plugin_origin__", "builtin"),
+            )
+        system = strategies.get("course49_system")
+        if system is not None:
+            self.database.register_framework(
+                framework_metadata().as_record(),
+                [item.metadata.as_record() for item in system.playbooks],
+                policy_version=POLICY_VERSION,
             )
 
     def _strategy_family(self, strategy_id: str) -> str:
@@ -158,6 +177,7 @@ class BacktestService:
         sample_seed: int = 49,
         execution_cost_multiplier: float = 1.0,
         refresh_data: bool = False,
+        playbook_ids: list[str] | None = None,
         progress_callback: Callable[..., None] | None = None,
     ) -> dict[str, Any]:
         run_started = perf_counter()
@@ -203,6 +223,9 @@ class BacktestService:
         start_date, end_date = _validate_date_range(start_date, end_date)
         count = _required_daily_bars(daily_bars, start_date, end_date)
         stock_codes = stock_codes or []
+        playbook_ids = list(dict.fromkeys(playbook_ids or []))
+        if playbook_ids and "course49_system" not in component_ids:
+            raise ValueError("playbook_ids is only supported by course49_system backtests")
         if universe == "custom" and not stock_codes:
             raise ValueError("Custom universe requires at least one stock code")
         course49_ids = tuple(
@@ -263,6 +286,7 @@ class BacktestService:
             "sample_seed": sample_seed,
             "execution_cost_multiplier": execution_cost_multiplier,
             "refresh_data": bool(refresh_data),
+            "playbook_ids": playbook_ids,
             "resolved_daily_bars": count,
             "data_plan": data_plan.as_dict(),
             "data_cache_key": data_cache_key,
@@ -270,6 +294,16 @@ class BacktestService:
             "worker_threads": self.config.performance.worker_threads,
             "memory_cache_limit_bytes": self.config.performance.memory_cache_bytes,
             "components": list(component_ids),
+            "framework_versions": {
+                item: self.strategies[item].metadata.framework_id
+                for item in component_ids
+                if self.strategies[item].metadata.framework_id
+            },
+            "policy_versions": {
+                item: self.strategies[item].metadata.policy_version
+                for item in component_ids
+                if self.strategies[item].metadata.policy_version
+            },
             "capital_weights": capital_weights,
             "composition_mode": (
                 strategy_group.composition_mode.value if strategy_group else "standalone"
@@ -358,7 +392,9 @@ class BacktestService:
 
                 return report
 
-            with TdxProvider(self.config, __file__) as provider:
+            with TdxProvider(
+                self.config, __file__, cache_reads=not refresh_data
+            ) as provider:
                 self._progress(progress_callback, "MARKET_DATA", 0.08, "正在读取通达信行情")
                 stage_started = perf_counter()
                 codes, names = provider.list_a_shares()
@@ -688,6 +724,21 @@ class BacktestService:
                                 "end": requested_end.date().isoformat(),
                             },
                         )
+                    for event_dataset in (
+                        "dragon_tiger",
+                        "limit_behavior",
+                        "market_activity",
+                    ):
+                        if self.snapshots.has_dataset(snapshot_id, event_dataset):
+                            self.database.add_snapshot_dependency(
+                                snapshot_id,
+                                "EVENT_FRAGMENT",
+                                f"{snapshot_id}:{event_dataset}",
+                                {
+                                    "start": lhb_start_day.date().isoformat(),
+                                    "end": requested_end.date().isoformat(),
+                                },
+                            )
                     stage_durations["course49_data"] = perf_counter() - stage_started
 
                 parameters["effective_batch_sizes"] = provider.effective_batch_sizes()
@@ -698,7 +749,21 @@ class BacktestService:
                 provider.__exit__(None, None, None)
 
                 stage_started = perf_counter()
-                self._progress(progress_callback, "STRATEGY_EXECUTION", 0.82, "正在执行策略")
+                if "course49_system" in component_ids:
+                    self._progress(
+                        progress_callback,
+                        "COURSE49_CONTEXT",
+                        0.80,
+                        "正在构建共享市场、题材、龙头和资金上下文",
+                    )
+                    self._progress(
+                        progress_callback,
+                        "PLAYBOOK_EVALUATION",
+                        0.82,
+                        "正在评估生产剧本",
+                    )
+                else:
+                    self._progress(progress_callback, "STRATEGY_EXECUTION", 0.82, "正在执行策略")
                 results = self._execute_components(
                     backtest_id,
                     strategy_id,
@@ -721,6 +786,13 @@ class BacktestService:
                     snapshot_id=snapshot_id,
                     parameters=parameters,
                 )
+                if "course49_system" in component_ids:
+                    self._progress(
+                        progress_callback,
+                        "ROUTING",
+                        0.94,
+                        "剧本去重、排序和资金路由已完成",
+                    )
                 stage_durations["strategy_execution"] = perf_counter() - stage_started
 
                 metrics = self._combine_results(results)
@@ -734,6 +806,12 @@ class BacktestService:
                 parameters["stage_durations_seconds"] = {
                     key: round(value, 3) for key, value in stage_durations.items()
                 }
+                self._progress(
+                    progress_callback,
+                    "PERSISTENCE",
+                    0.97,
+                    "正在保存回测、状态和证据",
+                )
                 self.database.execute(
                     """UPDATE backtests SET status='SUCCEEDED', finished_at=?, snapshot_id=?,
                     parameters_json=?, metrics_json=?
@@ -933,13 +1011,29 @@ class BacktestService:
             parameters["sector_membership_effective_asof"] = sector_query.get("asof", "")
             parameters["sector_membership_hash"] = sector_query.get("content_hash", "")
 
-        self._progress(
-            progress_callback,
-            "STRATEGY_EXECUTION",
-            0.35,
-            "快照已就绪，正在执行策略",
-            cache_status=parameters["cache_status"],
-        )
+        if "course49_system" in component_ids:
+            self._progress(
+                progress_callback,
+                "COURSE49_CONTEXT",
+                0.30,
+                "快照已就绪，正在构建共享上下文",
+                cache_status=parameters["cache_status"],
+            )
+            self._progress(
+                progress_callback,
+                "PLAYBOOK_EVALUATION",
+                0.35,
+                "正在评估生产剧本",
+                cache_status=parameters["cache_status"],
+            )
+        else:
+            self._progress(
+                progress_callback,
+                "STRATEGY_EXECUTION",
+                0.35,
+                "快照已就绪，正在执行策略",
+                cache_status=parameters["cache_status"],
+            )
         strategy_started = perf_counter()
         results = self._execute_components(
             backtest_id,
@@ -1010,6 +1104,19 @@ class BacktestService:
             snapshot_id,
             component_ids,
             dataset,
+        )
+        if "course49_system" in component_ids:
+            self._progress(
+                progress_callback,
+                "ROUTING",
+                0.92,
+                "剧本去重、排序和资金路由已完成",
+                cache_status=parameters["cache_status"],
+            )
+        prepared["playbook_ids"] = list(parameters.get("playbook_ids") or [])
+        prepared["stock_pool_hash"] = str(parameters.get("stock_pool_hash") or "")
+        prepared["sector_membership_hash"] = str(
+            parameters.get("sector_membership_hash") or ""
         )
         parameters["feature_cache"] = prepared.get("cache_status", {})
         results: dict[str, dict[str, Any]] = {}
@@ -1100,7 +1207,9 @@ class BacktestService:
         if not course49_ids:
             return {"cache_status": {}}
         cache_status: dict[str, str] = {}
-        market_key = self.cache.feature_key(snapshot_id, "course49_market", "2")
+        market_key = self.cache.feature_key(
+            snapshot_id, "course49_market", CONTEXT_VERSION + "-market-2"
+        )
         market_matrix, cache_status["market_matrix"] = self.cache.get_or_build_feature_frames(
             market_key,
             lambda: build_course49_market_matrix(
@@ -1116,7 +1225,9 @@ class BacktestService:
         }
         families = {self._strategy_family(item) for item in course49_ids}
         if "course49_v2" in families:
-            feature_key = self.cache.feature_key(snapshot_id, "course49_v2_features", "1")
+            feature_key = self.cache.feature_key(
+                snapshot_id, "course49_v2_features", CONTEXT_VERSION
+            )
             feature_matrix, cache_status["feature_matrix"] = self.cache.get_or_build_feature_frames(
                 feature_key,
                 lambda: build_course49_feature_matrix(
@@ -1130,7 +1241,7 @@ class BacktestService:
             eligibility_key = self.cache.feature_key(
                 snapshot_id,
                 "course49_eligibility",
-                "1",
+                CONTEXT_VERSION,
                 {"listing_bars": 60, "turnover": 20_000_000},
             )
             eligibility, cache_status["eligibility_matrix"] = self.cache.get_or_build_feature_frames(
@@ -1145,7 +1256,7 @@ class BacktestService:
             candidates_key = self.cache.feature_key(
                 snapshot_id,
                 "course49_v2_candidates",
-                "1",
+                CONTEXT_VERSION,
             )
             v2_candidates, cache_status["v2_candidate_matrix"] = (
                 self.cache.get_or_build_feature_frames(
@@ -1244,6 +1355,13 @@ class BacktestService:
         }
         backtest_id = uuid4().hex
         started_at = datetime.now().astimezone().isoformat()
+        self._progress(
+            progress_callback,
+            "PERSISTENCE",
+            0.97,
+            "正在保存回测、状态和证据",
+            cache_status=parameters["cache_status"],
+        )
         self.database.execute(
             """INSERT INTO backtests
             (backtest_id, strategy_id, status, started_at, start_date, end_date, parameters_json)
@@ -1592,6 +1710,19 @@ class BacktestService:
                     )
                 if family == "course49_v2":
                     scan_arguments["eligible_codes"] = eligible_codes
+                if strategy_id == "course49_system":
+                    scan_arguments["playbook_ids"] = tuple(
+                        prepared_features.get("playbook_ids")
+                        or []
+                    ) or None
+                    scan_arguments["context_metadata"] = {
+                        "stock_pool_hash": prepared_features.get("stock_pool_hash", ""),
+                        "sector_membership_hash": prepared_features.get(
+                            "sector_membership_hash", ""
+                        ),
+                        "market_count": len(daily_front),
+                        "eligible_count": len(eligible_codes),
+                    }
                 result = strategy.scan(**scan_arguments)
                 if is_adaptive:
                     runtime_state = dict(result.state.get("runtime_state") or {})
@@ -1636,6 +1767,10 @@ class BacktestService:
             metrics["trade_mode_attribution"] = _evidence_attribution(trade_frame, "trade_mode")
             metrics["exit_reason_attribution"] = _exit_reason_attribution(trade_frame)
             metrics["average_capital_invested"] = _average_capital_invested(equity, initial_cash)
+        if strategy_id == "course49_system":
+            metrics["playbook_attribution"] = _evidence_attribution(
+                trade_frame, "playbook_id"
+            )
         self._persist_rows(backtest_id, strategy_id, equity, trade_frame)
         return {"metrics": metrics, "equity": equity, "trades": trade_frame}
 
@@ -2196,8 +2331,8 @@ class BacktestService:
                 connection.execute(
                     """INSERT INTO backtest_trades
                     (backtest_id, strategy_id, timestamp, code, side, quantity, price, fees, pnl,
-                     reason, evidence, group_key, leg_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     reason, evidence, group_key, leg_id, framework_id, playbook_id, policy_version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         backtest_id, strategy_id, str(row["timestamp"]), str(row["code"]), str(row["side"]),
                         int(row["quantity"]), float(row["price"]), float(row["fees"]),
@@ -2206,6 +2341,9 @@ class BacktestService:
                         str(row.get("evidence", "{}")),
                         str(row.get("group_key", "")),
                         str(row.get("leg_id", "")),
+                        str(row.get("framework_id", "")),
+                        str(row.get("playbook_id", "")),
+                        str(row.get("policy_version", "")),
                     ),
                 )
 
@@ -2911,6 +3049,9 @@ def _trade(
         "pnl": pnl,
         "reason": ",".join(signal.reason_codes),
         "evidence": json.dumps(signal.evidence, ensure_ascii=False),
+        "framework_id": signal.framework_id,
+        "playbook_id": signal.playbook_id,
+        "policy_version": signal.policy_version,
     }
 
 

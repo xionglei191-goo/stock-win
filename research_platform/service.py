@@ -51,6 +51,11 @@ from .models import (
 from .plugin_loader import load_strategy_registry
 from .portfolio import PaperPortfolio
 from .storage import Database, ParquetSnapshotStore
+from .strategies.course49_system import (
+    POLICY_VERSION,
+    framework_metadata,
+    production_playbooks,
+)
 
 
 class PlatformService:
@@ -68,10 +73,21 @@ class PlatformService:
                 strategy.metadata,
                 getattr(strategy, "__plugin_origin__", "builtin"),
             )
+        self._register_frameworks()
         for group in built_in_groups():
             self.database.upsert_strategy_group(group)
         self.catalog = StrategyCatalog(self.strategies, self.database.load_strategy_groups())
         self.composition = CompositionEngine()
+
+    def _register_frameworks(self) -> None:
+        strategy = self.strategies.get("course49_system")
+        if strategy is None:
+            return
+        self.database.register_framework(
+            framework_metadata().as_record(),
+            [item.metadata.as_record() for item in strategy.playbooks],
+            policy_version=POLICY_VERSION,
+        )
 
     def refresh_catalog(self) -> None:
         self.catalog = StrategyCatalog(self.strategies, self.database.load_strategy_groups())
@@ -93,20 +109,31 @@ class PlatformService:
         self.strategies = strategies
         self.plugin_issues = issues
         self.catalog = catalog
+        for strategy in strategies.values():
+            self.database.register_strategy(
+                strategy.metadata,
+                getattr(strategy, "__plugin_origin__", "builtin"),
+            )
+        self._register_frameworks()
         for strategy in self.strategies.values():
             self.database.register_strategy(
                 strategy.metadata,
                 getattr(strategy, "__plugin_origin__", "builtin"),
             )
+        self._register_frameworks()
         return self.strategy_catalog()
 
     def strategy_catalog(self) -> dict[str, Any]:
         payload = self.catalog.as_records()
+        payload["frameworks"] = self.frameworks()
         payload["plugin_issues"] = [
             *[issue.as_record() for issue in self.plugin_issues],
             *self.catalog.group_issues,
         ]
-        for strategy in payload["strategies"]:
+        for strategy in [
+            *payload["strategies"],
+            *payload.get("archived_strategies", []),
+        ]:
             requirements = strategy.get("data_requirements", [])
             if not isinstance(requirements, list):
                 continue
@@ -123,6 +150,116 @@ class PlatformService:
                     requirement["cacheable"] = False
                     requirement["available"] = False
         return payload
+
+    def frameworks(self) -> list[dict[str, Any]]:
+        frameworks = self.database.query(
+            "SELECT * FROM strategy_frameworks WHERE enabled=1 ORDER BY framework_id"
+        )
+        playbooks = self.database.query(
+            "SELECT * FROM strategy_playbooks WHERE enabled=1 ORDER BY framework_id, playbook_id"
+        )
+        for row in playbooks:
+            try:
+                row["data_requirements"] = json.loads(
+                    str(row.pop("data_requirements_json", "[]"))
+                )
+            except json.JSONDecodeError:
+                row["data_requirements"] = []
+        for framework in frameworks:
+            framework["playbooks"] = [
+                item for item in playbooks if item["framework_id"] == framework["framework_id"]
+            ]
+        return frameworks
+
+    def framework_detail(self, framework_id: str) -> dict[str, Any]:
+        frameworks = [item for item in self.frameworks() if item["framework_id"] == framework_id]
+        if not frameworks:
+            raise KeyError(framework_id)
+        framework = frameworks[0]
+        recent_runs = self.database.query(
+            """SELECT * FROM runs WHERE status='SUCCEEDED' AND run_type='scan'
+            ORDER BY finished_at DESC LIMIT 100"""
+        )
+        run = None
+        state: dict[str, Any] = {}
+        candidates: list[dict[str, Any]] = []
+        for candidate_run in recent_runs:
+            try:
+                metadata = json.loads(str(candidate_run.get("metadata_json") or "{}"))
+            except json.JSONDecodeError:
+                continue
+            strategy_states = metadata.get("strategies") or {}
+            candidate_state = strategy_states.get(framework["strategy_id"]) or {}
+            if candidate_state:
+                run = candidate_run
+                state = candidate_state
+                framework_candidates = metadata.get("framework_candidates") or {}
+                candidates = list(framework_candidates.get(framework_id) or [])
+                break
+        signals = self.database.query(
+            """SELECT * FROM signals WHERE framework_id=?
+            ORDER BY generated_at DESC LIMIT 100""",
+            (framework_id,),
+        )
+        positions = self.database.query(
+            "SELECT * FROM paper_positions WHERE strategy_id=? ORDER BY code",
+            (framework["strategy_id"],),
+        )
+        runtime_states = self.database.query(
+            """SELECT scope, asof, state_json FROM strategy_runtime_states
+            WHERE strategy_id=? ORDER BY scope""",
+            (framework["strategy_id"],),
+        )
+        backtest_rows = self.database.query(
+            """SELECT b.* FROM backtests b
+            WHERE EXISTS (
+                SELECT 1 FROM backtest_states s
+                WHERE s.backtest_id=b.backtest_id AND s.strategy_id=?
+            )
+            ORDER BY b.started_at DESC LIMIT 1""",
+            (framework["strategy_id"],),
+        )
+        backtest_id = str(backtest_rows[0]["backtest_id"]) if backtest_rows else ""
+        history = (
+            self.database.query(
+                """SELECT * FROM backtest_states WHERE backtest_id=? AND strategy_id=?
+                ORDER BY timestamp DESC LIMIT 120""",
+                (backtest_id, framework["strategy_id"]),
+            )
+            if backtest_id
+            else []
+        )
+        playbook_history = (
+            self.database.query(
+                """SELECT * FROM backtest_playbook_states
+                WHERE backtest_id=? AND strategy_id=?
+                ORDER BY timestamp DESC, playbook_id LIMIT 360""",
+                (backtest_id, framework["strategy_id"]),
+            )
+            if backtest_id
+            else []
+        )
+        if not state and history:
+            try:
+                fallback_state = json.loads(str(history[0].get("state_json") or "{}"))
+            except (json.JSONDecodeError, TypeError):
+                fallback_state = {}
+            if isinstance(fallback_state, dict):
+                state = fallback_state
+                candidates = list(fallback_state.get("route_audit") or [])
+                state["context_source"] = "latest_backtest"
+        return {
+            **framework,
+            "latest_run": run,
+            "state": state,
+            "candidates": candidates,
+            "signals": signals,
+            "positions": positions,
+            "runtime_states": runtime_states,
+            "history": history,
+            "playbook_history": playbook_history,
+            "latest_backtest": backtest_rows[0] if backtest_rows else None,
+        }
 
     def save_strategy_group(self, group: StrategyGroupDefinition) -> None:
         group.validate(self.strategies)
@@ -279,7 +416,9 @@ class PlatformService:
                     cache_status="refresh" if refresh_data else "",
                     waiting_reason="single_tdx_channel",
                 )
-            with TdxProvider(self.config, __file__) as provider:
+            with TdxProvider(
+                self.config, __file__, cache_reads=not refresh_data
+            ) as provider:
                 if progress_callback is not None:
                     progress_callback(
                         phase="MARKET_DATA",
@@ -436,6 +575,14 @@ class PlatformService:
                     if self._runtime_adapter(item) == RuntimeAdapter.COURSE49_DAILY
                 )
                 if course49_ids:
+                    if progress_callback is not None:
+                        progress_callback(
+                            phase="EVENT_INCREMENT",
+                            progress=0.52,
+                            detail="正在补齐49课事件数据",
+                            cache_status="refresh" if refresh_data else "miss",
+                            waiting_reason="",
+                        )
                     limit_codes = self._latest_limit_codes(eligible_raw, names)
                     limit_snapshot = provider.fetch_limit_snapshot(limit_codes) if limit_codes else {}
                     course49_positions = [
@@ -532,6 +679,14 @@ class PlatformService:
                         for item in course49_ids
                         if self._strategy_family(item) != "course49_v1"
                     ):
+                        if progress_callback is not None and adaptive_id == "course49_system":
+                            progress_callback(
+                                phase="COURSE49_CONTEXT",
+                                progress=0.80,
+                                detail="正在构建共享市场、题材、龙头和资金上下文",
+                                cache_status="",
+                                waiting_reason="",
+                            )
                         adaptive_result = self.strategies[adaptive_id].scan(
                             run_id=run_id,
                             front_bars=eligible_front,
@@ -544,6 +699,20 @@ class PlatformService:
                             limit_snapshot=limit_snapshot,
                             lhb_history=lhb_history,
                             market_activity=market_activity,
+                            **(
+                                {
+                                    "context_metadata": {
+                                        "market_count": len(front_bars),
+                                        "eligible_count": len(eligible_front),
+                                        "stock_pool_hash": _stock_pool_hash(
+                                            list(eligible_front)
+                                        ),
+                                        "sector_membership_hash": sector_hash,
+                                    }
+                                }
+                                if adaptive_id == "course49_system"
+                                else {}
+                            ),
                         )
                         results.append(adaptive_result)
                         latest_asof = str(
@@ -554,6 +723,14 @@ class PlatformService:
                             dict(adaptive_result.state.get("runtime_state") or {}),
                             latest_asof,
                         )
+                        if progress_callback is not None and adaptive_id == "course49_system":
+                            progress_callback(
+                                phase="PLAYBOOK_ROUTING",
+                                progress=0.88,
+                                detail="剧本评估和统一路由已完成",
+                                cache_status="",
+                                waiting_reason="",
+                            )
 
                 generic_ids = [
                     item
@@ -610,6 +787,14 @@ class PlatformService:
                     results = self.composition.compose(requested_groups[0], results, run_id)
                 signals = [signal for result in results for signal in result.signals]
                 order_groups = [intent for result in results for intent in result.order_groups]
+                if progress_callback is not None:
+                    progress_callback(
+                        phase="PERSISTENCE",
+                        progress=0.92,
+                        detail="正在持久化信号、状态和证据",
+                        cache_status="",
+                        waiting_reason="",
+                    )
                 self.database.save_signals(signals)
                 self.database.save_order_groups(order_groups)
                 self.portfolio.queue_approved(signals)
@@ -661,11 +846,27 @@ class PlatformService:
                         market_activity_rows,
                         {"start": activity_start, "end": lhb_end},
                     )
+                    for event_dataset in (
+                        "dragon_tiger",
+                        "limit_behavior",
+                        "market_activity",
+                    ):
+                        self.database.add_snapshot_dependency(
+                            snapshot_id,
+                            "EVENT_FRAGMENT",
+                            f"{snapshot_id}:{event_dataset}",
+                            {"start": lhb_start, "end": lhb_end},
+                        )
                 if push_tdx:
                     self._push_scan(provider, results)
 
             metadata = {
                 "strategies": {result.strategy.strategy_id: result.state for result in results},
+                "framework_candidates": {
+                    result.strategy.framework_id: list(result.candidates)
+                    for result in component_results
+                    if result.strategy.framework_id
+                },
                 "components": [result.strategy.strategy_id for result in component_results],
                 "requested": requested_ids,
                 "composition_mode": (
@@ -830,7 +1031,9 @@ class PlatformService:
                 build_key, snapshot_id, data_asof, query, coverage
             )
             try:
-                with TdxProvider(self.config, __file__) as provider:
+                with TdxProvider(
+                    self.config, __file__, cache_reads=not refresh_data
+                ) as provider:
                     codes, names = provider.list_a_shares()
                     bars = provider.fetch_bars(
                         codes, "1d", daily_bars, dividend_type="front"
@@ -899,6 +1102,7 @@ class PlatformService:
         course49 = by_strategy.get("course49_v1")
         course49_v2 = by_strategy.get("course49_v2")
         course49_v3 = by_strategy.get("course49_v3")
+        course49_system = by_strategy.get("course49_system")
         if chan:
             provider.push_candidates(
                 "RP_CHAN", "缠论候选", [signal.code for signal in chan.signals if signal.side == "BUY"]
@@ -924,6 +1128,16 @@ class PlatformService:
                 [
                     signal.code
                     for signal in course49_v3.signals
+                    if signal.status == SignalStatus.PROPOSED
+                ],
+            )
+        if course49_system:
+            provider.push_candidates(
+                "RP49_SYS",
+                "49课体系候选",
+                [
+                    signal.code
+                    for signal in course49_system.signals
                     if signal.status == SignalStatus.PROPOSED
                 ],
             )

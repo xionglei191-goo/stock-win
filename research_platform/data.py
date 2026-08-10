@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
@@ -11,6 +11,7 @@ from strategy_v1.config import StrategyConfig
 from strategy_v1.tdx_adapter import TdxAdapter
 
 from .config import PlatformConfig
+from .data_cache import canonical_hash, shared_memory_cache
 from .course49_market import MARKET_ACTIVITY_FIELDS
 from .lhb import COURSE49_FIELDS, LHB_FIELDS
 from .models import DataHealth, DataStatus
@@ -23,7 +24,13 @@ def _chunks(values: list[str], size: int) -> Iterable[list[str]]:
 
 
 class TdxProvider(AbstractContextManager["TdxProvider"]):
-    def __init__(self, config: PlatformConfig, caller_path: str | Path):
+    def __init__(
+        self,
+        config: PlatformConfig,
+        caller_path: str | Path,
+        *,
+        cache_reads: bool = True,
+    ):
         legacy = StrategyConfig(
             tdx_root=config.tdx_root,
             batch_size=config.performance.bar_batch_size,
@@ -36,6 +43,9 @@ class TdxProvider(AbstractContextManager["TdxProvider"]):
             minimum_batch_size=config.performance.minimum_batch_size,
         )
         self.successful_event_batch_sizes: list[int] = []
+        self.memory = shared_memory_cache(config)
+        self.cache_reads = cache_reads
+        self.memory_hits = 0
 
     def __enter__(self) -> "TdxProvider":
         self.adapter.__enter__()
@@ -45,7 +55,13 @@ class TdxProvider(AbstractContextManager["TdxProvider"]):
         self.adapter.__exit__(exc_type, exc_value, traceback)
 
     def list_a_shares(self) -> tuple[list[str], dict[str, str]]:
-        return self.adapter.list_a_shares()
+        key = self._memory_key("a_share_master", {"asof": date.today().isoformat()})
+        cached = self._memory_get(key)
+        if isinstance(cached, tuple):
+            return cached
+        result = self.adapter.list_a_shares()
+        self.memory.put(key, result)
+        return result
 
     def fetch_bars(
         self,
@@ -60,6 +76,25 @@ class TdxProvider(AbstractContextManager["TdxProvider"]):
         warmup_bars: int = 0,
         batch_callback: Callable[[int, int, int], None] | None = None,
     ) -> dict[str, pd.DataFrame]:
+        cache_key = self._memory_key(
+            "bars",
+            {
+                "codes": codes,
+                "period": period,
+                "count": count,
+                "fields": fields,
+                "dividend_type": dividend_type,
+                "start_time": start_time,
+                "end_time": end_time,
+                "warmup_bars": warmup_bars,
+                "latest_asof": "" if end_time else date.today().isoformat(),
+            },
+        )
+        cached = self._memory_get(cache_key)
+        if isinstance(cached, dict):
+            if batch_callback is not None:
+                batch_callback(len(codes), len(codes), len(codes))
+            return cached
         bars = self.adapter.fetch_bars(
             codes,
             period,
@@ -79,17 +114,36 @@ class TdxProvider(AbstractContextManager["TdxProvider"]):
             frame.attrs["timezone"] = self.config.timezone
             frame.attrs["source"] = "tdx"
             frame.attrs["adjustment"] = dividend_type
+        self.memory.put(cache_key, bars)
         return bars
 
     def load_sectors(self, refresh: bool = False) -> dict[str, dict[str, Any]]:
-        return self.adapter.load_sector_members(refresh=refresh)
+        key = self._memory_key(
+            "sectors",
+            {"asof": date.today().isoformat()},
+        )
+        if not refresh:
+            cached = self._memory_get(key)
+            if isinstance(cached, dict):
+                return cached
+        result = self.adapter.load_sector_members(refresh=refresh)
+        self.memory.put(key, result)
+        return result
 
     def fetch_limit_snapshot(self, codes: list[str]) -> dict[str, dict[str, Any]]:
+        key = self._memory_key(
+            "limit_snapshot",
+            {"codes": codes, "asof": date.today().isoformat()},
+        )
+        cached = self._memory_get(key)
+        if isinstance(cached, dict):
+            return cached
         result: dict[str, dict[str, Any]] = {}
         for batch in _chunks(codes, self.config.performance.event_batch_size):
             raw = self.adapter.tq.get_zdt_data(stock_list=batch)
             if isinstance(raw, dict):
                 result.update({str(code): value for code, value in raw.items() if isinstance(value, dict)})
+        self.memory.put(key, result)
         return result
 
     def fetch_lhb_history(
@@ -110,6 +164,15 @@ class TdxProvider(AbstractContextManager["TdxProvider"]):
         end_time: str,
         batch_callback: Callable[[int, int, int], None] | None = None,
     ) -> dict[str, dict[str, list[dict[str, Any]]]]:
+        key = self._memory_key(
+            "course49_events",
+            {"codes": codes, "start_time": start_time, "end_time": end_time},
+        )
+        cached = self._memory_get(key)
+        if isinstance(cached, dict):
+            if batch_callback is not None:
+                batch_callback(len(codes), len(codes), len(codes))
+            return cached
         result: dict[str, dict[str, list[dict[str, Any]]]] = {}
         for raw in self._iter_professional_history(
             codes,
@@ -119,6 +182,7 @@ class TdxProvider(AbstractContextManager["TdxProvider"]):
             batch_callback=batch_callback,
         ):
             result.update(raw)
+        self.memory.put(key, result)
         return result
 
     def iter_course49_history(
@@ -191,6 +255,7 @@ class TdxProvider(AbstractContextManager["TdxProvider"]):
             "event_min_success": min(event_sizes) if event_sizes else 0,
             "event_max_success": max(event_sizes) if event_sizes else 0,
             "event_batches": len(event_sizes),
+            "memory_hits": self.memory_hits,
         }
 
     def fetch_market_activity(
@@ -198,6 +263,13 @@ class TdxProvider(AbstractContextManager["TdxProvider"]):
         start_time: str,
         end_time: str,
     ) -> dict[str, list[dict[str, Any]]]:
+        key = self._memory_key(
+            "market_activity",
+            {"start_time": start_time, "end_time": end_time},
+        )
+        cached = self._memory_get(key)
+        if isinstance(cached, dict):
+            return cached
         raw = self.adapter.tq.get_scjy_value(
             field_list=list(MARKET_ACTIVITY_FIELDS),
             start_time=start_time,
@@ -205,11 +277,30 @@ class TdxProvider(AbstractContextManager["TdxProvider"]):
         )
         if not isinstance(raw, dict):
             return {}
-        return {
+        result = {
             str(field): rows
             for field, rows in raw.items()
             if isinstance(rows, list)
         }
+        self.memory.put(key, result)
+        return result
+
+    def _memory_key(self, dataset: str, query: dict[str, Any]) -> str:
+        return "tdx:" + canonical_hash(
+            {
+                "dataset": dataset,
+                "provider": "tdx",
+                "query": query,
+            }
+        )
+
+    def _memory_get(self, key: str) -> Any | None:
+        if not self.cache_reads:
+            return None
+        value = self.memory.get(key)
+        if value is not None:
+            self.memory_hits += 1
+        return value
 
     def push_candidates(self, block_code: str, block_name: str, codes: list[str], show: bool = False) -> Any:
         existing = self.adapter.tq.get_user_sector()

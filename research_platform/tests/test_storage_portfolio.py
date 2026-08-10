@@ -22,10 +22,16 @@ from research_platform.storage import Database, ParquetSnapshotStore
 from research_platform.tests.helpers import temporary_config
 
 
-def signal(side: str, generated_at: datetime, status: SignalStatus) -> PlatformSignal:
+def signal(
+    side: str,
+    generated_at: datetime,
+    status: SignalStatus,
+    *,
+    strategy_id: str = "course49_system",
+) -> PlatformSignal:
     return PlatformSignal(
         run_id="run",
-        strategy_id="course49_v1",
+        strategy_id=strategy_id,
         strategy_version="1.0.0",
         generated_at=generated_at,
         available_at=generated_at,
@@ -48,7 +54,7 @@ class StoragePortfolioTests(unittest.TestCase):
         self.config = temporary_config(Path(self.temp.name))
         self.database = Database(self.config)
         self.database.initialize()
-        self.database.create_run("run", "scan", "research", ["course49_v1"])
+        self.database.create_run("run", "scan", "research", ["course49_system"])
         self.portfolio = PaperPortfolio(self.config, self.database)
 
     def tearDown(self) -> None:
@@ -64,6 +70,27 @@ class StoragePortfolioTests(unittest.TestCase):
         self.assertEqual(decisions[0]["note"], "确认题材")
         self.assertEqual(orders[0]["status"], "PENDING")
 
+    def test_archived_strategy_signal_cannot_be_approved(self) -> None:
+        proposed = signal(
+            "BUY",
+            datetime.now().astimezone(),
+            SignalStatus.PROPOSED,
+            strategy_id="course49_v2",
+        )
+        self.database.save_signals([proposed])
+        with self.assertRaisesRegex(ValueError, "account is frozen"):
+            self.database.decide_signal(
+                proposed.signal_id,
+                SignalStatus.APPROVED,
+                "旧策略只允许回放",
+            )
+        self.assertFalse(
+            self.database.query(
+                "SELECT * FROM paper_orders WHERE signal_id=?",
+                (proposed.signal_id,),
+            )
+        )
+
     def test_schema_migration_is_serialized_across_instances(self) -> None:
         config = temporary_config(Path(self.temp.name) / "parallel")
         with ThreadPoolExecutor(max_workers=4) as executor:
@@ -74,7 +101,7 @@ class StoragePortfolioTests(unittest.TestCase):
         }
         self.assertIn("entry_fees", columns)
 
-    def test_v5_database_migrates_to_v8_cache_schema(self) -> None:
+    def test_v5_database_migrates_to_v9_framework_schema(self) -> None:
         config = temporary_config(Path(self.temp.name) / "v5")
         config.database_path.parent.mkdir(parents=True)
         connection = sqlite3.connect(config.database_path)
@@ -103,7 +130,7 @@ class StoragePortfolioTests(unittest.TestCase):
         strategy_columns = {row["name"] for row in database.query("PRAGMA table_info(strategies)")}
         decision_columns = {row["name"] for row in database.query("PRAGMA table_info(signal_decisions)")}
         self.assertEqual(
-            database.query("SELECT MAX(version) AS version FROM schema_migrations")[0]["version"], 8
+            database.query("SELECT MAX(version) AS version FROM schema_migrations")[0]["version"], 9
         )
         self.assertIn("scan_enabled", strategy_columns)
         self.assertIn("runtime_adapter", strategy_columns)
@@ -113,6 +140,9 @@ class StoragePortfolioTests(unittest.TestCase):
         ))
         self.assertTrue(database.query(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='data_cache_entries'"
+        ))
+        self.assertTrue(database.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='strategy_frameworks'"
         ))
 
     def test_position_cap_and_t_plus_one(self) -> None:
@@ -126,7 +156,7 @@ class StoragePortfolioTests(unittest.TestCase):
             )
         }
         self.portfolio.process_pending(bars, {"600000.SH": "浦发银行"})
-        positions = self.portfolio.positions("course49_v1")
+        positions = self.portfolio.positions("course49_system")
         self.assertEqual(len(positions), 1)
         self.assertLessEqual(positions[0]["quantity"] * positions[0]["last_price"], 20_000.01)
 
@@ -140,7 +170,7 @@ class StoragePortfolioTests(unittest.TestCase):
             )
         }
         self.portfolio.process_pending(sell_bars, {"600000.SH": "浦发银行"})
-        self.assertFalse(self.portfolio.positions("course49_v1"))
+        self.assertFalse(self.portfolio.positions("course49_system"))
 
     def test_course49_limit_up_buy_does_not_fill_on_a_later_day(self) -> None:
         buy = signal("BUY", datetime(2026, 1, 5, 15, 0).astimezone(), SignalStatus.APPROVED)
@@ -165,7 +195,7 @@ class StoragePortfolioTests(unittest.TestCase):
         order = self.database.query("SELECT * FROM paper_orders WHERE signal_id=?", (buy.signal_id,))[0]
         self.assertEqual(order["status"], "CANCELED")
         self.assertEqual(order["block_reason"], "NEXT_OPEN_NOT_TRADABLE")
-        self.assertFalse(self.portfolio.positions("course49_v1"))
+        self.assertFalse(self.portfolio.positions("course49_system"))
 
     def test_sector_membership_uses_latest_snapshot_not_after_asof(self) -> None:
         snapshots = ParquetSnapshotStore(self.config, self.database)
