@@ -90,6 +90,7 @@ class PerformanceInfrastructureTests(unittest.TestCase):
 
     def test_failed_large_batch_halves_and_keeps_symbol_order(self) -> None:
         codes = [f"{index:06d}.SZ" for index in range(250)]
+        progress: list[tuple[int, int, int]] = []
         adapter = TdxAdapter(
             StrategyConfig(batch_size=800),
             __file__,
@@ -98,11 +99,21 @@ class PerformanceInfrastructureTests(unittest.TestCase):
         )
         fake = _AdaptiveFakeTq()
         adapter._tq = fake
-        bars = adapter.fetch_bars(codes, "1d", 90, fields=("Close",))
+        bars = adapter.fetch_bars(
+            codes,
+            "1d",
+            90,
+            fields=("Close",),
+            batch_callback=lambda completed, total, batch: progress.append(
+                (completed, total, batch)
+            ),
+        )
         self.assertEqual(list(bars), codes)
         self.assertEqual(fake.batch_sizes[0], 250)
         self.assertTrue(any(size == 100 for size in fake.batch_sizes))
         self.assertTrue(all(size <= 100 for size in adapter.successful_batch_sizes))
+        self.assertEqual(progress[-1][0:2], (len(codes), len(codes)))
+        self.assertEqual([item[0] for item in progress], sorted(item[0] for item in progress))
 
     def test_failed_refresh_does_not_replace_ready_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

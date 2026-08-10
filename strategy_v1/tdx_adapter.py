@@ -7,7 +7,7 @@ from contextlib import AbstractContextManager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import pandas as pd
 
@@ -206,8 +206,10 @@ class TdxAdapter(AbstractContextManager["TdxAdapter"]):
         start_time: str | None = None,
         end_time: str | None = None,
         warmup_bars: int = 0,
+        batch_callback: Callable[[int, int, int], None] | None = None,
     ) -> dict[str, pd.DataFrame]:
         result: dict[str, pd.DataFrame] = {}
+        completed = 0
         for requested in _chunks(codes, self.config.batch_size):
             for batch, raw in self._fetch_market_batches(
                 requested,
@@ -217,6 +219,9 @@ class TdxAdapter(AbstractContextManager["TdxAdapter"]):
                 dividend_type=dividend_type,
                 end_time=end_time,
             ):
+                completed += len(batch)
+                if batch_callback is not None:
+                    batch_callback(completed, len(codes), len(batch))
                 available = {str(field).lower(): frame for field, frame in raw.items()}
                 arguments = [
                     (code, available, fields, start_time, end_time, warmup_bars)
@@ -268,6 +273,7 @@ class TdxAdapter(AbstractContextManager["TdxAdapter"]):
                 yield batch, raw
                 continue
             if len(batch) <= self.minimum_batch_size:
+                yield batch, {}
                 continue
             midpoint = max(self.minimum_batch_size, len(batch) // 2)
             pending[0:0] = [batch[:midpoint], batch[midpoint:]]

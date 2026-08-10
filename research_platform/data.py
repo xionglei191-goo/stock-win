@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import AbstractContextManager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 import pandas as pd
 
@@ -58,6 +58,7 @@ class TdxProvider(AbstractContextManager["TdxProvider"]):
         start_time: str | None = None,
         end_time: str | None = None,
         warmup_bars: int = 0,
+        batch_callback: Callable[[int, int, int], None] | None = None,
     ) -> dict[str, pd.DataFrame]:
         bars = self.adapter.fetch_bars(
             codes,
@@ -68,6 +69,7 @@ class TdxProvider(AbstractContextManager["TdxProvider"]):
             start_time=start_time,
             end_time=end_time,
             warmup_bars=warmup_bars,
+            batch_callback=batch_callback,
         )
         for frame in bars.values():
             if "Amount" in frame.columns:
@@ -106,10 +108,15 @@ class TdxProvider(AbstractContextManager["TdxProvider"]):
         codes: list[str],
         start_time: str,
         end_time: str,
+        batch_callback: Callable[[int, int, int], None] | None = None,
     ) -> dict[str, dict[str, list[dict[str, Any]]]]:
         result: dict[str, dict[str, list[dict[str, Any]]]] = {}
         for raw in self._iter_professional_history(
-            codes, COURSE49_FIELDS, start_time, end_time
+            codes,
+            COURSE49_FIELDS,
+            start_time,
+            end_time,
+            batch_callback=batch_callback,
         ):
             result.update(raw)
         return result
@@ -119,9 +126,14 @@ class TdxProvider(AbstractContextManager["TdxProvider"]):
         codes: list[str],
         start_time: str,
         end_time: str,
+        batch_callback: Callable[[int, int, int], None] | None = None,
     ) -> Iterator[dict[str, dict[str, list[dict[str, Any]]]]]:
         yield from self._iter_professional_history(
-            codes, COURSE49_FIELDS, start_time, end_time
+            codes,
+            COURSE49_FIELDS,
+            start_time,
+            end_time,
+            batch_callback=batch_callback,
         )
 
     def _iter_professional_history(
@@ -130,8 +142,10 @@ class TdxProvider(AbstractContextManager["TdxProvider"]):
         fields: Iterable[str],
         start_time: str,
         end_time: str,
+        batch_callback: Callable[[int, int, int], None] | None = None,
     ) -> Iterator[dict[str, dict[str, list[dict[str, Any]]]]]:
         pending = list(_chunks(codes, self.config.performance.event_batch_size))
+        completed = 0
         while pending:
             batch = pending.pop(0)
             raw = self.adapter.tq.get_gpjy_value(
@@ -145,6 +159,9 @@ class TdxProvider(AbstractContextManager["TdxProvider"]):
             )
             if usable:
                 self.successful_event_batch_sizes.append(len(batch))
+                completed += len(batch)
+                if batch_callback is not None:
+                    batch_callback(completed, len(codes), len(batch))
                 yield {
                     str(code): value
                     for code, value in raw.items()
@@ -152,6 +169,9 @@ class TdxProvider(AbstractContextManager["TdxProvider"]):
                 }
                 continue
             if len(batch) <= self.config.performance.minimum_batch_size:
+                completed += len(batch)
+                if batch_callback is not None:
+                    batch_callback(completed, len(codes), len(batch))
                 continue
             midpoint = max(
                 self.config.performance.minimum_batch_size,

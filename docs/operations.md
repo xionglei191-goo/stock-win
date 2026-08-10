@@ -43,7 +43,7 @@ py -3 -m research_platform generate-brief --run-id <RUN_ID>
 py -3 -m research_platform refresh-feedback
 ```
 
-Web 的“策略”页可查看插件数据契约、建立组合、发起扫描和审批多腿意图；“回测”页只列出支持历史执行的插件和组合。最多三个本地作业并行，重复参数使用 single-flight 返回同一任务；通达信读取仍单通道，页面会显示等待原因、阶段进度、快照命中和资源占用。49课候选在“候选”页审批；配对套利必须整组审批。所有做空与多腿成交仅进入模拟账户。
+Web 的“策略”页可查看插件数据契约、建立组合、发起扫描和审批多腿意图；“回测”页只列出支持历史执行的插件和组合。最多三个本地作业并行，重复参数使用 single-flight 返回同一任务；通达信读取仍单通道，页面会显示等待原因、阶段进度、已处理股票数、快照命中和资源占用。扫描与回测均按策略 `DataPlan` 读取数据，固定股票套利不会加载全市场。49课候选在“候选”页审批；配对套利必须整组审批。所有做空与多腿成交仅进入模拟账户。
 
 默认性能参数可通过 `RESEARCH_WORKER_THREADS`、`RESEARCH_MEMORY_CACHE_GB`、`RESEARCH_MIN_AVAILABLE_MEMORY_GB`、`RESEARCH_DISK_CACHE_GB` 和 `RESEARCH_BACKTEST_WORKERS` 调整。64GB/12线程机器建议保持默认 8 线程、24GB LRU、至少 8GB 可用内存和 3 个作业。
 

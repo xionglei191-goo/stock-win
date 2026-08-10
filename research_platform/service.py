@@ -36,6 +36,7 @@ from .backtest_engine import (
 from .course49_market import flatten_market_activity, normalize_market_activity
 from .data import ResearchDataHub, TdxProvider
 from .data_cache import DataCacheManager
+from .data_plan import build_data_plan
 from .lhb import flatten_lhb_history, normalize_lhb_history
 from .models import (
     DataHealth,
@@ -229,6 +230,20 @@ class PlatformService:
             for item in component_ids
             for requirement in self.strategies[item].metadata.data_requirements
         )
+        candidate_streaks: list[int] = []
+        for item in component_ids:
+            if self._runtime_adapter(item) != RuntimeAdapter.COURSE49_DAILY:
+                continue
+            resolver = getattr(
+                self.strategies[item], "candidate_minimum_streak", None
+            )
+            candidate_streaks.append(
+                max(1, int(resolver())) if callable(resolver) else 1
+            )
+        data_plan = build_data_plan(
+            (self.strategies[item].metadata for item in component_ids),
+            event_minimum_streak=min(candidate_streaks, default=1),
+        )
         run_id = uuid4().hex
         started = datetime.now().astimezone()
         self.database.create_run(run_id, "scan", mode, requested_ids)
@@ -236,6 +251,26 @@ class PlatformService:
         health: list[DataHealth] = []
         results: list[StrategyScanResult] = []
         try:
+            def batch_progress(
+                phase: str,
+                lower: float,
+                upper: float,
+                label: str,
+            ) -> Any:
+                def report(completed: int, total: int, batch_size: int) -> None:
+                    if progress_callback is None:
+                        return
+                    ratio = completed / total if total else 1.0
+                    progress_callback(
+                        phase=phase,
+                        progress=lower + (upper - lower) * ratio,
+                        detail=f"{label} {completed}/{total}（本批 {batch_size}）",
+                        cache_status="refresh" if refresh_data else "miss",
+                        waiting_reason="",
+                    )
+
+                return report
+
             if progress_callback is not None:
                 progress_callback(
                     phase="WAITING_TDX",
@@ -268,7 +303,16 @@ class PlatformService:
                 ):
                     codes = constrained_codes
                 if sampling_mode == "stratified":
-                    sample_bars = provider.fetch_bars(codes, "1d", 90, dividend_type="front")
+                    sample_bars = provider.fetch_bars(
+                        codes,
+                        "1d",
+                        90,
+                        fields=data_plan.front_fields,
+                        dividend_type="front",
+                        batch_callback=batch_progress(
+                            "UNIVERSE_SAMPLE", 0.10, 0.20, "样本资格行情"
+                        ),
+                    )
                     sample_eligible = filter_universe(
                         sample_bars,
                         names,
@@ -281,8 +325,26 @@ class PlatformService:
                         sample_seed,
                     )
                 codes = list(dict.fromkeys([*codes, *constrained_codes]))
-                front = provider.fetch_bars(codes, "1d", 120, dividend_type="front")
-                raw = provider.fetch_bars(codes, "1d", 120, dividend_type="none")
+                front = provider.fetch_bars(
+                    codes,
+                    "1d",
+                    120,
+                    fields=data_plan.front_fields,
+                    dividend_type="front",
+                    batch_callback=batch_progress(
+                        "MARKET_DATA_FRONT", 0.12, 0.30, "前复权行情"
+                    ),
+                )
+                raw = provider.fetch_bars(
+                    codes,
+                    "1d",
+                    120,
+                    fields=data_plan.raw_fields,
+                    dividend_type="none",
+                    batch_callback=batch_progress(
+                        "MARKET_DATA_RAW", 0.30, 0.48, "不复权行情"
+                    ),
+                )
                 index_map = provider.fetch_bars(["999999.SH"], "1d", 120, dividend_type="front")
                 index_bars = index_map.get("999999.SH")
                 if index_bars is None:
@@ -293,25 +355,57 @@ class PlatformService:
                 if daily_health.status != DataStatus.READY:
                     raise DataBlockedError(daily_health.message or "Daily data is unavailable")
                 legacy_config = StrategyConfig(tdx_root=self.config.tdx_root, daily_lookback=120)
-                eligible_front = filter_universe(front, names, legacy_config)
+                fixed_generic_only = all(
+                    self._runtime_adapter(item) == RuntimeAdapter.GENERIC_DAILY
+                    and self._required_codes(item)
+                    for item in component_ids
+                )
+                eligible_front = (
+                    {code: frame for code, frame in front.items() if not frame.empty}
+                    if fixed_generic_only
+                    else filter_universe(front, names, legacy_config)
+                )
                 eligible_raw = {code: raw[code] for code in eligible_front if code in raw}
-                sectors_map = provider.load_sectors(refresh=refresh_sectors or refresh_data)
+                sectors_map = (
+                    provider.load_sectors(refresh=refresh_sectors or refresh_data)
+                    if data_plan.require_sectors
+                    else {}
+                )
                 sector_rows = _sector_membership_rows(sectors_map)
                 sector_hash = _records_hash(sector_rows)
                 benchmark_codes = ["000300.CSI", "000300.SH", "000852.CSI", "000852.SH", "399006.SZ"]
                 benchmark_bars = (
                     provider.fetch_bars(benchmark_codes, "1d", 120, dividend_type="front")
-                    if any(
-                        self._runtime_adapter(item) == RuntimeAdapter.COURSE49_DAILY
-                        and self._strategy_family(item) != "course49_v1"
-                        for item in component_ids
-                    )
+                    if data_plan.require_style_benchmarks
                     else {}
                 )
 
-                market = evaluate_market_regime(index_bars, eligible_front, legacy_config)
-                ranked_sectors = rank_sectors(sectors_map, eligible_front, legacy_config)
-                leaders = rank_leaders(ranked_sectors, sectors_map, eligible_front, names, legacy_config)
+                chan_ids = [
+                    item
+                    for item in component_ids
+                    if self._runtime_adapter(item) == RuntimeAdapter.CHAN_DAILY
+                ]
+                market = (
+                    evaluate_market_regime(index_bars, eligible_front, legacy_config)
+                    if chan_ids
+                    else None
+                )
+                ranked_sectors = (
+                    rank_sectors(sectors_map, eligible_front, legacy_config)
+                    if chan_ids
+                    else []
+                )
+                leaders = (
+                    rank_leaders(
+                        ranked_sectors,
+                        sectors_map,
+                        eligible_front,
+                        names,
+                        legacy_config,
+                    )
+                    if chan_ids
+                    else []
+                )
                 chan_positions = self.portfolio.positions("chan_v1")
                 pending_chan = self.database.query(
                     "SELECT code FROM paper_orders WHERE strategy_id='chan_v1' AND status='PENDING'"
@@ -324,11 +418,6 @@ class PlatformService:
                 self.portfolio.process_pending(execution_bars, names)
                 self.portfolio.process_pending_groups(raw, names)
 
-                chan_ids = [
-                    item
-                    for item in component_ids
-                    if self._runtime_adapter(item) == RuntimeAdapter.CHAN_DAILY
-                ]
                 for chan_id in chan_ids:
                     results.append(
                         self.strategies[chan_id].scan(
@@ -365,7 +454,14 @@ class PlatformService:
                     lhb_start = (latest_day - pd.Timedelta(days=30)).strftime("%Y%m%d")
                     lhb_end = latest_day.strftime("%Y%m%d")
                     course49_raw = (
-                        provider.fetch_course49_history(lhb_codes, lhb_start, lhb_end)
+                        provider.fetch_course49_history(
+                            lhb_codes,
+                            lhb_start,
+                            lhb_end,
+                            batch_callback=batch_progress(
+                                "COURSE49_EVENTS", 0.55, 0.78, "49课事件"
+                            ),
+                        )
                         if lhb_codes
                         else {}
                     )
@@ -527,17 +623,18 @@ class PlatformService:
                     "universe_distribution": _universe_distribution(list(eligible_front)),
                 }
                 self.snapshots.write_bars(snapshot_id, "daily_front", eligible_front, snapshot_metadata)
-                self.snapshots.write_records(
-                    snapshot_id,
-                    "sector_membership",
-                    sector_rows,
-                    {
-                        "quality": "LIMITED",
-                        "source": "current_fallback",
-                        "asof": latest_day.date().isoformat() if course49_ids else pd.Timestamp(index_bars.index[-1]).date().isoformat(),
-                        "content_hash": sector_hash,
-                    },
-                )
+                if data_plan.require_sectors:
+                    self.snapshots.write_records(
+                        snapshot_id,
+                        "sector_membership",
+                        sector_rows,
+                        {
+                            "quality": "LIMITED",
+                            "source": "current_fallback",
+                            "asof": latest_day.date().isoformat() if course49_ids else pd.Timestamp(index_bars.index[-1]).date().isoformat(),
+                            "content_hash": sector_hash,
+                        },
+                    )
                 if benchmark_bars:
                     self.snapshots.write_bars(
                         snapshot_id,
@@ -579,11 +676,13 @@ class PlatformService:
                 "order_group_count": sum(len(result.order_groups) for result in results),
                 "sampling_mode": sampling_mode,
                 "sample_seed": sample_seed,
+                "data_plan": data_plan.as_dict(),
+                "effective_batch_sizes": provider.effective_batch_sizes(),
                 "stock_pool_hash": _stock_pool_hash(list(eligible_front)) if results else "",
                 "universe_distribution": _universe_distribution(list(eligible_front)) if results else {},
-                "sector_membership_quality": "LIMITED",
-                "sector_membership_source": "current_fallback",
-                "sector_membership_hash": sector_hash if results else "",
+                "sector_membership_quality": "LIMITED" if data_plan.require_sectors else "NOT_REQUIRED",
+                "sector_membership_source": "current_fallback" if data_plan.require_sectors else "data_plan",
+                "sector_membership_hash": sector_hash if results and data_plan.require_sectors else "",
             }
             self.database.update_run(run_id, RunStatus.SUCCEEDED, snapshot_id=snapshot_id, metadata=metadata)
             if progress_callback is not None:

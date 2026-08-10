@@ -341,6 +341,23 @@ class BacktestService:
                 "等待通达信数据通道",
                 waiting_reason="single_tdx_channel",
             )
+            def batch_progress(
+                phase: str,
+                lower: float,
+                upper: float,
+                label: str,
+            ) -> Callable[[int, int, int], None]:
+                def report(completed: int, total: int, batch_size: int) -> None:
+                    ratio = completed / total if total else 1.0
+                    self._progress(
+                        progress_callback,
+                        phase,
+                        lower + (upper - lower) * ratio,
+                        f"{label} {completed}/{total}（本批 {batch_size}）",
+                    )
+
+                return report
+
             with TdxProvider(self.config, __file__) as provider:
                 self._progress(progress_callback, "MARKET_DATA", 0.08, "正在读取通达信行情")
                 stage_started = perf_counter()
@@ -364,6 +381,9 @@ class BacktestService:
                         fields=data_plan.front_fields,
                         dividend_type="front",
                         end_time=end_date,
+                        batch_callback=batch_progress(
+                            "UNIVERSE_SAMPLE", 0.08, 0.17, "样本资格行情"
+                        ),
                     )
                     eligible_for_sample = filter_universe(
                         _slice_to_date(eligibility_bars, end_date),
@@ -388,6 +408,9 @@ class BacktestService:
                     count,
                     fields=data_plan.front_fields,
                     dividend_type="front",
+                    batch_callback=batch_progress(
+                        "MARKET_DATA_FRONT", 0.10, 0.27, "前复权行情"
+                    ),
                     **bar_window,
                 )
                 daily_raw = provider.fetch_bars(
@@ -396,6 +419,9 @@ class BacktestService:
                     count,
                     fields=data_plan.raw_fields,
                     dividend_type="none",
+                    batch_callback=batch_progress(
+                        "MARKET_DATA_RAW", 0.27, 0.44, "不复权行情"
+                    ),
                     **bar_window,
                 )
                 end_eligible = filter_universe(
@@ -471,6 +497,12 @@ class BacktestService:
                 stage_durations["market_data"] = perf_counter() - stage_started
 
                 stage_started = perf_counter()
+                self._progress(
+                    progress_callback,
+                    "SNAPSHOT_WRITE",
+                    0.47,
+                    "正在写入原始数据快照",
+                )
                 snapshot_query = {**parameters, "count": count}
                 self.snapshots.write_bars(
                     snapshot_id, "daily_front", daily_front, {**snapshot_query, "adjustment": "front"}
@@ -521,6 +553,12 @@ class BacktestService:
                     for item in component_ids
                 ):
                     stage_started = perf_counter()
+                    self._progress(
+                        progress_callback,
+                        "COURSE49_DATA",
+                        0.58,
+                        "正在准备49课事件数据",
+                    )
                     available_days = _trading_days(index_bars.index)
                     requested_start = _trading_day(start_date) if start_date else available_days.min()
                     requested_end = _trading_day(end_date) if end_date else available_days.max()
@@ -586,6 +624,12 @@ class BacktestService:
                                 lhb_codes,
                                 lhb_start_day.strftime("%Y%m%d"),
                                 requested_end.strftime("%Y%m%d"),
+                                batch_callback=batch_progress(
+                                    "COURSE49_EVENTS",
+                                    0.60,
+                                    0.78,
+                                    "49课事件",
+                                ),
                             ):
                                 normalized_batch = normalize_lhb_history(
                                     lhb_batch, daily_raw
