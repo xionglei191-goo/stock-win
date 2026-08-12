@@ -76,8 +76,11 @@ class TestScoreBars:
         bars = _make_bars(300, "up")
         result = _score_bars(bars, USMomentumParameters())
         assert result is not None
-        # rs_score = long×0.50 + mid×0.30 + short×0.20
-        raw_expected = result["ret_long"] * 0.50 + result["ret_mid"] * 0.30 + result["ret_short"] * 0.20
+        # rs_score = max(ret_long,0)×0.50 + ret_mid×0.30 + ret_short×0.20
+        # + acceleration_bonus = max(ret_short - 0.15, 0) * 0.5
+        ret_long_adj = max(result["ret_long"], 0.0)
+        acceleration = max(result["ret_short"] - 0.15, 0.0) * 0.5
+        raw_expected = ret_long_adj * 0.50 + result["ret_mid"] * 0.30 + result["ret_short"] * 0.20 + acceleration
         assert abs(result["rs_score"] - raw_expected) < 1e-4
 
 
