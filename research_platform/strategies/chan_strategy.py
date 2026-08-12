@@ -26,11 +26,14 @@ class ChanStrategy:
     parameters = ChanParameters()
     metadata = StrategyMetadata(
         strategy_id="chan_v1",
-        version="2.0.0",
-        name="缠论结构突破",
-        description="市场与龙头过滤后的日线中枢突破、跌破和顶背驰策略",
+        version="3.0.0",
+        name="缠论结构突破（线段中枢重构）",
+        description="补齐线段层级与中枢延伸，背驰改为MACD面积比较并新增底背驰买点；等待新独立窗口验证。",
         frequency="1d",
         requires_approval=False,
+        lifecycle="HISTORICAL_REJECTED",
+        scan_enabled=False,
+        backtest_enabled=True,
         runtime_adapter=RuntimeAdapter.CHAN_DAILY,
         data_requirements=(
             DataRequirement("bars", "1d", "front", 120, True, ("Open", "High", "Low", "Close", "Volume")),
@@ -110,25 +113,32 @@ class ChanStrategy:
                         "leader_rank": leader.leader_rank,
                         "leader_score": leader.leader_score,
                         "breakout": state.breakout,
+                        "bullish_divergence": state.bullish_divergence,
+                        "trend": state.trend,
                         "price": price,
                     }
                 )
-                if state.breakout and daily_entry_allowed(frame, self.parameters):
-                    strength = min(1.0, 0.5 * leader.sector_score + 0.5 * leader.leader_score)
-                    signals.append(
-                        self._signal(
-                            run_id,
-                            leader.code,
-                            "BUY",
-                            price,
-                            strength,
-                            "CENTER_BREAKOUT",
-                            state,
-                            now,
-                            leader,
-                            market.regime,
-                        )
+                if not daily_entry_allowed(frame, self.parameters):
+                    continue
+                if state.breakout_confirmed:
+                    reason = "CENTER_BREAKOUT_MACD"
+                else:
+                    continue
+                strength = min(1.0, 0.5 * leader.sector_score + 0.5 * leader.leader_score)
+                signals.append(
+                    self._signal(
+                        run_id,
+                        leader.code,
+                        "BUY",
+                        price,
+                        strength,
+                        reason,
+                        state,
+                        now,
+                        leader,
+                        market.regime,
                     )
+                )
 
         return StrategyScanResult(
             strategy=self.metadata,

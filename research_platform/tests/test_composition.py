@@ -55,7 +55,10 @@ class CompositionTests(unittest.TestCase):
         metadata = self.strategies["chan_v1"].metadata
 
         self.assertEqual(metadata.frequency, "1d")
-        self.assertEqual(metadata.version, "2.0.0")
+        self.assertEqual(metadata.version, "3.0.0")
+        self.assertEqual(metadata.lifecycle, "HISTORICAL_REJECTED")
+        self.assertFalse(metadata.scan_enabled)
+        self.assertTrue(metadata.backtest_enabled)
         self.assertTrue(metadata.data_requirements)
         self.assertEqual(
             {requirement.frequency for requirement in metadata.data_requirements if requirement.dataset == "bars"},
@@ -84,9 +87,20 @@ class CompositionTests(unittest.TestCase):
         records = StrategyCatalog(self.strategies).as_records()
         pairs = next(item for item in records["strategies"] if item["strategy_id"] == "pairs_arbitrage_v1")
         adaptive = next(item for item in records["groups"] if item["group_id"] == "adaptive_multi_strategy")
+        combined = next(item for item in records["groups"] if item["group_id"] == "combined")
         self.assertEqual(pairs["execution_model"], "MULTI_LEG")
         self.assertTrue(pairs["supports_short"])
+        self.assertEqual(pairs["lifecycle"], "HISTORICAL_REJECTED")
+        self.assertFalse(pairs["scan_enabled"])
+        self.assertTrue(pairs["backtest_enabled"])
         self.assertTrue(adaptive["backtest_supported"])
+        self.assertFalse(adaptive["scan_supported"])
+        self.assertEqual(adaptive["version"], "2.1.0")
+        self.assertEqual(adaptive["category"], "research_archive")
+        self.assertFalse(combined["scan_supported"])
+        self.assertTrue(combined["backtest_supported"])
+        self.assertEqual(combined["version"], "3.1.0")
+        self.assertEqual(combined["category"], "research_archive")
         reward_compare = next(
             item for item in records["groups"] if item["group_id"] == "course49_v9_compare"
         )
