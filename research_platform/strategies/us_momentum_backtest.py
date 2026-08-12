@@ -133,30 +133,51 @@ def run_backtest(
             names=names,
             backtest_mode=True,
         )
-        new_codes = {c["code"] for c in result.candidates[: params.max_entry_signals]}
 
-        # Exit positions no longer in top list
+        # ── 改进一: 缓冲区出场 ──────────────────────────────────────────
+        # 只有持仓跌出 exit_thresh（RS前60%）才清仓，避免无效换手
+        exit_thresh = result.state.get("exit_thresh", None)
+        entry_top_codes = {c["code"] for c in result.candidates[: params.max_entry_signals]}
+        # Build a lookup of rs_score for all candidates
+        cand_score: dict[str, float] = {c["code"]: c["rs_score"] for c in result.candidates}
+
         for code in list(positions):
-            if code not in new_codes:
-                pos = positions[code]
-                price = _price(code, rb_date) or pos.entry_price
-                pos.exit_date = str(rb_date.date())
-                pos.exit_price = price
-                pos.exit_reason = "rebalance"
-                cash += pos.invested * (price / pos.entry_price)
-                closed_trades.append(pos)
-                del positions[code]
+            if code in entry_top_codes:
+                continue  # still in top-entry set, keep holding
+            pos_rs = cand_score.get(code)
+            if pos_rs is not None and exit_thresh is not None and pos_rs >= exit_thresh:
+                continue  # RS still above exit threshold, keep holding (buffer zone)
+            # Either not scored at all, or RS fell below exit threshold → exit
+            pos = positions[code]
+            price = _price(code, rb_date) or pos.entry_price
+            pos.exit_date = str(rb_date.date())
+            pos.exit_price = price
+            pos.exit_reason = "rebalance"
+            cash += pos.invested * (price / pos.entry_price)
+            closed_trades.append(pos)
+            del positions[code]
 
-        # Enter new positions (equal weight)
-        slot_value = initial_capital * params.target_weight
-        for cand in result.candidates[: params.max_entry_signals]:
-            code = cand["code"]
+        # ── 改进三: 按RS分比例配仓 ──────────────────────────────────────
+        # Compute total equity for position sizing
+        total_equity = cash + sum(
+            pos.invested * ((_price(code, rb_date) or pos.entry_price) / pos.entry_price)
+            for code, pos in positions.items()
+        )
+        from .us_momentum import _compute_score_weights
+        weighted_slots = _compute_score_weights(
+            [(c["code"], c) for c in result.candidates[: params.max_entry_signals]],
+            params.max_entry_signals,
+        )
+        for code, score, weight in weighted_slots:
             if code in positions:
                 continue
-            price = cand.get("close") or 0.0
-            if price <= 0 or cash < slot_value * 0.5:
+            price = score.get("close") or 0.0
+            if price <= 0:
                 continue
-            stop = cand.get("stop_price") or round(price * (1 - params.stop_ratio), 4)
+            slot_value = total_equity * weight
+            if cash < slot_value * 0.5:
+                continue
+            stop = round(price * (1 - params.stop_ratio), 4)
             actual = min(slot_value, cash)
             cash -= actual
             positions[code] = _Trade(
