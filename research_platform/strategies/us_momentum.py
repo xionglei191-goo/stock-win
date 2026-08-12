@@ -139,7 +139,7 @@ class USMomentumStrategy:
                 "bars",
                 "1d",
                 "front",
-                220,
+                1300,
                 True,
                 ("Open", "High", "Low", "Close", "Volume"),
             ),

@@ -76,7 +76,7 @@ def run_backtest(
     # Need >= ma_slow bars before first rebalance
     min_warmup = params.ma_slow + 10
 
-    def _slice_bars(target: pd.Timestamp, lookback: int = 220) -> dict[str, pd.DataFrame]:
+    def _slice_bars(target: pd.Timestamp, lookback: int = 1300) -> dict[str, pd.DataFrame]:
         out: dict[str, pd.DataFrame] = {}
         for code, df in bars.items():
             if not isinstance(df.index, pd.DatetimeIndex):
