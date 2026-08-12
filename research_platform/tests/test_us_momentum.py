@@ -11,13 +11,12 @@ from research_platform.strategies.us_momentum import (
 )
 
 
-def _make_bars(n: int = 220, trend: str = "up") -> pd.DataFrame:
-    dates = pd.date_range("2024-01-01", periods=n, freq="B")
+def _make_bars(n: int = 300, trend: str = "up") -> pd.DataFrame:
+    dates = pd.date_range("2023-01-01", periods=n, freq="B")
     rng = np.random.default_rng(42)
     if trend == "up":
         prices = 100.0 * np.cumprod(1 + rng.normal(0.001, 0.012, n))
-        # force MA50 > MA200 structure by biasing upward enough
-        prices = np.sort(prices)  # monotonically rising guarantees MA50>MA200
+        prices = np.sort(prices)  # monotonically rising guarantees MA200<close
     elif trend == "down":
         prices = 100.0 * np.cumprod(1 + rng.normal(-0.002, 0.012, n))
     else:
@@ -30,20 +29,20 @@ def _make_bars(n: int = 220, trend: str = "up") -> pd.DataFrame:
 
 
 def _make_us_bars(codes: list[str], trend: str = "up") -> dict[str, pd.DataFrame]:
-    return {code: _make_bars(220, trend) for code in codes}
+    return {code: _make_bars(300, trend) for code in codes}
 
 
 class TestScoreBars:
     def test_uptrend_passes(self):
-        bars = _make_bars(220, "up")
+        bars = _make_bars(300, "up")
         params = USMomentumParameters()
         result = _score_bars(bars, params)
         assert result is not None
         assert "rs_score" in result
-        assert result["ma_fast"] > result["ma_slow"]
+        assert result["close"] > result["ma_slow"]
 
     def test_downtrend_rejected(self):
-        bars = _make_bars(220, "down")
+        bars = _make_bars(300, "down")
         params = USMomentumParameters()
         assert _score_bars(bars, params) is None
 
@@ -53,12 +52,10 @@ class TestScoreBars:
         assert _score_bars(bars, params) is None
 
     def test_depth_filter_rejects_far_from_high(self):
-        # monotonically sorted prices mean last bar IS the 50-day high → depth=0
-        # use a price series that has a recent pullback instead
-        n = 220
-        dates = pd.date_range("2024-01-01", periods=n, freq="B")
+        n = 300
+        dates = pd.date_range("2023-01-01", periods=n, freq="B")
         prices = np.linspace(100, 130, n)
-        prices[-1] = prices[-2] * 0.85  # last bar pulls back 15% — well beyond 0.1%
+        prices[-1] = prices[-2] * 0.85  # last bar pulls back 15%
         volume = np.full(n, 2_000_000.0)
         bars = pd.DataFrame(
             {"Open": prices, "High": prices * 1.01, "Low": prices * 0.99, "Close": prices, "Volume": volume},
@@ -76,18 +73,18 @@ class TestScoreBars:
         assert _score_bars(bars, params) is None
 
     def test_rs_score_components(self):
-        bars = _make_bars(220, "up")
+        bars = _make_bars(300, "up")
         result = _score_bars(bars, USMomentumParameters())
         assert result is not None
-        # rs_score is rounded to 6 decimal places; verify against unrounded components
-        raw_expected = result["ret_short"] * 0.4 + result["ret_mid"] * 0.35 + result["ret_long"] * 0.25
+        # rs_score = long×0.50 + mid×0.30 + short×0.20
+        raw_expected = result["ret_long"] * 0.50 + result["ret_mid"] * 0.30 + result["ret_short"] * 0.20
         assert abs(result["rs_score"] - raw_expected) < 1e-4
 
 
 class TestUSMomentumStrategy:
     def test_empty_result_no_us_codes(self):
         strategy = USMomentumStrategy()
-        bars = {"600001.SH": _make_bars(220, "up"), "000001.SZ": _make_bars(220, "up")}
+        bars = {"600001.SH": _make_bars(300, "up"), "000001.SZ": _make_bars(300, "up")}
         result = strategy.scan(run_id="r1", front_bars=bars)
         assert result.candidates == ()
         assert result.signals == ()
@@ -95,9 +92,9 @@ class TestUSMomentumStrategy:
     def test_candidates_only_us_codes(self):
         strategy = USMomentumStrategy()
         bars = {
-            "AAPL.US": _make_bars(220, "up"),
-            "MSFT.US": _make_bars(220, "up"),
-            "600001.SH": _make_bars(220, "up"),
+            "AAPL.US": _make_bars(300, "up"),
+            "MSFT.US": _make_bars(300, "up"),
+            "600001.SH": _make_bars(300, "up"),
         }
         result = strategy.scan(run_id="r1", front_bars=bars)
         codes = {c["code"] for c in result.candidates}
@@ -120,7 +117,7 @@ class TestUSMomentumStrategy:
         assert result.signals == ()
 
     def test_signals_emitted_in_backtest_mode(self):
-        strategy = USMomentumStrategy()
+        strategy = USMomentumStrategy(USMomentumParameters(use_market_regime=False))
         bars = _make_us_bars(["AAPL.US", "MSFT.US", "GOOG.US"], "up")
         result = strategy.scan(run_id="r1", front_bars=bars, backtest_mode=True)
         assert len(result.signals) > 0

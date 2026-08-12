@@ -26,13 +26,16 @@ NY_TZ = ZoneInfo("America/New_York")
 class USMomentumParameters:
     ma_fast: int = 50
     ma_slow: int = 200
-    lookback_short: int = 20
-    lookback_mid: int = 50
-    lookback_long: int = 120
-    max_depth_from_high: float = 0.08
-    vol_ratio_cap: float = 1.5
-    rs_top_pct: float = 0.30
-    stop_ratio: float = 0.08
+    #改进2: 经典 12-1月动量 —— 252日总动量跳过最近20天，120日动量跳过最近20天
+    lookback_short: int = 60    # ~3个月（跳过最近20天在_score_bars内处理）
+    lookback_mid: int = 120     # ~6个月
+    lookback_long: int = 252    # ~12个月（经典Jegadeesh-Titman动量）
+    skip_recent: int = 20       # 跳过最近20天，避免短期反转噪音
+    max_depth_from_high: float = 0.15  # 放宽：允许距高点15%以内
+    vol_ratio_cap: float = 2.0
+    rs_top_pct: float = 0.40
+    # 改进3: 止损从8%放宽到20%，减少被震出优质动量股
+    stop_ratio: float = 0.20
     target_weight: float = 0.10
     max_candidates: int = 30
     max_entry_signals: int = 10
@@ -40,12 +43,15 @@ class USMomentumParameters:
     min_price: float = 5.0
     min_avg_volume: float = 500_000.0
     min_dollar_volume: float = 5_000_000.0
-    max_ret_mid: float = 5.0   # cap 50d return at 500% to filter data artifacts / IPO pops
-    min_vol_ratio: float = 0.05  # reject stocks where recent 5d volume < 5% of 60d baseline
+    max_ret_long: float = 10.0  # 放宽到1000%，只过滤极端数据异常
+    min_vol_ratio: float = 0.05
+    # 改进4: 市场择时 —— 用指数级别MA50>MA200作为开关
+    use_market_regime: bool = True
+    market_code: str = "SPY.US"
 
 
 def _score_bars(bars: pd.DataFrame, params: USMomentumParameters) -> dict[str, Any] | None:
-    min_bars = params.ma_slow + 10
+    min_bars = max(params.ma_slow, params.lookback_long + params.skip_recent) + 10
     if len(bars) < min_bars:
         return None
 
@@ -61,22 +67,31 @@ def _score_bars(bars: pd.DataFrame, params: USMomentumParameters) -> dict[str, A
 
     if np.isnan(last_ma_fast) or np.isnan(last_ma_slow):
         return None
-    if last_close <= last_ma_fast or last_ma_fast <= last_ma_slow:
+    # 改进4: 个股不再要求自身MA过滤，改由外部市场择时控制
+    # 仍保留 close > MA200 作为最低趋势条件（不要求MA50>MA200）
+    if last_close < last_ma_slow:
         return None
     if last_close < params.min_price:
         return None
 
+    skip = params.skip_recent  # 跳过最近N天，避免短期反转噪音
+
     def _ret(n: int) -> float:
-        if len(close) <= n:
+        # 回报从 -(n+skip) 到 -skip，跳过最近skip天
+        idx_end = -(skip + 1) if skip > 0 else -1
+        idx_start = -(n + skip + 1)
+        if len(close) <= n + skip:
             return 0.0
-        prev = float(close.iloc[-(n + 1)])
-        return (last_close / prev - 1) if prev > 0 else 0.0
+        p_end = float(close.iloc[idx_end])
+        p_start = float(close.iloc[idx_start])
+        return (p_end / p_start - 1) if p_start > 0 else 0.0
 
     ret_short = _ret(params.lookback_short)
     ret_mid = _ret(params.lookback_mid)
     ret_long = _ret(params.lookback_long)
 
-    if abs(ret_mid) > params.max_ret_mid or abs(ret_long) > params.max_ret_mid:
+    # 只过滤极端异常数据（>1000%）
+    if abs(ret_long) > params.max_ret_long:
         return None
 
     high_window = min(params.ma_fast, len(close))
@@ -100,11 +115,11 @@ def _score_bars(bars: pd.DataFrame, params: USMomentumParameters) -> dict[str, A
                 vol_ratio = vol5 / vol60
                 if vol_ratio > params.vol_ratio_cap:
                     return None
-                # reject stocks where recent volume has collapsed vs baseline
                 if vol_ratio < params.min_vol_ratio:
                     return None
 
-    rs_score = ret_short * 0.40 + ret_mid * 0.35 + ret_long * 0.25
+    # 改进2: 经典动量权重 —— 长期动量最重要
+    rs_score = ret_long * 0.50 + ret_mid * 0.30 + ret_short * 0.20
 
     return {
         "rs_score": round(rs_score, 6),
@@ -170,8 +185,21 @@ class USMomentumStrategy:
         valid_until = generated_at + timedelta(days=1)
 
         scored: list[tuple[str, dict[str, Any]]] = []
+
+        # 改进4: 市场择时 —— SPY MA50>MA200为熊市时不开新仓
+        market_bull = True
+        if params.use_market_regime:
+            spy_bars = front_bars.get(params.market_code)
+            if spy_bars is not None and len(spy_bars) >= params.ma_slow + 10:
+                spy_close = spy_bars["Close"]
+                spy_ma50 = float(spy_close.rolling(params.ma_fast).mean().iloc[-1])
+                spy_ma200 = float(spy_close.rolling(params.ma_slow).mean().iloc[-1])
+                market_bull = spy_ma50 > spy_ma200
+
         for code, bars in front_bars.items():
             if not code.endswith(".US"):
+                continue
+            if code == params.market_code:
                 continue
             result = _score_bars(bars, params)
             if result is not None:
@@ -205,7 +233,7 @@ class USMomentumStrategy:
         entry_enabled = backtest_mode or params.emit_live_entry_signals
         position_codes = {str(p["code"]) for p in positions}
 
-        if entry_enabled:
+        if entry_enabled and market_bull:
             for code, score in top[: params.max_entry_signals]:
                 if code in position_codes:
                     continue
@@ -234,5 +262,5 @@ class USMomentumStrategy:
             strategy=self.metadata,
             signals=tuple(signals),
             candidates=tuple(candidates),
-            state={},
+            state={"market_bull": market_bull},
         )
