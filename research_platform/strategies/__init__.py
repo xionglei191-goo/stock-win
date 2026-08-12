@@ -24,6 +24,25 @@ from .course49_v10 import Course49V10Strategy
 from .course49_v11 import Course49V11Strategy
 from .course49_system import Course49SystemStrategy
 from .pairs_arbitrage import DEFAULT_PAIRS, PairSpec, PairsArbitrageStrategy
+from .weekly_triangle import (
+    WeeklyTriangleParameters,
+    WeeklyTriangleStrategy,
+    analyze_weekly_triangle,
+    completed_weekly_bars,
+    resample_weekly_bars,
+)
+from .weekly_bull_platform import (
+    WeeklyBullPlatformParameters,
+    WeeklyBullPlatformStrategy,
+    analyze_weekly_bull_platform,
+    is_a_share_stock_code,
+)
+from .early_winner import (
+    EarlyWinnerMLStrategy,
+    EarlyWinnerRuleStrategy,
+)
+from .early_winner_trade import EarlyWinnerTradeStrategy
+from .us_momentum import USMomentumStrategy, USMomentumParameters
 
 
 def create_strategy_registry() -> dict[str, Any]:
@@ -42,6 +61,12 @@ def create_strategy_registry() -> dict[str, Any]:
         Course49V11Strategy(),
         Course49SystemStrategy(),
         PairsArbitrageStrategy(),
+        WeeklyTriangleStrategy(),
+        WeeklyBullPlatformStrategy(),
+        EarlyWinnerRuleStrategy(),
+        EarlyWinnerMLStrategy(),
+        EarlyWinnerTradeStrategy(),
+        USMomentumStrategy(),
     )
     registry = {plugin.metadata.strategy_id: plugin for plugin in plugins}
     for strategy_id, plugin in registry.items():
@@ -76,5 +101,19 @@ __all__ = [
     "DEFAULT_PAIRS",
     "PairSpec",
     "PairsArbitrageStrategy",
+    "WeeklyTriangleParameters",
+    "WeeklyTriangleStrategy",
+    "analyze_weekly_triangle",
+    "completed_weekly_bars",
+    "resample_weekly_bars",
     "create_strategy_registry",
+    "WeeklyBullPlatformParameters",
+    "WeeklyBullPlatformStrategy",
+    "analyze_weekly_bull_platform",
+    "is_a_share_stock_code",
+    "EarlyWinnerRuleStrategy",
+    "EarlyWinnerMLStrategy",
+    "EarlyWinnerTradeStrategy",
+    "USMomentumStrategy",
+    "USMomentumParameters",
 ]

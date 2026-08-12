@@ -200,6 +200,21 @@ class TdxAdapter(AbstractContextManager["TdxAdapter"]):
                 names[code] = name
         return sorted(names), names
 
+    def list_us_stocks(self) -> tuple[list[str], dict[str, str]]:
+        # get_stock_list("74") returns nothing for US market via DLL —
+        # enumerate vipdoc/ds/lday directly instead (files named 74#TICKER.day)
+        lday = self.config.tdx_root / "vipdoc" / "ds" / "lday"
+        names: dict[str, str] = {}
+        if lday.is_dir():
+            for path in lday.iterdir():
+                name = path.name
+                if name.startswith("74#") and name.endswith(".day"):
+                    ticker = name[3:-4]
+                    if ticker and "/" not in ticker:
+                        code = ticker + ".US"
+                        names[code] = ticker
+        return sorted(names), names
+
     def list_sectors(self) -> list[dict[str, str]]:
         sectors: dict[str, str] = {}
         for market in self.config.sector_markets:
