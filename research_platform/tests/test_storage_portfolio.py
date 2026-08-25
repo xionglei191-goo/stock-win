@@ -16,6 +16,7 @@ from research_platform.models import (
     OrderLegIntent,
     PlatformSignal,
     SignalStatus,
+    StrategyMetadata,
 )
 from research_platform.portfolio import PaperPortfolio
 from research_platform.storage import Database, ParquetSnapshotStore
@@ -70,6 +71,51 @@ class StoragePortfolioTests(unittest.TestCase):
         self.assertEqual(decisions[0]["note"], "确认题材")
         self.assertEqual(orders[0]["status"], "PENDING")
 
+    def test_approved_sell_is_queued(self) -> None:
+        proposed = signal("SELL", datetime.now().astimezone(), SignalStatus.PROPOSED)
+        self.database.save_signals([proposed])
+
+        self.database.decide_signal(
+            proposed.signal_id,
+            SignalStatus.APPROVED,
+            "执行退出",
+        )
+
+        orders = self.database.query(
+            "SELECT * FROM paper_orders WHERE signal_id=?",
+            (proposed.signal_id,),
+        )
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(orders[0]["side"], "SELL")
+        self.assertEqual(orders[0]["status"], "PENDING")
+
+    def test_signal_expiry_compares_absolute_time_across_timezones(self) -> None:
+        generated = pd.Timestamp("2026-08-12 16:00", tz="America/New_York")
+        proposed = PlatformSignal(
+            run_id="run",
+            strategy_id="course49_system",
+            strategy_version="1.0.0",
+            generated_at=generated.to_pydatetime(),
+            available_at=generated.to_pydatetime(),
+            code="600000.SH",
+            side="BUY",
+            strength=0.9,
+            target_weight=0.2,
+            horizon="test",
+            valid_until=pd.Timestamp(
+                "2026-08-13 16:00", tz="America/New_York"
+            ).to_pydatetime(),
+            stop_price=9.0,
+            status=SignalStatus.PROPOSED,
+            reason_codes=("TEST",),
+        )
+        self.database.save_signals([proposed])
+
+        before_expiry = pd.Timestamp("2026-08-13 07:00", tz="Asia/Shanghai")
+        after_expiry = pd.Timestamp("2026-08-14 07:00", tz="Asia/Shanghai")
+        self.assertEqual(self.database.expire_signals(before_expiry.to_pydatetime()), 0)
+        self.assertEqual(self.database.expire_signals(after_expiry.to_pydatetime()), 1)
+
     def test_archived_strategy_signal_cannot_be_approved(self) -> None:
         proposed = signal(
             "BUY",
@@ -101,7 +147,33 @@ class StoragePortfolioTests(unittest.TestCase):
         }
         self.assertIn("entry_fees", columns)
 
-    def test_v5_database_migrates_to_v9_framework_schema(self) -> None:
+    def test_research_only_strategy_migrates_category_and_freezes_account(self) -> None:
+        metadata = StrategyMetadata(
+            strategy_id="legacy_research_fixture",
+            version="1.0.0",
+            name="历史研究策略",
+            description="fixture",
+            frequency="1w",
+            requires_approval=True,
+            lifecycle="RESEARCH_ONLY",
+        )
+        self.database.register_strategy(metadata)
+        self.assertTrue(
+            self.database.query(
+                "SELECT * FROM paper_accounts WHERE strategy_id='legacy_research_fixture'"
+            )
+        )
+        self.database.initialize()
+        strategy = self.database.query(
+            "SELECT category FROM strategies WHERE strategy_id='legacy_research_fixture'"
+        )[0]
+        account = self.database.query(
+            "SELECT frozen FROM paper_accounts WHERE strategy_id='legacy_research_fixture'"
+        )[0]
+        self.assertEqual(strategy["category"], "research_project")
+        self.assertEqual(account["frozen"], 1)
+
+    def test_v5_database_migrates_to_v13_shadow_observer_schema(self) -> None:
         config = temporary_config(Path(self.temp.name) / "v5")
         config.database_path.parent.mkdir(parents=True)
         connection = sqlite3.connect(config.database_path)
@@ -120,6 +192,20 @@ class StoragePortfolioTests(unittest.TestCase):
                 decision_id INTEGER PRIMARY KEY AUTOINCREMENT, signal_id TEXT, decision TEXT,
                 note TEXT DEFAULT '', decided_at TEXT)"""
             )
+            connection.execute(
+                """CREATE TABLE strategy_observations (
+                observation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL,
+                strategy_id TEXT NOT NULL, strategy_version TEXT NOT NULL,
+                code TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', stage TEXT NOT NULL,
+                signal_asof TEXT NOT NULL, observed_at TEXT NOT NULL, score REAL NOT NULL,
+                entry_allowed INTEGER NOT NULL DEFAULT 0, target_weight REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING', executable INTEGER NOT NULL DEFAULT 0,
+                block_reason TEXT NOT NULL DEFAULT '', entry_time TEXT, entry_price REAL,
+                return_5d REAL, return_20d REAL, mae_20d REAL, mfe_20d REAL,
+                candidate_json TEXT NOT NULL DEFAULT '{}',
+                evaluation_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"""
+            )
             connection.commit()
         finally:
             connection.close()
@@ -130,10 +216,11 @@ class StoragePortfolioTests(unittest.TestCase):
         strategy_columns = {row["name"] for row in database.query("PRAGMA table_info(strategies)")}
         decision_columns = {row["name"] for row in database.query("PRAGMA table_info(signal_decisions)")}
         self.assertEqual(
-            database.query("SELECT MAX(version) AS version FROM schema_migrations")[0]["version"], 9
+            database.query("SELECT MAX(version) AS version FROM schema_migrations")[0]["version"], 13
         )
         self.assertIn("scan_enabled", strategy_columns)
         self.assertIn("runtime_adapter", strategy_columns)
+        self.assertIn("category", strategy_columns)
         self.assertIn("ai_alignment", decision_columns)
         self.assertTrue(database.query(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='strategy_experiments'"
@@ -144,6 +231,28 @@ class StoragePortfolioTests(unittest.TestCase):
         self.assertTrue(database.query(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='strategy_frameworks'"
         ))
+        self.assertTrue(database.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='strategy_observations'"
+        ))
+        self.assertTrue(database.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='research_projects'"
+        ))
+        self.assertTrue(database.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='research_candidates'"
+        ))
+        self.assertTrue(database.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='v9_repo_shadow_protocols'"
+        ))
+        self.assertTrue(database.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='v9_repo_shadow_events'"
+        ))
+        observation_columns = {
+            row["name"]
+            for row in database.query("PRAGMA table_info(strategy_observations)")
+        }
+        self.assertIn("hypothesis_selected", observation_columns)
+        self.assertIn("conversion_status", observation_columns)
+        self.assertIn("conversion_json", observation_columns)
 
     def test_position_cap_and_t_plus_one(self) -> None:
         buy = signal("BUY", datetime(2026, 1, 5, 15, 0).astimezone(), SignalStatus.APPROVED)

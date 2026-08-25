@@ -6,6 +6,16 @@
 
 `tdx-mock/` and `new_tdx64/` are local TongdaXin installations and data stores. Treat their binaries, market data, and configuration as external runtime assets, not application source.
 
+## Local TongdaXin Runtime
+
+For this repository on the user's current machine, the user-confirmed TongdaXin/TQ runtime root is `D:\Project\stock\tdx-mock`. It is a portable/local installation and is intentionally not registered in the Windows Uninstall registry.
+
+- Do not treat a missing TongdaXin registry entry as an installation failure or recurring blocker for this project.
+- Do not download another installer or ask the user to reinstall solely because the registry entry is absent.
+- Validate the runtime through the configured directory, the running `TdxW.exe` process, the local `127.0.0.1:17709` JSON-RPC service, and the required read-only US market-data methods.
+- A missing process, unavailable HTTP service, or failed read-only market-data call remains a real runtime blocker and should be reported precisely.
+- This exception is scoped to this repository and this user-confirmed path; it must not weaken default checks for other workspaces or machines.
+
 ## Build, Test, and Development Commands
 
 Run Python commands from `D:\Project\stock`:

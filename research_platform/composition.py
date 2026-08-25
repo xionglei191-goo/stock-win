@@ -9,6 +9,7 @@ from .models import (
     PlatformSignal,
     RuntimeAdapter,
     SignalStatus,
+    StrategyCategory,
     StrategyMetadata,
     StrategyScanResult,
 )
@@ -93,11 +94,24 @@ class StrategyGroupDefinition:
 def built_in_groups() -> tuple[StrategyGroupDefinition, ...]:
     return (
         StrategyGroupDefinition(
+            group_id="early_winner_v1_compare",
+            version="1.0.0",
+            name="早期强势股规则 / ML 对照",
+            description="在同一不可变研究快照上并列验证规则榜和模型榜，不做信号融合。",
+            composition_mode=CompositionMode.COMPARISON,
+            conflict_policy=ConflictPolicy.RISK_FIRST,
+            members=(
+                StrategyGroupMember("early_winner_rule_v1", 0.50, priority=10),
+                StrategyGroupMember("early_winner_ml_v1", 0.50, priority=20),
+            ),
+            built_in=True,
+        ),
+        StrategyGroupDefinition(
             group_id="combined",
-            version="3.0.0",
-            name="组合策略（缠论 + 49课体系）",
-            description="缠论与49课体系各使用50%独立资金，风险和归因互相隔离。",
-            composition_mode=CompositionMode.CAPITAL_SLEEVES,
+            version="3.1.0",
+            name="缠论 / 49课历史比较组合",
+            description="保留缠论与49课体系各50%资金分舱的历史复现；因缠论被审计否决，不支持扫描。",
+            composition_mode=CompositionMode.COMPARISON,
             conflict_policy=ConflictPolicy.RISK_FIRST,
             members=(
                 StrategyGroupMember("chan_v1", 0.50, priority=10),
@@ -224,9 +238,9 @@ def built_in_groups() -> tuple[StrategyGroupDefinition, ...]:
         ),
         StrategyGroupDefinition(
             group_id="adaptive_multi_strategy",
-            version="2.0.0",
-            name="自适应多策略组合",
-            description="49课、缠论与配对套利按独立资金分舱组合。",
+            version="2.1.0",
+            name="多策略历史比较组合",
+            description="保留49课、缠论与已否决配对套利的资金分舱历史回测；不支持扫描。",
             composition_mode=CompositionMode.CAPITAL_SLEEVES,
             conflict_policy=ConflictPolicy.RISK_FIRST,
             members=(
@@ -249,7 +263,12 @@ class StrategyCatalog:
         self.groups: dict[str, StrategyGroupDefinition] = {}
         self.group_issues: list[dict[str, str]] = []
         for group in built_in_groups():
-            group.validate(self.strategies)
+            try:
+                group.validate(self.strategies)
+            except ValueError as exc:
+                if "Unknown strategy group members" in str(exc):
+                    continue
+                raise
             self.groups[group.group_id] = group
         for group in groups:
             try:
@@ -334,6 +353,7 @@ class StrategyCatalog:
                     "framework_id": metadata.framework_id,
                     "policy_version": metadata.policy_version,
                     "archived": metadata.archived,
+                    "category": StrategyCategory(metadata.category).value,
                     "data_requirements": [requirement.__dict__ for requirement in metadata.data_requirements],
                 }
             (archived_strategies if metadata.archived else strategies).append(record)
@@ -363,9 +383,16 @@ class StrategyCatalog:
                     "members": [member.__dict__ for member in group.members],
                     "category": (
                         "framework"
-                        if group.group_id in {"combined", "adaptive_multi_strategy", "course49_system_compare"}
+                        if group.group_id == "course49_system_compare"
                         else "research_archive"
-                        if any(item.archived for item in member_metadata)
+                        if group.group_id in {"combined", "adaptive_multi_strategy"}
+                        or any(item.archived for item in member_metadata)
+                        else "research_project"
+                        if all(
+                            StrategyCategory(item.category)
+                            == StrategyCategory.RESEARCH_PROJECT
+                            for item in member_metadata
+                        )
                         else "independent"
                     ),
                     "scan_block_reason": (

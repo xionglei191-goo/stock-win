@@ -7,6 +7,8 @@ const strategyNames: Record<string, string> = {
   chan_v1: '缠论', course49_v1: '49课 V1', course49_v2: '49课 V2', course49_v3: '49课 V3',
   course49_v4: '49课 V4', course49_v5: '49课 V5', course49_v6: '49课 V6',
   course49_v7: '49课 V7', course49_v8: '49课 V8', course49_v9: '49课 V9（留出否决）', pairs_arbitrage_v1: '配对套利',
+  weekly_triangle_v1: '周线收敛三角形',
+  weekly_bull_platform_v1: '周线底部平台多头',
 }
 
 export default function PortfolioPage() {

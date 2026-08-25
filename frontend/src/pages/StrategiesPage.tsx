@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Check, FlaskConical, Play, Plus, RefreshCw, Save, Trash2, X } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import { api } from '../api'
 import { EmptyState, ErrorState, LoadingState, PageHeader, StatusBadge, percent, time } from '../components'
 import type { StrategyGroup, StrategyGroupDraft, StrategyGroupMember } from '../types'
@@ -39,6 +40,7 @@ export function lifecycleLabel(value: string) {
   if (value === 'HISTORICAL_ROBUSTNESS_REJECTED') return '历史稳健性否决'
   if (value === 'HOLDOUT_TARGET_REJECTED') return '留出收益目标否决'
   if (value === 'EXPERIMENTAL') return '实验'
+  if (value === 'RESEARCH_ONLY') return '研究观察'
   return value === 'ACTIVE' ? '有效' : value
 }
 
@@ -79,6 +81,8 @@ export default function StrategiesPage() {
   if (catalog.error) return <ErrorState error={catalog.error} />
   if (orderGroups.error) return <ErrorState error={orderGroups.error} />
   const data = catalog.data!
+  const formalStrategies = data.strategies.filter((item) => item.category !== 'research_project')
+  const researchStrategies = data.strategies.filter((item) => item.category === 'research_project')
 
   const editGroup = (group: StrategyGroup) => {
     setDraft({
@@ -107,7 +111,8 @@ export default function StrategiesPage() {
   return <>
     <PageHeader title="策略实验室" actions={<><button className="icon-button" title="重新加载本地策略插件" disabled={reload.isPending} onClick={() => reload.mutate()}><RefreshCw size={17} /></button><button className="button button--secondary" onClick={() => { setDraft(emptyGroup()); setEditingBuiltIn(false) }}><Plus size={17} />新建组合</button></>} />
     <section className="metrics-band metrics-band--compact">
-      <div><span>正式策略</span><strong>{data.strategies.length}</strong></div>
+      <div><span>正式策略</span><strong>{formalStrategies.length}</strong></div>
+      <div><span>研究项目</span><strong>{researchStrategies.length}</strong></div>
       <div><span>策略组合</span><strong>{data.groups.length}</strong></div>
       <div><span>多腿策略</span><strong>{data.strategies.filter((item) => item.execution_model === 'MULTI_LEG').length}</strong></div>
       <div><span>待批多腿</span><strong>{orderGroups.data!.filter((item) => item.status === 'PROPOSED').length}</strong></div>
@@ -118,8 +123,25 @@ export default function StrategiesPage() {
     <section className="table-section">
       <div className="section-heading"><h2>策略目录</h2><button className="button button--secondary" type="button" onClick={() => setShowArchived((value) => !value)}>{showArchived ? '隐藏研究归档' : '显示研究归档'}</button></div>
       <div className="table-wrap"><table className="strategy-catalog-table"><thead><tr><th>策略</th><th>版本</th><th>状态</th><th>来源</th><th>频率</th><th>执行</th><th>资产</th><th>数据需求</th><th>审批</th></tr></thead><tbody>
-        {data.strategies.map((strategy) => <tr key={strategy.strategy_id}><td><strong>{strategy.name}</strong><small className="subline">{strategy.strategy_id}</small></td><td>{strategy.version}<small className="subline">API {strategy.plugin_api_version}</small></td><td><StatusBadge status={lifecycleStatus(strategy.lifecycle)} label={lifecycleLabel(strategy.lifecycle)} /></td><td>{strategy.plugin_origin}<small className="subline">{strategy.runtime_adapter}</small></td><td>{strategy.frequency}</td><td>{strategy.execution_model === 'MULTI_LEG' ? '多腿' : '单腿'}{strategy.supports_short ? ' · 可做空' : ''}<small className="subline">{capabilityLabel(strategy.scan_enabled, strategy.backtest_enabled)}</small></td><td>{strategy.asset_classes.join(' / ')}</td><td><div className="requirement-list">{strategy.data_requirements.map((item, index) => <span key={`${item.dataset}-${index}`} className={item.available === false ? 'negative-text' : ''}>{item.dataset} · {item.frequency} · {item.adjustment} · {item.provider ?? '-'}</span>)}</div></td><td><StatusBadge status={strategy.requires_approval ? 'REQUIRED' : 'AUTO'} label={strategy.requires_approval ? '需审批' : '自动'} /></td></tr>)}
+        {formalStrategies.map((strategy) => <tr key={strategy.strategy_id}><td><strong>{strategy.name}</strong><small className="subline">{strategy.strategy_id}</small></td><td>{strategy.version}<small className="subline">API {strategy.plugin_api_version}</small></td><td><StatusBadge status={lifecycleStatus(strategy.lifecycle)} label={lifecycleLabel(strategy.lifecycle)} /></td><td>{strategy.plugin_origin}<small className="subline">{strategy.runtime_adapter}</small></td><td>{strategy.frequency}</td><td>{strategy.execution_model === 'MULTI_LEG' ? '多腿' : '单腿'}{strategy.supports_short ? ' · 可做空' : ''}<small className="subline">{capabilityLabel(strategy.scan_enabled, strategy.backtest_enabled)}</small></td><td>{strategy.asset_classes.join(' / ')}</td><td><div className="requirement-list">{strategy.data_requirements.map((item, index) => <span key={`${item.dataset}-${index}`} className={item.available === false ? 'negative-text' : ''}>{item.dataset} · {item.frequency} · {item.adjustment} · {item.provider ?? '-'}</span>)}</div></td><td><StatusBadge status={strategy.requires_approval ? 'REQUIRED' : 'AUTO'} label={strategy.requires_approval ? '需审批' : '自动'} /></td></tr>)}
       </tbody></table></div>
+    </section>
+
+    <section className="table-section">
+      <div className="section-heading"><h2>研究项目</h2><span>只输出候选，不进入交易链路</span></div>
+      <div className="research-project-grid">
+        {researchStrategies.map((strategy) => <article key={strategy.strategy_id} className="research-project-card">
+          <div><strong>{strategy.name}</strong><StatusBadge status="RESEARCH_ONLY" label="研究观察" /></div>
+          <p>{strategy.description}</p>
+          <small>{strategy.strategy_id} · {strategy.version}</small>
+          {strategy.strategy_family === 'early_winner_v1' && <Link className="button button--secondary" to="/research/early-winner">打开研究详情</Link>}
+          {strategy.strategy_family === 'early_winner_v2' && <Link className="button button--secondary" to="/research/early-winner-v2">打开 V2 研究</Link>}
+          {strategy.strategy_family === 'early_winner_v3' && <Link className="button button--secondary" to="/research/early-winner-v3">打开 V3 研究</Link>}
+          {strategy.strategy_family === 'early_winner_v4' && <Link className="button button--secondary" to="/research/early-winner-v4">打开 V4 研究</Link>}
+          {strategy.strategy_family === 'early_winner_v5' && <Link className="button button--secondary" to="/research/early-winner-v5">打开 V5 预注册</Link>}
+          {strategy.strategy_family === 'early_winner_v6' && <Link className="button button--secondary" to="/research/early-winner-v6">打开 V6 密封验证</Link>}
+        </article>)}
+      </div>
     </section>
 
     {showArchived && <section className="table-section">
@@ -160,7 +182,7 @@ export default function StrategiesPage() {
           <label className="field field--description"><span>说明</span><input value={draft.description} disabled={editingBuiltIn} onChange={(event) => setDraft({ ...draft, description: event.target.value })} /></label>
         </div>
         <div className="member-editor">
-          {data.strategies.map((strategy) => {
+          {formalStrategies.map((strategy) => {
             const member = draft.members.find((item) => item.strategy_id === strategy.strategy_id)
             return <div key={strategy.strategy_id} className={`member-row ${member ? 'active' : ''}`}>
               <label className="member-toggle"><input type="checkbox" checked={Boolean(member)} disabled={editingBuiltIn} onChange={() => toggleMember(strategy.strategy_id)} /><span><strong>{strategy.name}</strong><small>{strategy.execution_model === 'MULTI_LEG' ? '多腿' : strategy.frequency}</small></span></label>

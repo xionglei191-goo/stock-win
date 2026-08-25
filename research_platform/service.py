@@ -36,8 +36,16 @@ from .backtest_engine import (
 from .course49_market import flatten_market_activity, normalize_market_activity
 from .data import ResearchDataHub, TdxProvider
 from .data_cache import DataCacheManager
-from .data_plan import build_data_plan
+from .data_plan import build_data_plan, required_bar_lookback
+from .early_winner_research import EarlyWinnerResearchService
+from .early_winner_v2_research import EarlyWinnerV2ResearchService
+from .early_winner_v3_research import EarlyWinnerV3ResearchService
+from .early_winner_v4_research import EarlyWinnerV4ResearchService
+from .early_winner_v5_research import EarlyWinnerV5ResearchService
+from .early_winner_v6_research import EarlyWinnerV6ResearchService
+from .early_winner_trading import EarlyWinnerTradingService
 from .lhb import flatten_lhb_history, normalize_lhb_history
+from .validation_gates import run_validation_gates
 from .models import (
     DataHealth,
     DataStatus,
@@ -56,6 +64,8 @@ from .strategies.course49_system import (
     framework_metadata,
     production_playbooks,
 )
+from .weekly_triangle_observations import WeeklyTriangleObservationService
+from .us_market_calendar import is_nyse_month_end
 
 
 class PlatformService:
@@ -67,12 +77,27 @@ class PlatformService:
         self.data_cache = DataCacheManager(self.config, self.database)
         self.data_hub = ResearchDataHub(self.config)
         self.portfolio = PaperPortfolio(self.config, self.database)
+        self.weekly_triangle_observations = WeeklyTriangleObservationService(
+            self.config,
+            self.database,
+        )
+        self.early_winner = EarlyWinnerResearchService(self.config, self.database)
+        self.early_winner_v2 = EarlyWinnerV2ResearchService(self.config, self.database)
+        self.early_winner_v3 = EarlyWinnerV3ResearchService(self.config, self.database)
+        self.early_winner_v4 = EarlyWinnerV4ResearchService(self.config, self.database)
+        self.early_winner_v5 = EarlyWinnerV5ResearchService(self.config, self.database)
+        self.early_winner_v6 = EarlyWinnerV6ResearchService(self.config, self.database)
         self.strategies, self.plugin_issues = load_strategy_registry(self.config)
+        self.strategies.setdefault(
+            self.early_winner_v6.strategy.metadata.strategy_id,
+            self.early_winner_v6.strategy,
+        )
         for strategy in self.strategies.values():
             self.database.register_strategy(
                 strategy.metadata,
                 getattr(strategy, "__plugin_origin__", "builtin"),
             )
+        self.early_winner_trading = EarlyWinnerTradingService(self.config, self.database)
         self._register_frameworks()
         for group in built_in_groups():
             self.database.upsert_strategy_group(group)
@@ -103,8 +128,57 @@ class PlatformService:
         values = getattr(self.strategies[strategy_id], "required_codes", ())
         return tuple(str(item) for item in values)
 
+    def _strategy_market(self, strategy_id: str) -> str:
+        asset_classes = {
+            str(item).strip().upper()
+            for item in self.strategies[strategy_id].metadata.asset_classes
+            if str(item).strip()
+        }
+        markets: set[str] = set()
+        if any(item.startswith("US_") for item in asset_classes):
+            markets.add("US")
+        if "A_STOCK" in asset_classes or any(item.startswith("CN_") for item in asset_classes):
+            markets.add("CN")
+        if len(markets) > 1:
+            raise ValueError(
+                f"Strategy '{strategy_id}' declares assets from multiple markets: "
+                f"{', '.join(sorted(asset_classes))}"
+            )
+        return next(iter(markets), "CN")
+
+    def _scan_market(self, strategy_ids: tuple[str, ...]) -> str:
+        markets = {self._strategy_market(strategy_id) for strategy_id in strategy_ids}
+        if len(markets) != 1:
+            raise ValueError(
+                "A single scan cannot combine CN and US strategies; use separate runs"
+            )
+        return next(iter(markets))
+
+    def _us_benchmark_codes(self, strategy_ids: tuple[str, ...]) -> tuple[str, ...]:
+        codes = ["SPY.US"]
+        for strategy_id in strategy_ids:
+            parameters = getattr(self.strategies[strategy_id], "parameters", None)
+            market_code = str(getattr(parameters, "market_code", "") or "").strip()
+            if not market_code:
+                continue
+            if not market_code.endswith(".US"):
+                raise ValueError(
+                    f"US strategy '{strategy_id}' declares a non-US market benchmark: "
+                    f"{market_code}"
+                )
+            codes.append(market_code)
+        return tuple(dict.fromkeys(codes))
+
+    @staticmethod
+    def _is_us_month_end(index: Any) -> bool:
+        return is_nyse_month_end(index)
+
     def reload_strategies(self) -> dict[str, Any]:
         strategies, issues = load_strategy_registry(self.config)
+        strategies.setdefault(
+            self.early_winner_v6.strategy.metadata.strategy_id,
+            self.early_winner_v6.strategy,
+        )
         catalog = StrategyCatalog(strategies, self.database.load_strategy_groups())
         self.strategies = strategies
         self.plugin_issues = issues
@@ -121,6 +195,7 @@ class PlatformService:
                 getattr(strategy, "__plugin_origin__", "builtin"),
             )
         self._register_frameworks()
+        self.early_winner_trading = EarlyWinnerTradingService(self.config, self.database)
         return self.strategy_catalog()
 
     def strategy_catalog(self) -> dict[str, Any]:
@@ -323,6 +398,14 @@ class PlatformService:
                 "detail": str(self.config.database_path),
             }
         )
+        for gate in run_validation_gates(self.config.repository_root):
+            checks.append(
+                {
+                    "name": f"gate_{gate.name}",
+                    "ok": gate.ok,
+                    "detail": gate.detail,
+                }
+            )
         summary = "READY" if all(item["ok"] for item in checks) else "PARTIAL"
         return {"status": summary, "checked_at": datetime.now().astimezone().isoformat(), "checks": checks}
 
@@ -339,7 +422,7 @@ class PlatformService:
         refresh_data: bool = False,
         progress_callback: Any | None = None,
     ) -> ScanReport:
-        requested_ids = strategy_ids or ["combined"]
+        requested_ids = strategy_ids or ["course49_system"]
         sampling_mode = _resolve_sampling_mode(sampling_mode, max_stocks)
         unknown = sorted(
             item for item in set(requested_ids) if item not in self.strategies and item not in self.catalog.groups
@@ -362,6 +445,15 @@ class PlatformService:
         )
         if disabled:
             raise ValueError(f"Strategies are not enabled for scanning: {', '.join(disabled)}")
+        scan_market = self._scan_market(component_ids)
+        if scan_market == "US" and mode != "research":
+            raise ValueError(
+                "US strategy scans are research-only. Automated US paper execution "
+                "uses the isolated USMomentumPaperService after qualification."
+            )
+        us_benchmark_codes = (
+            self._us_benchmark_codes(component_ids) if scan_market == "US" else ()
+        )
         self.data_hub.sources.validate_requirements(
             requirement
             for item in component_ids
@@ -381,12 +473,17 @@ class PlatformService:
             (self.strategies[item].metadata for item in component_ids),
             event_minimum_streak=min(candidate_streaks, default=1),
         )
+        scan_bar_count = required_bar_lookback(
+            (self.strategies[item].metadata for item in component_ids),
+            minimum=120,
+        )
         run_id = uuid4().hex
         started = datetime.now().astimezone()
         self.database.create_run(run_id, "scan", mode, requested_ids)
         self.database.update_run(run_id, RunStatus.RUNNING)
         health: list[DataHealth] = []
         results: list[StrategyScanResult] = []
+        weekly_observation_update: dict[str, Any] = {}
         try:
             def batch_progress(
                 phase: str,
@@ -427,7 +524,16 @@ class PlatformService:
                         cache_status="refresh" if refresh_data else "miss",
                         waiting_reason="",
                     )
-                codes, names = provider.list_a_shares()
+                if scan_market == "US":
+                    listed_codes, listed_names = provider.list_us_stocks()
+                    codes = [code for code in listed_codes if code.endswith(".US")]
+                    names = {code: listed_names.get(code, code) for code in codes}
+                    if not codes:
+                        raise DataBlockedError(
+                            "US stock universe is unavailable; no .US symbols were returned"
+                        )
+                else:
+                    codes, names = provider.list_a_shares()
                 constrained_codes = list(
                     dict.fromkeys(
                         code
@@ -435,6 +541,21 @@ class PlatformService:
                         for code in self._required_codes(item)
                     )
                 )
+                if scan_market == "US":
+                    invalid_codes = sorted(
+                        code for code in constrained_codes if not code.endswith(".US")
+                    )
+                    if invalid_codes:
+                        raise ValueError(
+                            "US scans only accept .US symbols: "
+                            + ", ".join(invalid_codes)
+                        )
+                    missing_codes = sorted(set(constrained_codes) - set(codes))
+                    if missing_codes:
+                        raise DataBlockedError(
+                            "Required US symbols are absent from the stock universe: "
+                            + ", ".join(missing_codes)
+                        )
                 if all(
                     self._runtime_adapter(item) == RuntimeAdapter.GENERIC_DAILY
                     and self._required_codes(item)
@@ -452,10 +573,21 @@ class PlatformService:
                             "UNIVERSE_SAMPLE", 0.10, 0.20, "样本资格行情"
                         ),
                     )
-                    sample_eligible = filter_universe(
-                        sample_bars,
-                        names,
-                        StrategyConfig(tdx_root=self.config.tdx_root, daily_lookback=90),
+                    sample_eligible = (
+                        {
+                            code: frame
+                            for code, frame in sample_bars.items()
+                            if code.endswith(".US") and not frame.empty
+                        }
+                        if scan_market == "US"
+                        else filter_universe(
+                            sample_bars,
+                            names,
+                            StrategyConfig(
+                                tdx_root=self.config.tdx_root,
+                                daily_lookback=90,
+                            ),
+                        )
                     )
                     codes = _stratified_sample(
                         list(sample_eligible),
@@ -463,11 +595,30 @@ class PlatformService:
                         max_stocks or min(500, len(sample_eligible)),
                         sample_seed,
                     )
-                codes = list(dict.fromkeys([*codes, *constrained_codes]))
+                tradable_codes = list(
+                    dict.fromkeys(
+                        [
+                            *codes,
+                            *constrained_codes,
+                        ]
+                    )
+                )
+                codes = list(
+                    dict.fromkeys(
+                        [
+                            *tradable_codes,
+                            *(us_benchmark_codes if scan_market == "US" else ()),
+                        ]
+                    )
+                )
+                if scan_market == "US" and any(
+                    not code.endswith(".US") for code in codes
+                ):
+                    raise ValueError("US scans only accept .US symbols")
                 front = provider.fetch_bars(
                     codes,
                     "1d",
-                    120,
+                    scan_bar_count,
                     fields=data_plan.front_fields,
                     dividend_type="front",
                     batch_callback=batch_progress(
@@ -477,33 +628,86 @@ class PlatformService:
                 raw = provider.fetch_bars(
                     codes,
                     "1d",
-                    120,
+                    scan_bar_count,
                     fields=data_plan.raw_fields,
                     dividend_type="none",
                     batch_callback=batch_progress(
                         "MARKET_DATA_RAW", 0.30, 0.48, "不复权行情"
                     ),
                 )
-                index_map = provider.fetch_bars(["999999.SH"], "1d", 120, dividend_type="front")
-                index_bars = index_map.get("999999.SH")
-                if index_bars is None:
-                    fallback = provider.fetch_bars(["000001.SH"], "1d", 120, dividend_type="front")
-                    index_bars = fallback.get("000001.SH")
-                daily_health = self.data_hub.assess_daily(raw, index_bars)
+                if scan_market == "US":
+                    missing_benchmark_bars = [
+                        code
+                        for code in us_benchmark_codes
+                        if code not in front or front[code].empty
+                    ]
+                    if missing_benchmark_bars:
+                        raise DataBlockedError(
+                            "Required US market benchmark data is unavailable: "
+                            + ", ".join(missing_benchmark_bars)
+                        )
+                    index_bars = front["SPY.US"]
+                else:
+                    index_map = provider.fetch_bars(
+                        ["999999.SH"], "1d", scan_bar_count, dividend_type="front"
+                    )
+                    index_bars = index_map.get("999999.SH")
+                    if index_bars is None:
+                        fallback = provider.fetch_bars(
+                            ["000001.SH"], "1d", scan_bar_count, dividend_type="front"
+                        )
+                        index_bars = fallback.get("000001.SH")
+                daily_health = self.data_hub.assess_daily(
+                    raw,
+                    index_bars,
+                    expected_symbol_count=len(codes),
+                )
                 health.append(daily_health)
                 if daily_health.status != DataStatus.READY:
                     raise DataBlockedError(daily_health.message or "Daily data is unavailable")
-                legacy_config = StrategyConfig(tdx_root=self.config.tdx_root, daily_lookback=120)
+                legacy_config = StrategyConfig(
+                    tdx_root=self.config.tdx_root,
+                    daily_lookback=scan_bar_count,
+                )
                 fixed_generic_only = all(
                     self._runtime_adapter(item) == RuntimeAdapter.GENERIC_DAILY
                     and self._required_codes(item)
                     for item in component_ids
                 )
                 eligible_front = (
-                    {code: frame for code, frame in front.items() if not frame.empty}
-                    if fixed_generic_only
+                    {
+                        code: frame
+                        for code, frame in front.items()
+                        if not frame.empty
+                        and (scan_market != "US" or code.endswith(".US"))
+                    }
+                    if fixed_generic_only or scan_market == "US"
                     else filter_universe(front, names, legacy_config)
                 )
+                if scan_market == "US" and not eligible_front:
+                    raise DataBlockedError(
+                        "US stock universe has no usable daily bar data"
+                    )
+                if scan_market == "US":
+                    tradable_set = set(tradable_codes)
+                    eligible_front = {
+                        code: frame
+                        for code, frame in eligible_front.items()
+                        if code in tradable_set
+                    }
+                    if not eligible_front:
+                        raise DataBlockedError(
+                            "US stock universe has no usable tradable equity data"
+                        )
+                    # Benchmarks are analysis inputs, never tradable candidates.
+                    # The strategy reads SPY from front_bars for regime control.
+                    eligible_front.update(
+                        {
+                            code: front[code]
+                            for code in us_benchmark_codes
+                            if code in front and not front[code].empty
+                        }
+                    )
                 eligible_raw = {code: raw[code] for code in eligible_front if code in raw}
                 sectors_map = (
                     provider.load_sectors(refresh=refresh_sectors or refresh_data)
@@ -514,7 +718,12 @@ class PlatformService:
                 sector_hash = _records_hash(sector_rows)
                 benchmark_codes = ["000300.CSI", "000300.SH", "000852.CSI", "000852.SH", "399006.SZ"]
                 benchmark_bars = (
-                    provider.fetch_bars(benchmark_codes, "1d", 120, dividend_type="front")
+                    provider.fetch_bars(
+                        benchmark_codes,
+                        "1d",
+                        scan_bar_count,
+                        dividend_type="front",
+                    )
                     if data_plan.require_style_benchmarks
                     else {}
                 )
@@ -735,7 +944,8 @@ class PlatformService:
                 generic_ids = [
                     item
                     for item in component_ids
-                    if self._runtime_adapter(item) == RuntimeAdapter.GENERIC_DAILY
+                    if self._runtime_adapter(item)
+                    in {RuntimeAdapter.GENERIC_DAILY, RuntimeAdapter.US_STRICT}
                 ]
                 for generic_id in generic_ids:
                     metadata = self.strategies[generic_id].metadata
@@ -746,13 +956,23 @@ class PlatformService:
                     )
                     generic_result = self.strategies[generic_id].scan(
                         run_id=run_id,
+                        asof=pd.Timestamp(index_bars.index[-1]),
                         front_bars=eligible_front,
                         raw_bars=eligible_raw,
                         names=names,
                         sector_members=sectors_map,
                         benchmark_bars=benchmark_bars,
+                        index_bars=index_bars,
                         positions=generic_positions,
                         runtime_state=self.database.load_runtime_states(generic_id),
+                        is_rebalance_day=(
+                            self._is_us_month_end(index_bars.index)
+                            if scan_market == "US"
+                            else None
+                        ),
+                        tradable_codes=(
+                            set(tradable_codes) if scan_market == "US" else None
+                        ),
                     )
                     generic_latest = generic_result.state.get("asof")
                     _validate_scan_result(
@@ -800,12 +1020,18 @@ class PlatformService:
                 self.portfolio.queue_approved(signals)
                 snapshot_id = f"scan_{run_id}"
                 snapshot_metadata = {
-                    "count": 120,
+                    "count": scan_bar_count,
                     "adjustment": "front",
+                    "market": scan_market,
                     "sampling_mode": sampling_mode,
                     "sample_seed": sample_seed,
-                    "stock_pool_hash": _stock_pool_hash(list(eligible_front)),
-                    "universe_distribution": _universe_distribution(list(eligible_front)),
+                    "stock_pool_hash": _stock_pool_hash(
+                        list(tradable_codes if scan_market == "US" else eligible_front)
+                    ),
+                    "universe_distribution": _universe_distribution(
+                        list(tradable_codes if scan_market == "US" else eligible_front)
+                    ),
+                    "analysis_benchmarks": list(us_benchmark_codes),
                 }
                 self.snapshots.write_bars(snapshot_id, "daily_front", eligible_front, snapshot_metadata)
                 if data_plan.require_sectors:
@@ -860,12 +1086,78 @@ class PlatformService:
                 if push_tdx:
                     self._push_scan(provider, results)
 
+                weekly_result = next(
+                    (
+                        result
+                        for result in component_results
+                        if result.strategy.strategy_id == "weekly_triangle_v1"
+                    ),
+                    None,
+                )
+                if weekly_result is not None and sampling_mode == "full":
+                    weekly_strategy = self.strategies["weekly_triangle_v1"]
+                    runtime_candidates = [
+                        dict(item["candidate"])
+                        for item in dict(
+                            weekly_result.state.get("runtime_state") or {}
+                        ).values()
+                        if isinstance(item, dict)
+                        and isinstance(item.get("candidate"), dict)
+                    ]
+                    observation_candidates = sorted(
+                        runtime_candidates or list(weekly_result.candidates),
+                        key=lambda item: (
+                            -float(item.get("score") or 0.0),
+                            str(item.get("code") or ""),
+                        ),
+                    )
+                    target_weight = float(
+                        getattr(
+                            getattr(weekly_strategy, "parameters", None),
+                            "target_weight",
+                            0.20,
+                        )
+                    )
+                    try:
+                        weekly_observation_update = (
+                            self.weekly_triangle_observations.capture_and_refresh(
+                                run_id=run_id,
+                                strategy_version=weekly_result.strategy.version,
+                                observed_at=str(weekly_result.state.get("asof") or ""),
+                                candidates=observation_candidates,
+                                bars=raw,
+                                target_weight=target_weight,
+                                maximum_entries=int(
+                                    getattr(
+                                        getattr(weekly_strategy, "parameters", None),
+                                        "max_entry_signals",
+                                        20,
+                                    )
+                                ),
+                            )
+                        )
+                    except Exception as exc:
+                        weekly_observation_update = {
+                            "status": "FAILED",
+                            "error": str(exc),
+                        }
+                elif weekly_result is not None:
+                    weekly_observation_update = {
+                        "status": "SKIPPED",
+                        "reason": "NON_FULL_UNIVERSE",
+                    }
+
             metadata = {
                 "strategies": {result.strategy.strategy_id: result.state for result in results},
                 "framework_candidates": {
                     result.strategy.framework_id: list(result.candidates)
                     for result in component_results
                     if result.strategy.framework_id
+                },
+                "strategy_candidates": {
+                    result.strategy.strategy_id: list(result.candidates)
+                    for result in component_results
+                    if result.candidates
                 },
                 "components": [result.strategy.strategy_id for result in component_results],
                 "requested": requested_ids,
@@ -874,16 +1166,23 @@ class PlatformService:
                     if len(requested_ids) == 1 and requested_groups
                     else "independent"
                 ),
+                "market": scan_market,
                 "order_group_count": sum(len(result.order_groups) for result in results),
                 "sampling_mode": sampling_mode,
                 "sample_seed": sample_seed,
                 "data_plan": data_plan.as_dict(),
                 "effective_batch_sizes": provider.effective_batch_sizes(),
-                "stock_pool_hash": _stock_pool_hash(list(eligible_front)) if results else "",
-                "universe_distribution": _universe_distribution(list(eligible_front)) if results else {},
+                "stock_pool_hash": _stock_pool_hash(
+                    list(tradable_codes if scan_market == "US" else eligible_front)
+                ) if results else "",
+                "universe_distribution": _universe_distribution(
+                    list(tradable_codes if scan_market == "US" else eligible_front)
+                ) if results else {},
+                "analysis_benchmarks": list(us_benchmark_codes),
                 "sector_membership_quality": "LIMITED" if data_plan.require_sectors else "NOT_REQUIRED",
                 "sector_membership_source": "current_fallback" if data_plan.require_sectors else "data_plan",
                 "sector_membership_hash": sector_hash if results and data_plan.require_sectors else "",
+                "weekly_triangle_observations": weekly_observation_update,
             }
             self.database.update_run(run_id, RunStatus.SUCCEEDED, snapshot_id=snapshot_id, metadata=metadata)
             if progress_callback is not None:
@@ -1103,6 +1402,7 @@ class PlatformService:
         course49_v2 = by_strategy.get("course49_v2")
         course49_v3 = by_strategy.get("course49_v3")
         course49_system = by_strategy.get("course49_system")
+        weekly_triangle = by_strategy.get("weekly_triangle_v1")
         if chan:
             provider.push_candidates(
                 "RP_CHAN", "缠论候选", [signal.code for signal in chan.signals if signal.side == "BUY"]
@@ -1141,6 +1441,25 @@ class PlatformService:
                     if signal.status == SignalStatus.PROPOSED
                 ],
             )
+        if weekly_triangle:
+            provider.push_candidates(
+                "RP_WTRI_WATCH",
+                "周线三角观察",
+                [
+                    str(candidate["code"])
+                    for candidate in weekly_triangle.candidates
+                ],
+            )
+            provider.push_candidates(
+                "RP_WTRI_BREAK",
+                "周线三角突破观察",
+                [
+                    str(candidate["code"])
+                    for candidate in weekly_triangle.candidates
+                    if candidate.get("stage") == "BREAKOUT"
+                ],
+            )
+            provider.push_candidates("RP_WTRI_BUY", "周线三角买入（停用）", [])
         sell_codes = [signal.code for result in results for signal in result.signals if signal.side == "SELL"]
         provider.push_candidates("RP_SELL", "投研卖出", sell_codes)
         for result in results:

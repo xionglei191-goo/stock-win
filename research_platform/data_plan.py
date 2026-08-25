@@ -83,6 +83,22 @@ def build_data_plan(
     )
 
 
+def required_bar_lookback(
+    metadata: Iterable[StrategyMetadata],
+    *,
+    minimum: int = 0,
+) -> int:
+    return max(
+        [minimum]
+        + [
+            int(requirement.lookback)
+            for strategy in metadata
+            for requirement in strategy.data_requirements
+            if requirement.dataset == "bars"
+        ]
+    )
+
+
 def _bar_fields(
     requirements: tuple[DataRequirement, ...],
     adjustment: str,

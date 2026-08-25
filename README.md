@@ -1,15 +1,18 @@
 # 通达信多策略投研平台
 
-本项目以本地通达信为首要行情与板块数据底座，在其上建立可复现的数据契约、策略框架、插件、组合编排、Python 回测、模拟组合和 Web 展示。缠论与配对套利是独立策略；“49 课”是共享市场、题材、龙头和资金上下文的多剧本体系。平台不调用真实下单接口。
+美股动量 PIT 与自动模拟盘运行说明见 [docs/us-momentum-production.md](docs/us-momentum-production.md)。
+
+本项目以本地通达信为首要行情与板块数据底座，在其上建立可复现的数据契约、策略框架、插件、组合编排、Python 回测、模拟组合和 Web 展示。“49 课”是当前默认扫描入口；缠论、配对套利 V1 和周线三角形的历史入场均已否决，保留为研究基线。平台不调用真实下单接口。
 
 ## 当前能力
 
 - 通达信全 A 股、日线、板块及涨跌停数据适配。
 - 数据健康检查、SQLite 元数据、Parquet 研究快照和来源登记。
 - 策略驱动 `DataPlan`、历史区间读取、24GB 内存/50GB 磁盘两级缓存、8线程本地处理和三作业调度；TQ 始终单通道。
-- `chan_v1`：市场/板块/龙头过滤后的日线中枢突破与退出。
+- `chan_v1`：日线中枢突破历史基线；五段标准/双倍成本审计均为 0/5 盈利窗口，已关闭扫描并保留回测。
 - `course49_system`：正式的 49 课体系入口，统一路由修复启动、发酵二板和加速核心接力三个生产剧本；V1-V11 保留为默认隐藏的研究归档。
-- `pairs_arbitrage_v1`：固定同行业股票对的价差均值回归研究，使用原子多腿意图和仅模拟做空。
+- `pairs_arbitrage_v1`：固定同行业股票对的价差均值回归历史基线；五段冻结审计已否决，只保留回测复现。
+- `weekly_triangle_v1`：周线均线聚合与收敛三角形观察策略；历史入场已否决，实时候选只进入独立前向观察账本。
 - API V1 本地策略插件、热重载、数据依赖声明和自定义组合；支持资金分舱、信号加权、交集确认和风险覆盖。
 - 通用日线单腿/多腿回测适配器；新增普通策略或套利策略不需要修改扫描和回测主流程。
 - 分策略资金隔离、原子多腿模拟执行、T+1、涨跌停、费用、滑点和组合上限。
@@ -34,12 +37,15 @@ cd ..
 
 py -3 -m research_platform catalog
 py -3 -m research_platform scan --strategies course49_system
-py -3 -m research_platform scan --strategies adaptive_multi_strategy
 py -3 -m research_platform backtest --strategy course49_system --playbooks recovery_ignition,ferment_second_board,acceleration_core_relay
 py -3 -m research_platform backtest --strategy adaptive_multi_strategy --daily-bars 180
+py -3 -m research_platform pairs-arbitrage-study
+py -3 -m research_platform chan-study
 py -3 -m research_platform diagnose-course49 --backtest-id <BACKTEST_ID>
 py -3 -m research_platform daily-research
 py -3 -m research_platform refresh-feedback
+py -3 -m research_platform refresh-weekly-observations
+py -3 -m research_platform weekly-triangle-setup-study
 py -3 -m research_platform serve
 ```
 
@@ -55,4 +61,4 @@ py -3 -m research_platform serve
 - `data/`：运行数据库和 Parquet 快照，不提交版本库。
 - `tdx-mock/`、`new_tdx64/`：本机通达信资产，不视为应用源码。
 
-详细设计见 [docs/architecture.md](docs/architecture.md)，研究助手见 [docs/ai-research.md](docs/ai-research.md)，自动实验见 [docs/strategy-lab.md](docs/strategy-lab.md)，新增策略流程见 [docs/strategy-development.md](docs/strategy-development.md)，日常操作见 [docs/operations.md](docs/operations.md)。
+详细设计见 [docs/architecture.md](docs/architecture.md)，Chan 审计见 [docs/chan-daily-evaluation.md](docs/chan-daily-evaluation.md)，配对套利审计见 [docs/pairs-arbitrage-research.md](docs/pairs-arbitrage-research.md)，现金工具预注册见 [docs/cash-instrument-validation.md](docs/cash-instrument-validation.md)，研究助手见 [docs/ai-research.md](docs/ai-research.md)，自动实验见 [docs/strategy-lab.md](docs/strategy-lab.md)，新增策略流程见 [docs/strategy-development.md](docs/strategy-development.md)，日常操作见 [docs/operations.md](docs/operations.md)。

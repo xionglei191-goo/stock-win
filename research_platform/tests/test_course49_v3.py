@@ -125,6 +125,21 @@ class Course49V3Tests(unittest.TestCase):
         self.assertFalse(strategy.holding_sector_weak("GLOBAL_CORE", None))
         self.assertTrue(strategy.holding_sector_weak("880001.SH", None))
 
+    def test_global_rank_accepts_base_point_in_time_arguments(self) -> None:
+        strategy = Course49V3Strategy()
+
+        self.assertEqual(
+            strategy.rank_sectors(
+                {},
+                {},
+                {},
+                {},
+                asof=pd.Timestamp("2026-01-05"),
+                eligible_codes={"000001.SZ"},
+            ),
+            [],
+        )
+
     def test_defensive_index_does_not_veto_local_acceleration(self) -> None:
         strategy = Course49V3Strategy()
         self.assertTrue(strategy.entry_allowed(market(), style()))

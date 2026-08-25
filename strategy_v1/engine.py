@@ -154,10 +154,15 @@ def run_scan(
             if frame is None or len(frame) < 20:
                 continue
             chan = analyze_chan(frame, config.chan)
-            if chan.breakout and daily_entry_allowed(frame, config.chan):
-                raw_frame = execution_bars.get(leader.code)
-                raw_price = float(raw_frame["Close"].iloc[-1]) if raw_frame is not None else float(frame["Close"].iloc[-1])
-                signals.append(_latest_signal(leader.code, frame, chan, "BUY", "日线中枢上破", market, leader, raw_price))
+            if not daily_entry_allowed(frame, config.chan):
+                continue
+            if chan.breakout_confirmed:
+                reason = "日线中枢上破(MACD确认)"
+            else:
+                continue
+            raw_frame = execution_bars.get(leader.code)
+            raw_price = float(raw_frame["Close"].iloc[-1]) if raw_frame is not None else float(frame["Close"].iloc[-1])
+            signals.append(_latest_signal(leader.code, frame, chan, "BUY", reason, market, leader, raw_price))
 
     broker.queue(signals)
     latest_times = [pd.Timestamp(frame.index[-1]) for frame in signal_bars.values() if not frame.empty]

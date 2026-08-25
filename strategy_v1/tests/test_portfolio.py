@@ -55,6 +55,13 @@ class PortfolioTests(unittest.TestCase):
         }
         self.broker.process_pending(next_day, {"600000.SH": 10.1}, {"600000.SH": "浦发银行"})
         self.assertNotIn("600000.SH", self.broker.state.positions)
+        buy, sell = self.broker.trades
+        expected_pnl = (
+            (sell["price"] - buy["price"]) * sell["quantity"]
+            - buy["fees"]
+            - sell["fees"]
+        )
+        self.assertAlmostEqual(sell["pnl"], expected_pnl)
 
     def test_limit_up_buy_remains_pending(self) -> None:
         self.broker.queue([self.signal("BUY", "2026-01-05 10:00")])

@@ -8,6 +8,8 @@ from typing import Any, Protocol
 
 import pandas as pd
 
+from strategy_v1.portfolio import price_limit_ratio
+
 from research_platform.lhb import LhbFeatures, latest_lhb_features, latest_limit_features
 from research_platform.models import (
     DataRequirement,
@@ -28,9 +30,10 @@ from .course49_v2 import Course49V2Strategy, MarketStyle, POSITIVE_LHB_REASONS
 
 
 FRAMEWORK_ID = "course49"
-FRAMEWORK_VERSION = "1.0.0"
+FRAMEWORK_VERSION = "1.1.0"
 CONTEXT_VERSION = "1.0.0"
-POLICY_VERSION = "1.0.0"
+POLICY_VERSION = "1.1.0"
+LEADER_PULLBACK_PLAYBOOK_ID = "leader_pullback_reclaim"
 
 
 class PlaybookLifecycle(StrEnum):
@@ -92,6 +95,7 @@ class Course49Context:
     runtime_state: dict[str, dict[str, Any]]
     front_bars: dict[str, pd.DataFrame] = field(repr=False)
     raw_bars: dict[str, pd.DataFrame] = field(repr=False)
+    sector_members: dict[str, dict[str, Any]] = field(repr=False)
     lhb_history: dict[str, dict[str, LhbFeatures]] = field(repr=False)
 
 
@@ -104,6 +108,7 @@ class PlaybookCandidate:
     reason_codes: tuple[str, ...]
     evidence: dict[str, Any]
     leader: dict[str, Any]
+    stop_price: float | None = None
 
 
 @dataclass(frozen=True)
@@ -331,6 +336,333 @@ class AccelerationCoreRelayPlaybook(_ProductionPlaybook):
     trade_mode = "ACCELERATION_CORE_RELAY"
 
 
+class LeaderPullbackReclaimPlaybook:
+    """Research-only strong-leader pullback and close-reclaim playbook."""
+
+    metadata: PlaybookMetadata
+    trade_mode = "LEADER_PULLBACK_RECLAIM"
+
+    def __init__(self, metadata: PlaybookMetadata) -> None:
+        self.metadata = metadata
+
+    def evaluate(self, context: Course49Context) -> PlaybookResult:
+        if self.metadata.lifecycle != PlaybookLifecycle.RESEARCH:
+            return PlaybookResult(
+                self.metadata.playbook_id, False, (), ("PLAYBOOK_NOT_RESEARCH",)
+            )
+        healthy_divergence = (
+            context.market.phase == "DIVERGENCE"
+            and context.market.score >= 0.55
+            and context.market.regime != "WEAK"
+            and context.style.entry_allowed
+        )
+        ordinary_entry = (
+            context.market.phase in {"RECOVERY", "FERMENT"}
+            and context.entry_allowed
+        )
+        if not (healthy_divergence or ordinary_entry):
+            return PlaybookResult(
+                self.metadata.playbook_id,
+                False,
+                (),
+                (f"MARKET_PHASE_{context.market.phase}",),
+            )
+
+        sector_results: list[PlaybookCandidate] = []
+        for sector in context.sectors[:3]:
+            theme_phase = str(sector.get("theme_phase", ""))
+            if theme_phase not in {"START", "FERMENT", "DIVERGENCE"}:
+                continue
+            sector_code = str(sector["sector_code"])
+            members = context.sector_members.get(sector_code, {}).get("members", [])
+            rows: list[dict[str, Any]] = []
+            for code_value in members:
+                code = str(code_value)
+                if code in context.positions:
+                    continue
+                features = _pullback_candidate_features(
+                    context.front_bars.get(code),
+                    context.raw_bars.get(code),
+                    code,
+                    context.asof,
+                )
+                if features is None:
+                    continue
+                capital = latest_lhb_features(context.lhb_history, code, context.asof)
+                if capital and capital.risk:
+                    continue
+                rows.append(
+                    {
+                        "code": code,
+                        "features": features,
+                        "capital": capital,
+                    }
+                )
+            if not rows:
+                continue
+
+            strength = pd.Series(
+                {item["code"]: item["features"]["return_20d"] for item in rows}
+            ).rank(method="average", pct=True)
+            liquidity = pd.Series(
+                {item["code"]: item["features"]["turnover_20d"] for item in rows}
+            ).rank(method="average", pct=True)
+            ranked: list[tuple[float, str, dict[str, Any], LhbFeatures | None]] = []
+            for item in rows:
+                code = item["code"]
+                features = item["features"]
+                volume_score = max(
+                    0.0,
+                    min(1.0, (1.0 - features["pullback_volume_ratio"]) / 0.5),
+                )
+                depth_score = max(
+                    0.0,
+                    min(1.0, 1.0 - abs(features["pullback_depth"] - 0.06) / 0.04),
+                )
+                score = min(
+                    1.0,
+                    float(sector.get("score", 0.0) or 0.0) * 0.25
+                    + float(strength[code]) * 0.25
+                    + volume_score * 0.20
+                    + depth_score * 0.15
+                    + float(liquidity[code]) * 0.15,
+                )
+                ranked.append((score, code, features, item["capital"]))
+            ranked.sort(key=lambda item: (-item[0], item[1]))
+            score, code, features, capital = ranked[0]
+            price = float(features["close"])
+            stop_price = max(price * 0.95, float(features["pullback_low"]) * 0.99)
+            leader = {
+                "code": code,
+                "name": code,
+                "price": price,
+                "sector_code": sector_code,
+                "sector_name": str(sector.get("sector_name", sector_code)),
+                "sector_rank": int(sector.get("rank", len(sector_results) + 1)),
+                "sector_score": float(sector.get("score", 0.0) or 0.0),
+                "theme_phase": theme_phase,
+                "streak": 0,
+                "leader_rank": 1,
+                "role": "PULLBACK_LEADER",
+                "leader_score": score,
+                "board_quality_score": 0.0,
+                "capital_risk": "",
+            }
+            evidence = {
+                "price": price,
+                "entry_price": price,
+                "market_score": context.market.score,
+                "market_score_change_3d": context.market.score_change_3d,
+                "market_regime": context.market.regime,
+                "market_phase": context.market.phase,
+                "market_style": context.style.code,
+                "style_suitability": context.suitability,
+                "classified_style_suitability": context.style.suitability,
+                "trade_mode": self.trade_mode,
+                "benchmark_codes": context.style.benchmark_codes,
+                "sector_code": sector_code,
+                "sector_name": leader["sector_name"],
+                "sector_rank": leader["sector_rank"],
+                "sector_score": leader["sector_score"],
+                "theme_phase": theme_phase,
+                "leader_rank": 1,
+                "role": leader["role"],
+                "leader_score": score,
+                "base_target_weight": self.metadata.base_weight,
+                "lhb": capital.as_dict() if capital else {"listed": False},
+                "limit_behavior": {"limit_event": False},
+                "pullback": features,
+                "entry_gap_min": -0.03,
+                "entry_gap_max": 0.08,
+                "framework_id": FRAMEWORK_ID,
+                "playbook_id": self.metadata.playbook_id,
+                "policy_version": POLICY_VERSION,
+            }
+            sector_results.append(
+                PlaybookCandidate(
+                    self.metadata.playbook_id,
+                    code,
+                    score,
+                    self.metadata.base_weight,
+                    (
+                        self.trade_mode,
+                        "TOP3_THEME",
+                        "SHRINKING_PULLBACK",
+                        "MA5_RECLAIM",
+                    ),
+                    evidence,
+                    leader,
+                    stop_price=stop_price,
+                )
+            )
+        return PlaybookResult(
+            self.metadata.playbook_id, True, tuple(sector_results[:3]), ()
+        )
+
+
+def _pullback_candidate_features(
+    front: pd.DataFrame | None,
+    raw: pd.DataFrame | None,
+    code: str,
+    asof: pd.Timestamp,
+) -> dict[str, float | int] | None:
+    if front is None or raw is None:
+        return None
+    visible_front = front.loc[:asof].copy().sort_index()
+    visible_raw = raw.loc[:asof].copy().sort_index()
+    if len(visible_front) < 21 or len(visible_raw) < 21:
+        return None
+    close = pd.to_numeric(visible_front.get("Close"), errors="coerce")
+    open_price = pd.to_numeric(visible_front.get("Open"), errors="coerce")
+    low = pd.to_numeric(visible_front.get("Low"), errors="coerce")
+    volume = pd.to_numeric(visible_front.get("Volume"), errors="coerce")
+    if any(item.isna().iloc[-21:].any() for item in (close, open_price, low, volume)):
+        return None
+    raw_close = pd.to_numeric(visible_raw.get("Close"), errors="coerce")
+    raw_low = pd.to_numeric(visible_raw.get("Low"), errors="coerce")
+    raw_volume = pd.to_numeric(visible_raw.get("Volume"), errors="coerce")
+    if any(item.isna().iloc[-21:].any() for item in (raw_close, raw_low, raw_volume)):
+        return None
+
+    return_20d = float(close.iloc[-1] / close.iloc[-21] - 1.0)
+    if return_20d < 0.10:
+        return None
+    ratio = price_limit_ratio(code, "")
+    raw_returns = raw_close.pct_change(fill_method=None)
+    if not bool((raw_returns.iloc[-21:-2] >= ratio - 0.001).any()):
+        return None
+
+    recent = close.iloc[-10:]
+    peak_position = int(recent.to_numpy().argmax())
+    peak_age = len(recent) - 1 - peak_position
+    if peak_age < 2 or peak_age > 4:
+        return None
+    peak_index = len(close) - len(recent) + peak_position
+    peak_close = float(close.iloc[peak_index])
+    pullback_depth = float(1.0 - close.iloc[-1] / peak_close)
+    if pullback_depth < 0.03 or pullback_depth > 0.10:
+        return None
+
+    pullback_volume = volume.iloc[peak_index + 1 : -1]
+    baseline_volume = float(volume.iloc[-21:-1].mean())
+    if pullback_volume.empty or baseline_volume <= 0:
+        return None
+    pullback_volume_ratio = float(pullback_volume.mean() / baseline_volume)
+    if pullback_volume_ratio > 0.80:
+        return None
+
+    peak_date = pd.Timestamp(close.index[peak_index])
+    raw_pullback_returns = raw_returns.loc[peak_date:].iloc[1:]
+    if bool((raw_pullback_returns <= -ratio + 0.001).any()):
+        return None
+
+    ma5 = float(close.tail(5).mean())
+    ma10 = float(close.tail(10).mean())
+    ma20 = float(close.tail(20).mean())
+    adjusted_pullback_low = float(low.iloc[peak_index + 1 :].min())
+    touched_support = adjusted_pullback_low <= max(ma5, ma10) * 1.01
+    current_close = float(close.iloc[-1])
+    previous_close = float(close.iloc[-2])
+    current_return = current_close / previous_close - 1.0
+    if not (
+        touched_support
+        and current_close >= ma5
+        and current_close >= ma10 * 0.99
+        and current_close > ma20
+        and current_close > float(open_price.iloc[-1])
+        and current_close > previous_close
+        and current_return <= 0.05
+    ):
+        return None
+
+    raw_pullback_low = float(raw_low.loc[peak_date:].iloc[1:].min())
+    raw_current_close = float(raw_close.iloc[-1])
+    turnover_20d = float((raw_close.tail(20) * raw_volume.tail(20)).mean())
+    return {
+        "close": raw_current_close,
+        "adjusted_close": current_close,
+        "return_20d": return_20d,
+        "peak_age": peak_age,
+        "peak_close": peak_close,
+        "pullback_depth": pullback_depth,
+        "pullback_volume_ratio": pullback_volume_ratio,
+        "pullback_low": raw_pullback_low,
+        "adjusted_pullback_low": adjusted_pullback_low,
+        "ma5": ma5,
+        "ma10": ma10,
+        "ma20": ma20,
+        "turnover_20d": turnover_20d,
+    }
+
+
+def build_leader_pullback_candidate_matrix(
+    front_bars: dict[str, pd.DataFrame],
+    raw_bars: dict[str, pd.DataFrame],
+    names: dict[str, str],
+    eligibility: pd.DataFrame,
+) -> pd.DataFrame:
+    """Broad point-in-time mask; the playbook applies the exact pullback rules."""
+    codes = sorted(set(front_bars) & set(raw_bars) & set(eligibility.columns))
+    if not codes:
+        return pd.DataFrame()
+    front_close = pd.concat(
+        {code: pd.to_numeric(front_bars[code].get("Close"), errors="coerce") for code in codes},
+        axis=1,
+    ).sort_index()
+    raw_close = pd.concat(
+        {code: pd.to_numeric(raw_bars[code].get("Close"), errors="coerce") for code in codes},
+        axis=1,
+    ).reindex(front_close.index)
+    raw_returns = raw_close.pct_change(fill_method=None)
+    thresholds = pd.Series(
+        {code: price_limit_ratio(code, names.get(code, "")) - 0.001 for code in codes}
+    )
+    limit_up = raw_returns.ge(thresholds, axis="columns")
+    recent_limit = limit_up.shift(2).rolling(19, min_periods=19).max().fillna(False)
+    strong = front_close / front_close.shift(20) - 1.0 >= 0.10
+    eligible = eligibility.reindex(index=front_close.index, columns=codes).fillna(False)
+    return recent_limit.astype(bool) & strong.fillna(False) & eligible.astype(bool)
+
+
+def update_pullback_exit_state(
+    state: dict[str, Any],
+    *,
+    price: float,
+    entry_price: float,
+    below_ma5: bool,
+    below_ma10: bool,
+    market_weak: bool,
+    sector_weak: bool,
+    immediate_reason: str = "",
+) -> tuple[dict[str, Any], str]:
+    del below_ma5
+    current = {
+        "market_weak_days": int(state.get("market_weak_days", 0) or 0),
+        "sector_weak_days": int(state.get("sector_weak_days", 0) or 0),
+        "below_ma10_days": int(state.get("below_ma10_days", 0) or 0),
+        "max_close": float(state.get("max_close", entry_price) or entry_price),
+        "entry_price": float(state.get("entry_price", entry_price) or entry_price),
+        "holding_days": int(state.get("holding_days", 0) or 0) + 1,
+    }
+    current["max_close"] = max(current["max_close"], price)
+    current["market_weak_days"] = current["market_weak_days"] + 1 if market_weak else 0
+    current["sector_weak_days"] = current["sector_weak_days"] + 1 if sector_weak else 0
+    current["below_ma10_days"] = current["below_ma10_days"] + 1 if below_ma10 else 0
+    if immediate_reason:
+        return current, immediate_reason
+    if current["max_close"] > entry_price * 1.08 and price <= current["max_close"] * 0.96:
+        return current, "PULLBACK_TRAILING_PROFIT"
+    if current["below_ma10_days"] >= 2:
+        return current, "PULLBACK_STRUCTURE_BROKEN"
+    if current["market_weak_days"] >= 2:
+        return current, "PULLBACK_MARKET_WEAK_CONFIRMED"
+    if current["sector_weak_days"] >= 2:
+        return current, "PULLBACK_SECTOR_FADED_CONFIRMED"
+    if current["holding_days"] >= 5:
+        return current, "PULLBACK_TIME_EXIT"
+    return current, ""
+
+
 def framework_metadata() -> FrameworkMetadata:
     return FrameworkMetadata(
         FRAMEWORK_ID,
@@ -385,6 +717,26 @@ def production_playbooks(
             )
         )
         for playbook_class, playbook_id, name, description, base_weight, phase in definitions
+    )
+
+
+def research_playbooks(
+    requirements: tuple[DataRequirement, ...],
+) -> tuple[Course49Playbook, ...]:
+    return (
+        LeaderPullbackReclaimPlaybook(
+            PlaybookMetadata(
+                LEADER_PULLBACK_PLAYBOOK_ID,
+                FRAMEWORK_ID,
+                "0.1.0",
+                "强势回调确认低吸",
+                "近20日强势股缩量回调后收盘重新站回短期均线。",
+                PlaybookLifecycle.RESEARCH,
+                requirements,
+                0.10,
+                "MULTI_PHASE",
+            )
+        ),
     )
 
 
@@ -447,7 +799,9 @@ class Course49SystemStrategy(Course49V2Strategy):
         self.playbook_registry = Course49PlaybookRegistry()
         for playbook in production_playbooks(self.metadata.data_requirements):
             self.playbook_registry.register(playbook, trusted_production=True)
-        self.playbooks = self.playbook_registry.production()
+        for playbook in research_playbooks(self.metadata.data_requirements):
+            self.playbook_registry.register(playbook)
+        self.playbooks = self.playbook_registry.all()
         self.router = Course49Router()
 
     def scan(
@@ -547,13 +901,21 @@ class Course49SystemStrategy(Course49V2Strategy):
             runtime_state=runtime_state,
             front_bars=front_bars,
             raw_bars=raw_bars,
+            sector_members=sector_members,
             lhb_history=lhb_history,
         )
         generated_at = _shanghai_time(market.asof.replace(hour=18))
         next_day = _shanghai_time((market.asof + pd.offsets.BDay(1)).replace(hour=9, minute=25))
         signals, next_runtime = self._exit_signals(context, run_id, generated_at, next_day)
 
-        selected_ids = set(playbook_ids or [item.metadata.playbook_id for item in self.playbooks])
+        selected_ids = set(
+            playbook_ids
+            or [
+                item.metadata.playbook_id
+                for item in self.playbooks
+                if item.metadata.lifecycle == PlaybookLifecycle.PRODUCTION
+            ]
+        )
         unknown = selected_ids - {item.metadata.playbook_id for item in self.playbooks}
         if unknown:
             raise ValueError(f"Unknown Course49 playbooks: {', '.join(sorted(unknown))}")
@@ -578,7 +940,9 @@ class Course49SystemStrategy(Course49V2Strategy):
                     target_weight=item.target_weight,
                     horizon="daily-short",
                     valid_until=next_day,
-                    stop_price=price * (1.0 - self.stop_loss_ratio()),
+                    stop_price=item.stop_price
+                    if item.stop_price is not None
+                    else price * (1.0 - self.stop_loss_ratio()),
                     status=SignalStatus.PROPOSED,
                     reason_codes=item.reason_codes,
                     evidence=item.evidence,
@@ -679,6 +1043,7 @@ class Course49SystemStrategy(Course49V2Strategy):
             close = pd.to_numeric(frame["Close"], errors="coerce").dropna()
             price = float(close.iloc[-1])
             below_ma5 = price < float(close.tail(5).mean())
+            below_ma10 = price < float(close.tail(10).mean())
             evidence = json_evidence(position)
             sector_code = str(evidence.get("sector_code", ""))
             sector = holding_sector_map.get(sector_code)
@@ -699,24 +1064,37 @@ class Course49SystemStrategy(Course49V2Strategy):
                 or context.runtime_state.get(code, {}).get("entry_price")
                 or price
             )
-            state, reason = self.evaluate_exit_state(
-                context.runtime_state.get(code, {}),
-                price=price,
-                entry_price=entry_price,
-                below_ma5=below_ma5,
-                market_weak=context.market.phase in {"RETREAT", "DIVERGENCE"}
-                or context.market.regime == "WEAK",
-                sector_weak=self.holding_sector_weak(sector_code, sector),
-                leader_weak=self.holding_leader_weak(code, leader, leader_rank),
-                immediate_reason=immediate_reason,
-            )
+            source_playbook = str(evidence.get("playbook_id", "holding_management"))
+            if source_playbook == LEADER_PULLBACK_PLAYBOOK_ID:
+                state, reason = update_pullback_exit_state(
+                    context.runtime_state.get(code, {}),
+                    price=price,
+                    entry_price=entry_price,
+                    below_ma5=below_ma5,
+                    below_ma10=below_ma10,
+                    market_weak=context.market.phase == "RETREAT"
+                    or context.market.regime == "WEAK",
+                    sector_weak=self.holding_sector_weak(sector_code, sector),
+                    immediate_reason=immediate_reason,
+                )
+            else:
+                state, reason = self.evaluate_exit_state(
+                    context.runtime_state.get(code, {}),
+                    price=price,
+                    entry_price=entry_price,
+                    below_ma5=below_ma5,
+                    market_weak=context.market.phase in {"RETREAT", "DIVERGENCE"}
+                    or context.market.regime == "WEAK",
+                    sector_weak=self.holding_sector_weak(sector_code, sector),
+                    leader_weak=self.holding_leader_weak(code, leader, leader_rank),
+                    immediate_reason=immediate_reason,
+                )
             state.update(
                 {"sector_code": sector_code, "asof": context.market.asof.date().isoformat()}
             )
             next_runtime[code] = state
             if not reason:
                 continue
-            source_playbook = str(evidence.get("playbook_id", "holding_management"))
             signals.append(
                 PlatformSignal(
                     run_id=run_id,

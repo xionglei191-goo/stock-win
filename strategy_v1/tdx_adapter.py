@@ -34,6 +34,40 @@ def _code_name(item: Any) -> tuple[str, str]:
     return "", ""
 
 
+_US_EQUITY_BLOCKS = frozenset(
+    {
+        "道琼斯成份股",
+        "标普成份股",
+        "纳斯达克100",
+        "标普中盘400",
+    }
+)
+
+
+def _read_us_equity_constituents(path: Path) -> set[str]:
+    """Read only current broad-index constituents from TDX's US block file."""
+
+    try:
+        lines = path.read_text(encoding="gbk").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return set()
+    selected: set[str] = set()
+    active = False
+    for raw in lines:
+        value = raw.strip()
+        if not value:
+            continue
+        if value.startswith("#"):
+            active = value[1:] in _US_EQUITY_BLOCKS
+            continue
+        if not active:
+            continue
+        ticker = value.upper()
+        if ticker and all(character.isalnum() or character in ".-" for character in ticker):
+            selected.add(ticker)
+    return selected
+
+
 def _bound_frame_to_window(
     frame: pd.DataFrame,
     *,
@@ -201,18 +235,32 @@ class TdxAdapter(AbstractContextManager["TdxAdapter"]):
         return sorted(names), names
 
     def list_us_stocks(self) -> tuple[list[str], dict[str, str]]:
-        # get_stock_list("74") returns nothing for US market via DLL —
-        # enumerate vipdoc/ds/lday directly instead (files named 74#TICKER.day)
+        """Return the current liquid US-equity universe used by live scans.
+
+        The ``vipdoc/ds/lday`` directory is an archive rather than a security
+        master: it contains ETFs, options and delisted symbols.  TDX's current
+        constituent blocks provide a conservative common-stock universe and
+        the local day files prove that each symbol is actually available.
+        Historical research must use a separate point-in-time master instead
+        of this current constituent list.
+        """
         lday = self.config.tdx_root / "vipdoc" / "ds" / "lday"
+        block_file = self.config.tdx_root / "T0002" / "hq_cache" / "mgblock.dat"
         names: dict[str, str] = {}
-        if lday.is_dir():
-            for path in lday.iterdir():
-                name = path.name
-                if name.startswith("74#") and name.endswith(".day"):
-                    ticker = name[3:-4]
-                    if ticker and "/" not in ticker:
-                        code = ticker + ".US"
-                        names[code] = ticker
+        if not lday.is_dir() or not block_file.is_file():
+            return [], names
+
+        available = {
+            path.name[3:-4].upper()
+            for path in lday.iterdir()
+            if path.is_file()
+            and path.name.startswith("74#")
+            and path.name.endswith(".day")
+        }
+        tickers = _read_us_equity_constituents(block_file)
+        for ticker in sorted(tickers & available):
+            code = f"{ticker}.US"
+            names[code] = ticker
         return sorted(names), names
 
     def list_sectors(self) -> list[dict[str, str]]:

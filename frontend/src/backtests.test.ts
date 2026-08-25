@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest'
 import {
   backtestValidation,
   backtestCostLabel,
+  buildBacktestRequest,
   compressStates,
   parseStockCodes,
+  requiresPitRelease,
   strategyCatalogDisplayName,
 } from './pages/BacktestsPage'
 
@@ -48,5 +50,32 @@ describe('backtest request helpers', () => {
   it('distinguishes standard and stressed execution costs', () => {
     expect(backtestCostLabel()).toBe('标准成本')
     expect(backtestCostLabel(2)).toBe('2 倍成本')
+  })
+
+  it('locks US momentum to a READY PIT release contract', () => {
+    expect(requiresPitRelease('us_momentum_v1')).toBe(true)
+    expect(buildBacktestRequest({
+      strategyId: 'us_momentum_v1',
+      startDate: '2020-01-01',
+      endDate: '2026-01-01',
+      dailyBars: '2000',
+      maxStocks: '10',
+      samplingMode: 'stratified',
+      sampleSeed: '7',
+      executionCostMultiplier: '2',
+      universe: 'custom',
+      stockCodes: 'AAPL,MSFT',
+      refreshData: true,
+      playbookIds: [],
+      pitReleaseId: 'release-ready-1',
+    })).toEqual(expect.objectContaining({
+      strategy_id: 'us_momentum_v1',
+      universe: 'sp500_ivv_proxy_v1',
+      pit_release_id: 'release-ready-1',
+      sampling_mode: 'full',
+      stock_codes: [],
+      max_stocks: undefined,
+      refresh_data: false,
+    }))
   })
 })

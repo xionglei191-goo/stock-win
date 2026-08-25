@@ -3,9 +3,9 @@ import { AlertTriangle, CheckCircle2, LoaderCircle } from 'lucide-react'
 
 export function StatusBadge({ status, label }: { status: string; label?: string }) {
   const normalized = status.toUpperCase()
-  const tone = ['READY', 'SUCCEEDED', 'APPROVED', 'EXECUTED'].includes(normalized)
+  const tone = ['READY', 'DATA_READY', 'SUCCEEDED', 'APPROVED', 'EXECUTED', 'PAPER_QUALIFIED'].includes(normalized)
     ? 'positive'
-    : ['FAILED', 'WEAK', 'STALE', 'REJECTED'].includes(normalized)
+    : ['FAILED', 'WEAK', 'STALE', 'REJECTED', 'DATA_BLOCKED', 'PAPER_BLOCKED', 'DATA_DEGRADED', 'KILLED', 'CRITICAL', 'HIGH'].includes(normalized)
       ? 'negative'
       : 'warning'
   return <span className={`status status--${tone}`}>{label ?? status}</span>

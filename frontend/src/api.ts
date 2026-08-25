@@ -1,4 +1,4 @@
-import type { Backtest, BacktestDetail, BacktestReplayRequest, BacktestRequest, Course49FrameworkDetail, Dashboard, DecisionRequest, Doctor, FeedbackSummary, Job, OrderGroupIntent, Portfolio, ResearchBrief, Signal, StrategyCatalog, StrategyExperiment, StrategyFramework, StrategyGroup, StrategyGroupDraft } from './types'
+import type { Backtest, BacktestDetail, BacktestReplayRequest, BacktestRequest, Course49FrameworkDetail, Dashboard, DecisionRequest, Doctor, EarlyWinnerCandidate, EarlyWinnerProject, EarlyWinnerV2Project, EarlyWinnerV3Project, EarlyWinnerV4Project, EarlyWinnerV5Project, EarlyWinnerV6Project, FeedbackSummary, Job, OrderGroupIntent, Portfolio, ResearchBrief, Signal, StrategyCatalog, StrategyExperiment, StrategyFramework, StrategyGroup, StrategyGroupDraft, USPaperStatus, USPITQualityReport, USPITReleaseDetail, USPITReleaseSummary } from './types'
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -21,7 +21,40 @@ export const api = {
   backtests: () => request<Backtest[]>('/api/backtests'),
   backtest: (id: string) => request<BacktestDetail>(`/api/backtests/${id}`),
   sources: () => request<Array<Record<string, unknown>>>('/api/sources'),
+  usPitReleases: async () => {
+    const payload = await request<USPITReleaseSummary[] | { releases: USPITReleaseSummary[] }>('/api/data/us-pit/releases')
+    return Array.isArray(payload) ? payload : payload.releases
+  },
+  usPitRelease: (id: string) => request<USPITReleaseDetail>(`/api/data/us-pit/releases/${encodeURIComponent(id)}`),
+  usPitQuality: (id: string) => request<USPITQualityReport>(`/api/data/us-pit/releases/${encodeURIComponent(id)}/quality`),
+  usPaperStatus: () => request<USPaperStatus>('/api/us-paper/status'),
   strategyCatalog: () => request<StrategyCatalog>('/api/strategy-catalog'),
+  earlyWinner: () => request<EarlyWinnerProject>('/api/research/early-winner'),
+  earlyWinnerV2: () => request<EarlyWinnerV2Project>('/api/research/early-winner-v2'),
+  auditEarlyWinnerV2: () => request<{ job_id: string; status: string }>('/api/research/early-winner-v2/development-audit', { method: 'POST' }),
+  earlyWinnerV3: () => request<EarlyWinnerV3Project>('/api/research/early-winner-v3'),
+  supplementEarlyWinnerV3: () => request<{ job_id: string; status: string }>('/api/research/early-winner-v3/supplement', { method: 'POST' }),
+  auditEarlyWinnerV3: () => request<{ job_id: string; status: string }>('/api/research/early-winner-v3/development-audit', { method: 'POST' }),
+  earlyWinnerV4: () => request<EarlyWinnerV4Project>('/api/research/early-winner-v4'),
+  buildLabelsEarlyWinnerV4: () => request<{ job_id: string; status: string }>('/api/research/early-winner-v4/build-labels', { method: 'POST' }),
+  auditEarlyWinnerV4: () => request<{ job_id: string; status: string }>('/api/research/early-winner-v4/development-audit', { method: 'POST' }),
+  earlyWinnerV5: () => request<EarlyWinnerV5Project>('/api/research/early-winner-v5'),
+  earlyWinnerV6: () => request<EarlyWinnerV6Project>('/api/research/early-winner-v6'),
+  earlyWinnerCandidates: (method?: 'rule' | 'ml', asof?: string) => {
+    const query = new URLSearchParams()
+    if (method) query.set('method', method)
+    if (asof) query.set('asof', asof)
+    const suffix = query.size ? `?${query.toString()}` : ''
+    return request<EarlyWinnerCandidate[]>(`/api/research/early-winner/candidates${suffix}`)
+  },
+  refreshEarlyWinner: () => request<{ job_id: string; status: string }>('/api/research/early-winner/refresh', { method: 'POST' }),
+  trainEarlyWinner: () => request<{ job_id: string; status: string }>('/api/research/early-winner/train', { method: 'POST' }),
+  validateEarlyWinner: () => request<{ job_id: string; status: string }>('/api/research/early-winner/validate', { method: 'POST' }),
+  earlyWinnerHistoryStatus: () => request<Record<string, unknown>>('/api/research/early-winner/history/status'),
+  buildEarlyWinnerHistory: (startYear = 2018, endYear = 2025) => request<{ job_id: string; status: string }>('/api/research/early-winner/history/build', {
+    method: 'POST',
+    body: JSON.stringify({ start_year: startYear, end_year: endYear }),
+  }),
   frameworks: () => request<StrategyFramework[]>('/api/frameworks'),
   framework: (id: string) => request<Course49FrameworkDetail>('/api/frameworks/' + id),
   reloadStrategyCatalog: () => request<StrategyCatalog>('/api/strategy-catalog/reload', {
@@ -37,7 +70,7 @@ export const api = {
   job: (id: string) => request<Job>(`/api/jobs/${id}`),
   scan: (pushTdx: boolean) => request<{ job_id: string }>('/api/runs/scan', {
     method: 'POST',
-    body: JSON.stringify({ strategies: ['combined'], mode: 'research', push_tdx: pushTdx }),
+    body: JSON.stringify({ strategies: ['course49_system'], mode: 'research', push_tdx: pushTdx }),
   }),
   scanSelection: (strategies: string[], pushTdx = false) => request<{ job_id: string }>('/api/runs/scan', {
     method: 'POST',
@@ -61,7 +94,7 @@ export const api = {
   }),
   runDailyResearch: () => request<{ job_id: string; status: string }>('/api/research/daily', {
     method: 'POST',
-    body: JSON.stringify({ strategies: ['combined'], mode: 'research', push_tdx: false }),
+    body: JSON.stringify({ strategies: ['course49_system'], mode: 'research', push_tdx: false }),
   }),
   generateBrief: (runId: string) => request<{ job_id: string; status: string }>('/api/research/briefs', {
     method: 'POST',

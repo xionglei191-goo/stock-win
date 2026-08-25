@@ -42,7 +42,16 @@ from .early_winner import (
     EarlyWinnerRuleStrategy,
 )
 from .early_winner_trade import EarlyWinnerTradeStrategy
+from .early_winner_v2 import EarlyWinnerV2Strategy
+from .early_winner_v3 import EarlyWinnerV3Strategy
+from .early_winner_v4 import EarlyWinnerV4Strategy
+from .early_winner_v5 import EarlyWinnerV5Strategy
 from .us_momentum import USMomentumStrategy, USMomentumParameters
+from .qqq_vol_dca import QQQVolDCAParameters, QQQVolDCAStrategy
+from .qqq_treasury_rotation import (
+    QQQTreasuryRotationParameters,
+    QQQTreasuryRotationStrategy,
+)
 
 
 def create_strategy_registry() -> dict[str, Any]:
@@ -66,7 +75,13 @@ def create_strategy_registry() -> dict[str, Any]:
         EarlyWinnerRuleStrategy(),
         EarlyWinnerMLStrategy(),
         EarlyWinnerTradeStrategy(),
+        EarlyWinnerV2Strategy(),
+        EarlyWinnerV3Strategy(),
+        EarlyWinnerV4Strategy(),
+        EarlyWinnerV5Strategy(),
         USMomentumStrategy(),
+        QQQVolDCAStrategy(),
+        QQQTreasuryRotationStrategy(),
     )
     registry = {plugin.metadata.strategy_id: plugin for plugin in plugins}
     for strategy_id, plugin in registry.items():
@@ -114,6 +129,14 @@ __all__ = [
     "EarlyWinnerRuleStrategy",
     "EarlyWinnerMLStrategy",
     "EarlyWinnerTradeStrategy",
+    "EarlyWinnerV2Strategy",
+    "EarlyWinnerV3Strategy",
+    "EarlyWinnerV4Strategy",
+    "EarlyWinnerV5Strategy",
     "USMomentumStrategy",
     "USMomentumParameters",
+    "QQQVolDCAParameters",
+    "QQQVolDCAStrategy",
+    "QQQTreasuryRotationParameters",
+    "QQQTreasuryRotationStrategy",
 ]

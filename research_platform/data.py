@@ -16,6 +16,7 @@ from .course49_market import MARKET_ACTIVITY_FIELDS
 from .lhb import COURSE49_FIELDS, LHB_FIELDS
 from .models import DataHealth, DataStatus
 from .registry import SourceRegistry
+from .us_tdx import TQRawRPCEnvelope, TQReadOnlyClient
 
 
 def _chunks(values: list[str], size: int) -> Iterable[list[str]]:
@@ -63,6 +64,15 @@ class TdxProvider(AbstractContextManager["TdxProvider"]):
         self.memory.put(key, result)
         return result
 
+    def list_us_stocks(self) -> tuple[list[str], dict[str, str]]:
+        key = self._memory_key("us_stock_master", {"asof": date.today().isoformat()})
+        cached = self._memory_get(key)
+        if isinstance(cached, tuple):
+            return cached
+        result = self.adapter.list_us_stocks()
+        self.memory.put(key, result)
+        return result
+
     def fetch_bars(
         self,
         codes: list[str],
@@ -106,16 +116,97 @@ class TdxProvider(AbstractContextManager["TdxProvider"]):
             warmup_bars=warmup_bars,
             batch_callback=batch_callback,
         )
-        for frame in bars.values():
+        for code, frame in bars.items():
+            is_us = str(code).upper().endswith(".US")
             if "Amount" in frame.columns:
-                frame["Amount"] = pd.to_numeric(frame["Amount"], errors="coerce") * 10_000.0
-                frame.attrs["amount_unit"] = "CNY"
+                if is_us:
+                    # TDX's US Amount scale is not documented by the local
+                    # adapter. Preserve the raw value and make the uncertainty
+                    # explicit; strategy liquidity uses Close * Volume instead.
+                    frame["Amount"] = pd.to_numeric(frame["Amount"], errors="coerce")
+                    frame.attrs["amount_unit"] = "TDX_RAW_UNKNOWN"
+                else:
+                    frame["Amount"] = (
+                        pd.to_numeric(frame["Amount"], errors="coerce") * 10_000.0
+                    )
+                    frame.attrs["amount_unit"] = "CNY"
             frame.attrs["volume_unit"] = "share"
-            frame.attrs["timezone"] = self.config.timezone
+            frame.attrs["timezone"] = (
+                "America/New_York" if is_us else self.config.timezone
+            )
             frame.attrs["source"] = "tdx"
             frame.attrs["adjustment"] = dividend_type
         self.memory.put(cache_key, bars)
         return bars
+
+    def fetch_bars_evidence(
+        self,
+        codes: list[str],
+        period: str,
+        count: int,
+        *,
+        fields: tuple[str, ...],
+        dividend_type: str,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        warmup_bars: int = 0,
+    ) -> tuple[dict[str, pd.DataFrame], tuple[TQRawRPCEnvelope, ...]]:
+        """Fetch US bars directly from read-only JSON-RPC and preserve bytes.
+
+        This production evidence path deliberately bypasses TdxAdapter's
+        duplicate removal and Close-null filtering. Normalization belongs to
+        the PIT market preparer after the response has entered CAS.
+        """
+
+        if warmup_bars != 0:
+            raise ValueError("raw TQ evidence fetch does not accept warmup_bars")
+        normalized = [str(code).strip().upper() for code in codes]
+        if not normalized or any(not code.endswith(".US") for code in normalized):
+            raise ValueError("raw TQ evidence fetch only accepts non-empty .US codes")
+        client = TQReadOnlyClient(timeout_seconds=120.0)
+        envelopes: list[TQRawRPCEnvelope] = []
+        result: dict[str, pd.DataFrame] = {}
+        batch_size = max(1, min(50, self.config.performance.bar_batch_size))
+        for batch in _chunks(normalized, batch_size):
+            envelope = client.call_raw(
+                "get_market_data",
+                {
+                    "field_list": list(fields),
+                    "stock_list": batch,
+                    "period": period,
+                    "end_time": "" if end_time is None else str(end_time).replace("-", ""),
+                    "count": int(count),
+                    "dividend_type": dividend_type,
+                    "fill_data": False,
+                },
+            )
+            envelopes.append(envelope)
+            payload = envelope.value
+            if not isinstance(payload, dict):
+                continue
+            for code in batch:
+                raw = payload.get(code)
+                if not isinstance(raw, dict):
+                    continue
+                lengths = [len(value) for value in raw.values() if isinstance(value, list)]
+                if not lengths:
+                    continue
+                rows = max(lengths)
+                columns: dict[str, list[Any]] = {}
+                for key, value in raw.items():
+                    if isinstance(value, list):
+                        columns[str(key)] = list(value) + [None] * (rows - len(value))
+                frame = pd.DataFrame(columns)
+                date_values = frame.get("Date")
+                if date_values is None:
+                    frame.index = pd.RangeIndex(len(frame))
+                else:
+                    frame.index = pd.to_datetime(date_values.astype(str), errors="coerce")
+                if start_time:
+                    lower = pd.Timestamp(start_time).normalize()
+                    frame = frame.loc[pd.DatetimeIndex(frame.index) >= lower]
+                result[code] = frame
+        return result, tuple(envelopes)
 
     def load_sectors(self, refresh: bool = False) -> dict[str, dict[str, Any]]:
         key = self._memory_key(
@@ -368,6 +459,7 @@ class ResearchDataHub:
         bars: dict[str, pd.DataFrame],
         expected_index: pd.DataFrame | None,
         dataset: str = "daily_bars",
+        expected_symbol_count: int | None = None,
     ) -> DataHealth:
         if not bars or expected_index is None or expected_index.empty:
             return DataHealth(dataset, DataStatus.FAILED, None, None, 0, "No data returned")
@@ -376,7 +468,8 @@ class ResearchDataHub:
         if not latest_values:
             return DataHealth(dataset, DataStatus.FAILED, None, expected.isoformat(), 0, "No valid rows")
         latest = max(latest_values)
-        coverage = sum(value == expected for value in latest_values) / len(latest_values)
+        denominator = max(len(latest_values), int(expected_symbol_count or 0))
+        coverage = sum(value == expected for value in latest_values) / denominator
         status = DataStatus.READY if latest >= expected and coverage >= 0.90 else DataStatus.PARTIAL
         message = "" if status == DataStatus.READY else f"Only {coverage:.1%} of symbols reach expected date"
         return DataHealth(dataset, status, latest.isoformat(), expected.isoformat(), len(latest_values), message)

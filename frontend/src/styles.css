@@ -48,6 +48,8 @@ main { max-width: 1500px; margin: 0 auto; padding: 23px 26px 54px; }
 .button:disabled { opacity: .55; cursor: wait; }
 .button--secondary { color: var(--ink); border-color: var(--line-strong); background: var(--surface); }
 .button--secondary:hover { background: #eef0ec; }
+.button--danger { color: #fff; border-color: var(--red); background: var(--red); }
+.button--danger:hover { background: #85312c; }
 .status { display: inline-flex; align-items: center; min-height: 21px; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 650; white-space: nowrap; }
 .status--positive { color: var(--green); background: var(--green-soft); }
 .status--negative { color: var(--red); background: var(--red-soft); }
@@ -200,6 +202,30 @@ tbody tr:hover { background: #fafbf9; }
 .compact-field input, .compact-field select { width: 100%; height: 32px; border: 1px solid var(--line-strong); border-radius: 4px; padding: 0 7px; background: white; }
 .editor-actions { display: flex; justify-content: flex-end; padding-top: 14px; }
 .order-group-table { min-width: 1050px; }
+.research-project-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+.research-project-card { min-width: 0; padding: 14px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); display: grid; gap: 10px; }
+.research-project-card > div { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.research-project-card p { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
+.research-project-card small { color: var(--muted); font-family: Consolas, monospace; font-size: 10px; }
+.research-project-card .button { justify-self: start; }
+
+.early-winner-safety { margin-bottom: 18px; padding: 14px 16px; display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.early-winner-safety > div { display: flex; align-items: center; gap: 10px; }
+.early-winner-safety span { display: grid; gap: 3px; }
+.early-winner-safety small { color: var(--muted); font-size: 10px; }
+.early-winner-gates { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+.early-winner-gates article { min-height: 118px; padding: 12px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface); display: grid; align-content: start; justify-items: start; gap: 7px; }
+.early-winner-gates article strong { font-family: Consolas, monospace; font-size: 11px; }
+.early-winner-gates article p { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.early-winner-gates article small { color: var(--muted); font-size: 9px; }
+.early-winner-summary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin-bottom: 18px; }
+.early-winner-summary-grid > .panel { min-width: 0; padding: 16px; }
+.early-winner-facts { margin: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid var(--line); }
+.early-winner-facts > div { min-width: 0; padding: 10px 8px 8px 0; display: grid; gap: 4px; }
+.early-winner-facts dt { color: var(--muted); font-size: 9px; }
+.early-winner-facts dd { margin: 0; font-family: Consolas, monospace; font-size: 10px; overflow-wrap: anywhere; }
+.early-winner-lists { display: grid; gap: 18px; }
+.early-winner-candidates table { min-width: 1180px; }
 
 .framework-context { margin-bottom: 18px; }
 .framework-context .section-heading > div { display: grid; gap: 4px; }
@@ -319,6 +345,7 @@ tbody tr:hover { background: #fafbf9; }
   .pool-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .attribution-grid { grid-template-columns: 1fr; }
   .strategy-workbench { grid-template-columns: 1fr; }
+  .early-winner-summary-grid { grid-template-columns: 1fr; }
   .strategy-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .claim-columns { grid-template-columns: 1fr; }
   .context-facts { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -378,4 +405,48 @@ tbody tr:hover { background: #fafbf9; }
   .experiment-metrics span:nth-child(2) { border-right: 0; }
   .experiment-metrics span:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
   .experiment-footer { align-items: stretch; flex-direction: column; }
+}
+.trading-control-form {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(180px, 1fr));
+  gap: 14px;
+  align-items: end;
+}
+
+.trading-control-form label {
+  display: grid;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.trading-control-form input,
+.trading-batch-decision input {
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  padding: 0 11px;
+}
+
+.trading-control-form .form-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 10px;
+}
+
+.trading-batch-decision {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  padding: 14px;
+  border-top: 1px solid var(--line);
+}
+
+@media (max-width: 900px) {
+  .trading-control-form {
+    grid-template-columns: 1fr;
+  }
 }

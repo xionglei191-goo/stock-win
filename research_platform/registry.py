@@ -35,6 +35,48 @@ class SourceRegistry:
                 "market_activity", "tdx", True, "Point-in-time whole-market limit and breadth ecology"
             ),
             "financials": SourceDefinition("financials", "tdx", True, "Point-in-time financial statements"),
+            "industry_history": SourceDefinition(
+                "industry_history",
+                "cninfo/direct",
+                True,
+                "Point-in-time CNINFO industry classification changes",
+            ),
+            "announcements": SourceDefinition(
+                "announcements",
+                "cninfo/direct",
+                True,
+                "CNINFO announcements with publication timestamps and source URLs",
+            ),
+            "institutional_flows": SourceDefinition(
+                "institutional_flows",
+                "tdx",
+                True,
+                "Point-in-time northbound, institutional and shareholder-count series",
+            ),
+            "consensus_snapshots": SourceDefinition(
+                "consensus_snapshots",
+                "tdx",
+                True,
+                "Forward-only daily consensus snapshots; never backfilled",
+            ),
+            "us_pit_universe": SourceDefinition(
+                "us_pit_universe",
+                "SEC N-PORT + observed iShares IVV",
+                True,
+                "Immutable sp500_ivv_proxy_v1 evidence; historical inference is fail-closed",
+            ),
+            "us_corporate_actions": SourceDefinition(
+                "us_corporate_actions",
+                "verified SEC/exchange/issuer evidence",
+                True,
+                "Effective-dated US corporate actions with auditable local overrides",
+            ),
+            "us_bar_crosscheck": SourceDefinition(
+                "us_bar_crosscheck",
+                "pinned AKShare",
+                True,
+                "Cross-check only; never silently replaces TDX market data",
+            ),
             "macro": SourceDefinition(
                 "macro", "external", True, "Reserved external macro provider", False
             ),

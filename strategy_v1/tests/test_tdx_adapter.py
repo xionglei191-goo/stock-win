@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
+from pathlib import Path
 
 import pandas as pd
 
-from strategy_v1.tdx_adapter import _bound_frame_to_window
+from strategy_v1.tdx_adapter import _bound_frame_to_window, _read_us_equity_constituents
 
 
 class TdxAdapterWindowTests(unittest.TestCase):
@@ -37,6 +39,27 @@ class TdxAdapterWindowTests(unittest.TestCase):
         )
 
         self.assertTrue(bounded.empty)
+
+    def test_us_equity_master_uses_only_broad_index_constituents(self) -> None:
+        content = "\n".join(
+            (
+                "#标普成份股",
+                "AAPL",
+                "BRK.B",
+                "#美股-热门ETF",
+                "SPY",
+                "QQQ",
+                "#纳斯达克100",
+                "MSFT",
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mgblock.dat"
+            path.write_text(content, encoding="gbk")
+
+            values = _read_us_equity_constituents(path)
+
+        self.assertEqual(values, {"AAPL", "BRK.B", "MSFT"})
 
 
 if __name__ == "__main__":

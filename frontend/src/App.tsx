@@ -13,6 +13,12 @@ const ResearchPage = lazy(() => import('./pages/ResearchPage'))
 const SignalsPage = lazy(() => import('./pages/SignalsPage'))
 const StrategiesPage = lazy(() => import('./pages/StrategiesPage'))
 const Course49Page = lazy(() => import('./pages/Course49Page'))
+const EarlyWinnerPage = lazy(() => import('./pages/EarlyWinnerPage'))
+const EarlyWinnerV2Page = lazy(() => import('./pages/EarlyWinnerV2Page'))
+const EarlyWinnerV3Page = lazy(() => import('./pages/EarlyWinnerV3Page'))
+const EarlyWinnerV4Page = lazy(() => import('./pages/EarlyWinnerV4Page'))
+const EarlyWinnerV5Page = lazy(() => import('./pages/EarlyWinnerV5Page'))
+const EarlyWinnerV6Page = lazy(() => import('./pages/EarlyWinnerV6Page'))
 
 const navigation = [
   { to: '/', label: '总览', icon: LayoutDashboard },
@@ -51,6 +57,12 @@ export default function App() {
               <Route path="/" element={<OverviewPage />} />
               <Route path="/signals" element={<SignalsPage />} />
               <Route path="/research" element={<ResearchPage />} />
+              <Route path="/research/early-winner" element={<EarlyWinnerPage />} />
+              <Route path="/research/early-winner-v2" element={<EarlyWinnerV2Page />} />
+              <Route path="/research/early-winner-v3" element={<EarlyWinnerV3Page />} />
+              <Route path="/research/early-winner-v4" element={<EarlyWinnerV4Page />} />
+              <Route path="/research/early-winner-v5" element={<EarlyWinnerV5Page />} />
+              <Route path="/research/early-winner-v6" element={<EarlyWinnerV6Page />} />
               <Route path="/strategies" element={<StrategiesPage />} />
               <Route path="/course49" element={<Course49Page />} />
               <Route path="/portfolio" element={<PortfolioPage />} />

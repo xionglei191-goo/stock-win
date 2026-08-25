@@ -40,6 +40,12 @@ class RuntimeAdapter(StrEnum):
     CHAN_DAILY = "chan_daily"
     COURSE49_DAILY = "course49_daily"
     GENERIC_DAILY = "generic_daily"
+    US_STRICT = "us_strict"
+
+
+class StrategyCategory(StrEnum):
+    INDEPENDENT = "independent"
+    RESEARCH_PROJECT = "research_project"
 
 
 class OrderGroupAction(StrEnum):
@@ -91,6 +97,7 @@ class StrategyMetadata:
     framework_id: str = ""
     policy_version: str = ""
     archived: bool = False
+    category: StrategyCategory = StrategyCategory.INDEPENDENT
 
 
 @dataclass(frozen=True)

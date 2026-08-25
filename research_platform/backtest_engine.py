@@ -16,16 +16,16 @@ import pandas as pd
 import psutil
 
 from strategy_v1.backtest import build_daily_schedule, run_backtest as run_legacy_chan_backtest
-from strategy_v1.config import RiskConfig, StrategyConfig
+from strategy_v1.config import CostConfig, RiskConfig, StrategyConfig
 from strategy_v1.market import filter_universe
 from strategy_v1.portfolio import price_limit_ratio
 
-from .config import PlatformConfig, PortfolioConfig
+from .config import PlatformConfig, PortfolioConfig, USPortfolioConfig
 from .composition import CompositionMode, StrategyCatalog, built_in_groups
 from .course49_market import flatten_market_activity, normalize_market_activity
 from .data import TdxProvider
 from .data_cache import DataCacheManager
-from .data_plan import DataPlan, build_data_plan
+from .data_plan import DataPlan, build_data_plan, required_bar_lookback
 from .lhb import (
     LhbFeatures,
     flatten_lhb_history,
@@ -38,6 +38,7 @@ from .models import (
     OrderGroupIntent,
     PlatformSignal,
     RuntimeAdapter,
+    SignalStatus,
     StrategyScanResult,
 )
 from .plugin_loader import load_strategy_registry
@@ -45,7 +46,9 @@ from .registry import SourceRegistry
 from .storage import Database, ParquetSnapshotStore
 from .strategies.course49_system import (
     CONTEXT_VERSION,
+    LEADER_PULLBACK_PLAYBOOK_ID,
     POLICY_VERSION,
+    build_leader_pullback_candidate_matrix,
     framework_metadata,
 )
 from .strategies import (
@@ -58,6 +61,7 @@ from .strategies import (
 
 ADAPTIVE_COURSE49_IDS = frozenset({"course49_v2", "course49_v3"})
 COURSE49_IDS = frozenset({"course49_v1", *ADAPTIVE_COURSE49_IDS})
+CHAN_REPLAY_CONTRACT_VERSION = "2.0.0"
 
 
 @dataclass
@@ -70,6 +74,26 @@ class HistoricalPosition:
     last_price: float
     evidence: str
     entry_fees: float
+
+
+@dataclass(frozen=True)
+class USPointInTimeUniverse:
+    """Tradable US symbols by effective date.
+
+    The membership map must come from a point-in-time source that includes
+    delisted securities. A current security master is deliberately not treated
+    as historical membership evidence.
+    """
+
+    memberships: dict[pd.Timestamp, frozenset[str]]
+    source: str
+
+    def members_on(self, value: Any) -> frozenset[str]:
+        day = _trading_day(value)
+        eligible_dates = [item for item in self.memberships if item <= day]
+        if not eligible_dates:
+            return frozenset()
+        return self.memberships[max(eligible_dates)]
 
 
 @dataclass
@@ -106,6 +130,14 @@ class BacktestService:
         self.snapshots = ParquetSnapshotStore(config, database)
         self.cache = DataCacheManager(config, database)
         self.sources = SourceRegistry()
+        self._chan_schedule_cache: dict[
+            str,
+            tuple[
+                dict[str, dict[str, Any]],
+                dict[str, Any],
+                tuple[str, ...],
+            ],
+        ] = {}
         self.strategies, self.plugin_issues = load_strategy_registry(self.config)
         for strategy in self.strategies.values():
             self.database.register_strategy(
@@ -156,6 +188,31 @@ class BacktestService:
         values = getattr(self.strategies[strategy_id], "required_codes", ())
         return tuple(str(item) for item in values)
 
+    def _strategy_market(self, strategy_id: str) -> str:
+        asset_classes = {
+            str(item).strip().upper()
+            for item in self.strategies[strategy_id].metadata.asset_classes
+            if str(item).strip()
+        }
+        markets: set[str] = set()
+        if any(item.startswith("US_") for item in asset_classes):
+            markets.add("US")
+        if "A_STOCK" in asset_classes or any(item.startswith("CN_") for item in asset_classes):
+            markets.add("CN")
+        if len(markets) > 1:
+            raise ValueError(
+                f"Strategy '{strategy_id}' declares assets from multiple markets"
+            )
+        return next(iter(markets), "CN")
+
+    def _component_market(self, component_ids: tuple[str, ...]) -> str:
+        markets = {self._strategy_market(item) for item in component_ids}
+        if len(markets) != 1:
+            raise ValueError(
+                "A single backtest cannot combine CN and US strategies; use separate runs"
+            )
+        return next(iter(markets))
+
     def _candidate_minimum_streak(self, strategy_id: str) -> int:
         resolver = getattr(
             self.strategies[strategy_id], "candidate_minimum_streak", None
@@ -178,6 +235,7 @@ class BacktestService:
         execution_cost_multiplier: float = 1.0,
         refresh_data: bool = False,
         playbook_ids: list[str] | None = None,
+        pit_release_id: str | None = None,
         progress_callback: Callable[..., None] | None = None,
     ) -> dict[str, Any]:
         run_started = perf_counter()
@@ -204,6 +262,27 @@ class BacktestService:
             raise ValueError(
                 f"Strategies are not enabled for backtesting: {', '.join(disabled)}"
             )
+        market = self._component_market(component_ids)
+        if market == "US":
+            return self._run_us_strict_release(
+                strategy_id,
+                component_ids,
+                start_date=start_date,
+                end_date=end_date,
+                universe=universe,
+                stock_codes=stock_codes or [],
+                max_stocks=max_stocks,
+                sampling_mode=sampling_mode,
+                execution_cost_multiplier=execution_cost_multiplier,
+                pit_release_id=pit_release_id,
+                progress_callback=progress_callback,
+            )
+        if market == "US" and universe not in {
+            "all_us", "sp500_ivv_proxy_v1", "custom"
+        }:
+            raise ValueError("US strategies require a US universe")
+        if market == "CN" and universe == "all_us":
+            raise ValueError("CN strategies cannot use the 'all_us' universe")
         self.sources.validate_requirements(
             requirement
             for item in component_ids
@@ -212,16 +291,27 @@ class BacktestService:
         capital_weights = self.catalog.capital_weights(strategy_id)
         if not 0.0 <= execution_cost_multiplier <= 5.0:
             raise ValueError("Execution cost multiplier must be between 0 and 5")
-        if execution_cost_multiplier != 1.0 and any(
-            self._runtime_adapter(item) == RuntimeAdapter.CHAN_DAILY for item in component_ids
-        ):
-            raise ValueError("Execution cost stress is unavailable for the legacy Chan adapter")
-        execution_config = _execution_cost_config(
-            self.config.portfolio, execution_cost_multiplier
+        execution_config = (
+            _us_execution_cost_config(
+                self.config.us_portfolio, execution_cost_multiplier
+            )
+            if market == "US"
+            else _execution_cost_config(
+                self.config.portfolio, execution_cost_multiplier
+            )
         )
         sampling_mode = _resolve_sampling_mode(sampling_mode, max_stocks)
+        if market == "US" and sampling_mode == "stratified":
+            raise ValueError(
+                "US stratified sampling is disabled until a point-in-time stratifier is available"
+            )
         start_date, end_date = _validate_date_range(start_date, end_date)
-        count = _required_daily_bars(daily_bars, start_date, end_date)
+        count = max(
+            _required_daily_bars(daily_bars, start_date, end_date),
+            required_bar_lookback(
+                (self.strategies[item].metadata for item in component_ids)
+            ),
+        )
         stock_codes = stock_codes or []
         playbook_ids = list(dict.fromkeys(playbook_ids or []))
         if playbook_ids and "course49_system" not in component_ids:
@@ -287,6 +377,7 @@ class BacktestService:
             "execution_cost_multiplier": execution_cost_multiplier,
             "refresh_data": bool(refresh_data),
             "playbook_ids": playbook_ids,
+            "pit_release_id": pit_release_id or "",
             "resolved_daily_bars": count,
             "data_plan": data_plan.as_dict(),
             "data_cache_key": data_cache_key,
@@ -305,12 +396,21 @@ class BacktestService:
                 if self.strategies[item].metadata.policy_version
             },
             "capital_weights": capital_weights,
+            "chan_replay_contract_version": (
+                CHAN_REPLAY_CONTRACT_VERSION
+                if any(
+                    self._runtime_adapter(item) == RuntimeAdapter.CHAN_DAILY
+                    for item in component_ids
+                )
+                else ""
+            ),
             "composition_mode": (
                 strategy_group.composition_mode.value if strategy_group else "standalone"
             ),
             "conflict_policy": (
                 strategy_group.conflict_policy.value if strategy_group else "risk_first"
             ),
+            "market": market,
         }
         backtest_id = uuid4().hex
         started_at = datetime.now().astimezone().isoformat()
@@ -397,9 +497,44 @@ class BacktestService:
             ) as provider:
                 self._progress(progress_callback, "MARKET_DATA", 0.08, "正在读取通达信行情")
                 stage_started = perf_counter()
-                codes, names = provider.list_a_shares()
-                codes = _select_universe(codes, universe, stock_codes)
+                if market == "US":
+                    master_codes, names = provider.list_us_stocks()
+                    codes = _select_universe(
+                        [code for code in master_codes if code.endswith(".US")],
+                        universe,
+                        stock_codes,
+                        market="US",
+                    )
+                    if not codes:
+                        raise ValueError("Selected US stock universe is empty")
+                    if start_date is not None:
+                        raise ValueError(
+                            "Historical US backtests require an explicit point-in-time "
+                            "universe containing delisted securities; the current TDX "
+                            "security master is scan-only"
+                        )
+                else:
+                    codes, names = provider.list_a_shares()
+                    codes = _select_universe(codes, universe, stock_codes, market="CN")
                 constrained_codes = list(required_data_codes)
+                if market == "US":
+                    invalid_required = [
+                        code for code in constrained_codes if not code.endswith(".US")
+                    ]
+                    if invalid_required:
+                        raise ValueError(
+                            "US backtests only accept .US required codes: "
+                            + ", ".join(invalid_required)
+                        )
+                else:
+                    invalid_required = [
+                        code for code in constrained_codes if code.endswith(".US")
+                    ]
+                    if invalid_required:
+                        raise ValueError(
+                            "CN backtests cannot include .US required codes: "
+                            + ", ".join(invalid_required)
+                        )
                 if all(
                     self._runtime_adapter(item) == RuntimeAdapter.GENERIC_DAILY
                     and self._required_codes(item)
@@ -436,7 +571,10 @@ class BacktestService:
                 bar_window = {
                     "start_time": start_date,
                     "end_time": end_date,
-                    "warmup_bars": 90,
+                    "warmup_bars": required_bar_lookback(
+                        (self.strategies[item].metadata for item in component_ids),
+                        minimum=90,
+                    ),
                 }
                 daily_front = provider.fetch_bars(
                     codes,
@@ -460,10 +598,20 @@ class BacktestService:
                     ),
                     **bar_window,
                 )
-                end_eligible = filter_universe(
-                    _slice_to_date(daily_front, end_date),
-                    names,
-                    StrategyConfig(tdx_root=self.config.tdx_root, daily_lookback=count),
+                end_eligible = (
+                    {
+                        code: frame
+                        for code, frame in _slice_to_date(daily_front, end_date).items()
+                        if code.endswith(".US") and not frame.empty
+                    }
+                    if market == "US"
+                    else filter_universe(
+                        _slice_to_date(daily_front, end_date),
+                        names,
+                        StrategyConfig(
+                            tdx_root=self.config.tdx_root, daily_lookback=count
+                        ),
+                    )
                 )
                 if all(
                     self._runtime_adapter(item) == RuntimeAdapter.GENERIC_DAILY
@@ -477,12 +625,13 @@ class BacktestService:
                 parameters["resolved_symbols"] = len(end_eligible)
                 parameters["stock_pool_hash"] = _stock_pool_hash(list(end_eligible))
                 parameters["universe_distribution"] = _universe_distribution(list(end_eligible))
+                market_index_code = "SPY.US" if market == "US" else "999999.SH"
                 index_map = provider.fetch_bars(
-                    ["999999.SH"], "1d", count, dividend_type="front", **bar_window
+                    [market_index_code], "1d", count, dividend_type="front", **bar_window
                 )
-                index_bars = index_map.get("999999.SH")
+                index_bars = index_map.get(market_index_code)
                 if index_bars is None:
-                    raise RuntimeError("Shanghai index data is unavailable")
+                    raise RuntimeError(f"{market_index_code} market calendar is unavailable")
                 _ensure_date_range_available(index_bars, start_date, end_date)
                 sector_asof = end_date or _trading_days(index_bars.index).max().date().isoformat()
                 sector_members: dict[str, dict[str, Any]] = {}
@@ -557,7 +706,7 @@ class BacktestService:
                     snapshot_id,
                     "market_index",
                     index_map,
-                    {**snapshot_query, "codes": ["999999.SH"], "adjustment": "front"},
+                    {**snapshot_query, "codes": [market_index_code], "adjustment": "front"},
                 )
                 self.snapshots.write_records(
                     snapshot_id,
@@ -785,6 +934,7 @@ class BacktestService:
                     execution_config,
                     snapshot_id=snapshot_id,
                     parameters=parameters,
+                    progress_callback=progress_callback,
                 )
                 if "course49_system" in component_ids:
                     self._progress(
@@ -852,6 +1002,188 @@ class BacktestService:
             raise
         finally:
             cache_lock.release()
+
+    def _run_us_strict_release(
+        self,
+        strategy_id: str,
+        component_ids: tuple[str, ...],
+        *,
+        start_date: str | None,
+        end_date: str | None,
+        universe: str,
+        stock_codes: list[str],
+        max_stocks: int | None,
+        sampling_mode: str,
+        execution_cost_multiplier: float,
+        pit_release_id: str | None,
+        progress_callback: Callable[..., None] | None,
+    ) -> dict[str, Any]:
+        """Route US momentum exclusively through a certified immutable release."""
+
+        if component_ids != ("us_momentum_v1",) or strategy_id != "us_momentum_v1":
+            raise ValueError("US_STRICT currently supports only us_momentum_v1 standalone")
+        if universe != "sp500_ivv_proxy_v1":
+            raise ValueError("us_momentum_v1 requires universe='sp500_ivv_proxy_v1'")
+        if not pit_release_id:
+            raise ValueError("us_momentum_v1 requires pit_release_id for a READY PIT release")
+        if stock_codes or max_stocks is not None or sampling_mode != "full":
+            raise ValueError(
+                "Certified US PIT backtests prohibit custom codes, max_stocks and sampling"
+            )
+        if not 0.0 <= execution_cost_multiplier <= 5.0:
+            raise ValueError("Execution cost multiplier must be between 0 and 5")
+
+        start_date, end_date = _validate_date_range(start_date, end_date)
+
+        from .strategies.us_momentum_backtest import run_backtest as run_us_strict_backtest
+        from .us_pit import USPITService
+        from .us_pit.hashing import sha256_file
+
+        release_service = USPITService(self.config.us_pit_dir)
+        self._progress(progress_callback, "PIT_VERIFY", 0.05, "Verifying immutable US PIT release")
+        dataset = release_service.load_backtest_dataset(pit_release_id)
+        release = release_service.store.load_release(pit_release_id)
+        manifest_sha256 = sha256_file(release.path / "manifest.json")
+        backtest_id = uuid4().hex
+        started_at = datetime.now().astimezone().isoformat()
+        parameters = {
+            "strategy_id": strategy_id,
+            "start_date": start_date,
+            "end_date": end_date,
+            "universe": universe,
+            "pit_release_id": pit_release_id,
+            "pit_manifest_hash": manifest_sha256,
+            "execution_cost_multiplier": execution_cost_multiplier,
+            "market": "US",
+            "runtime_adapter": RuntimeAdapter.US_STRICT.value,
+        }
+        self.database.execute(
+            """INSERT INTO backtests
+            (backtest_id, strategy_id, status, started_at, start_date, end_date, parameters_json)
+            VALUES (?, ?, 'RUNNING', ?, ?, ?, ?)""",
+            (
+                backtest_id,
+                strategy_id,
+                started_at,
+                start_date,
+                end_date,
+                json.dumps(parameters, ensure_ascii=False),
+            ),
+        )
+        try:
+            self._progress(progress_callback, "US_STRICT", 0.20, "Running stable-ID strict US backtest")
+            cost_config = _us_execution_cost_config(
+                self.config.us_portfolio,
+                execution_cost_multiplier,
+            )
+            result = run_us_strict_backtest(
+                dataset=dataset,
+                names={
+                    str(row.get("security_id")): str(row.get("issuer_id") or row.get("security_id"))
+                    for row in dataset.security_master.to_dict("records")
+                },
+                initial_capital=self.config.us_portfolio.initial_cash,
+                cost_config=cost_config,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            equity = pd.DataFrame(
+                [
+                    {
+                        "timestamp": timestamp,
+                        "equity": value,
+                        "cash": value,
+                        "positions": 0,
+                    }
+                    for timestamp, value in result["equity_curve"].items()
+                ]
+            )
+            # Reconstruct exact cash/position counts is not possible from the public
+            # summary alone.  The strict runner therefore exposes the detailed rows
+            # through a private integration key while keeping the historical return
+            # payload backwards compatible.
+            if result.get("equity_rows"):
+                equity = pd.DataFrame(result["equity_rows"])
+            trades = pd.DataFrame(result["trades"])
+            if not trades.empty:
+                trades = trades[trades["side"].isin(["BUY", "SELL"])].copy()
+            if not trades.empty:
+                trades["evidence"] = trades["evidence"].map(
+                    lambda value: json.dumps(value, ensure_ascii=False)
+                    if isinstance(value, (dict, list))
+                    else str(value or "{}")
+                )
+            self._persist_rows(backtest_id, strategy_id, equity, trades)
+            snapshot_id = f"uspit_{pit_release_id}"
+            self.database.execute(
+                """INSERT OR IGNORE INTO data_snapshots
+                (snapshot_id, dataset, source, created_at, path, row_count,
+                 content_hash, query_json)
+                VALUES (?, 'us_pit_release', 'immutable_release', ?, ?, 0, ?, ?)""",
+                (
+                    snapshot_id,
+                    started_at,
+                    str(release.path / "manifest.json"),
+                    manifest_sha256,
+                    json.dumps(
+                        {
+                            "release_id": pit_release_id,
+                            "manifest_sha256": manifest_sha256,
+                            "universe": universe,
+                            "status": release.status.value,
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            )
+            self.database.execute(
+                """INSERT OR IGNORE INTO snapshot_dependencies
+                (snapshot_id, dependency_type, dependency_id, coverage_json, created_at)
+                VALUES (?, 'US_PIT_RELEASE', ?, ?, ?)""",
+                (
+                    snapshot_id,
+                    pit_release_id,
+                    json.dumps(
+                        {
+                            "manifest_sha256": manifest_sha256,
+                            "start_date": start_date,
+                            "end_date": end_date,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    started_at,
+                ),
+            )
+            metrics = dict(result["metrics"])
+            metrics.update(
+                {
+                    "backtest_id": backtest_id,
+                    "strategy_id": strategy_id,
+                    "snapshot_id": snapshot_id,
+                    "parameters": parameters,
+                    "data_contract": result["data_contract"],
+                    "promotion_status": "HISTORICAL_EVIDENCE_REQUIRED",
+                }
+            )
+            self.database.execute(
+                """UPDATE backtests SET status='SUCCEEDED', finished_at=?, snapshot_id=?,
+                parameters_json=?, metrics_json=? WHERE backtest_id=?""",
+                (
+                    datetime.now().astimezone().isoformat(),
+                    snapshot_id,
+                    json.dumps(parameters, ensure_ascii=False),
+                    json.dumps(metrics, ensure_ascii=False),
+                    backtest_id,
+                ),
+            )
+            self._progress(progress_callback, "COMPLETED", 1.0, "Strict US backtest completed")
+            return metrics
+        except Exception as exc:
+            self.database.execute(
+                "UPDATE backtests SET status='FAILED', finished_at=?, error=? WHERE backtest_id=?",
+                (datetime.now().astimezone().isoformat(), str(exc), backtest_id),
+            )
+            raise
 
     @staticmethod
     def _progress(
@@ -1047,6 +1379,7 @@ class BacktestService:
             execution_config,
             snapshot_id=snapshot_id,
             parameters=parameters,
+            progress_callback=progress_callback,
         )
         metrics = self._combine_results(results)
         parameters["peak_memory_bytes"] = psutil.Process().memory_info().rss
@@ -1099,11 +1432,13 @@ class BacktestService:
         *,
         snapshot_id: str,
         parameters: dict[str, Any],
+        progress_callback: Callable[..., None] | None = None,
     ) -> dict[str, dict[str, Any]]:
         prepared = self._prepare_course49_features(
             snapshot_id,
             component_ids,
             dataset,
+            playbook_ids=list(parameters.get("playbook_ids") or []),
         )
         if "course49_system" in component_ids:
             self._progress(
@@ -1140,6 +1475,8 @@ class BacktestService:
                     start_date,
                     end_date,
                     capital_weight=capital_weights[component_id],
+                    execution_config=execution_config,
+                    schedule_cache_key=f"{snapshot_id}:{start_date}:{end_date}",
                 )
                 chan_reserved = _reserved_codes_by_date(results[component_id]["trades"])
             elif adapter == RuntimeAdapter.COURSE49_DAILY:
@@ -1198,6 +1535,8 @@ class BacktestService:
         snapshot_id: str,
         component_ids: tuple[str, ...],
         dataset: BacktestDataset,
+        *,
+        playbook_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         course49_ids = tuple(
             item
@@ -1268,6 +1607,28 @@ class BacktestService:
                 )
             )
             prepared["v2_candidate_matrix"] = v2_candidates
+        if (
+            "course49_system" in course49_ids
+            and LEADER_PULLBACK_PLAYBOOK_ID in set(playbook_ids or [])
+        ):
+            pullback_key = self.cache.feature_key(
+                snapshot_id,
+                "course49_leader_pullback_candidates",
+                "1",
+                {"lookback": 20, "minimum_return": 0.10},
+            )
+            pullback_candidates, cache_status["pullback_candidate_matrix"] = (
+                self.cache.get_or_build_feature_frames(
+                    pullback_key,
+                    lambda: build_leader_pullback_candidate_matrix(
+                        dataset.daily_front,
+                        dataset.daily_raw,
+                        dataset.names,
+                        eligibility,
+                    ),
+                )
+            )
+            prepared["pullback_candidate_matrix"] = pullback_candidates
         if "course49_v3" in families:
             for minimum_streak in sorted(
                 {
@@ -1295,6 +1656,198 @@ class BacktestService:
                 cache_status[f"candidate_matrix_{minimum_streak}"] = status
         return prepared
 
+    def replay_backtest(
+        self,
+        source_backtest_id: str,
+        *,
+        strategy_id: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        execution_cost_multiplier: float = 1.0,
+        progress_callback: Callable[..., None] | None = None,
+    ) -> dict[str, Any]:
+        rows = self.database.query(
+            "SELECT strategy_id FROM backtests WHERE backtest_id=?",
+            (source_backtest_id,),
+        )
+        if not rows:
+            raise ValueError(f"Unknown source backtest: {source_backtest_id}")
+        target = strategy_id or str(rows[0].get("strategy_id") or "")
+        if target not in self.strategies:
+            raise ValueError(f"Unknown replay strategy: {target}")
+        if self._runtime_adapter(target) == RuntimeAdapter.CHAN_DAILY:
+            return self.replay_chan(
+                source_backtest_id,
+                strategy_id=target,
+                start_date=start_date,
+                end_date=end_date,
+                execution_cost_multiplier=execution_cost_multiplier,
+                progress_callback=progress_callback,
+            )
+        if self._strategy_family(target).startswith("course49_"):
+            return self.replay_course49(
+                source_backtest_id,
+                strategy_id=target,
+                start_date=start_date,
+                end_date=end_date,
+                execution_cost_multiplier=execution_cost_multiplier,
+                progress_callback=progress_callback,
+            )
+        raise ValueError("Snapshot replay supports Chan and standalone Course49 strategies")
+
+    def replay_chan(
+        self,
+        source_backtest_id: str,
+        *,
+        strategy_id: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        execution_cost_multiplier: float = 1.0,
+        progress_callback: Callable[..., None] | None = None,
+    ) -> dict[str, Any]:
+        source_rows = self.database.query(
+            "SELECT * FROM backtests WHERE backtest_id=?",
+            (source_backtest_id,),
+        )
+        if not source_rows:
+            raise ValueError(f"Unknown source backtest: {source_backtest_id}")
+        source = source_rows[0]
+        snapshot_id = str(source.get("snapshot_id") or "")
+        if not snapshot_id:
+            raise ValueError(f"Backtest {source_backtest_id} has no immutable snapshot")
+        strategy_id = strategy_id or "chan_v1"
+        if strategy_id not in self.strategies or self._runtime_adapter(
+            strategy_id
+        ) != RuntimeAdapter.CHAN_DAILY:
+            raise ValueError("Chan snapshot replay requires a Chan strategy")
+        if not 0.0 <= execution_cost_multiplier <= 5.0:
+            raise ValueError("Execution cost multiplier must be between 0 and 5")
+        start_date, end_date = _validate_date_range(
+            start_date or str(source.get("start_date") or "") or None,
+            end_date or str(source.get("end_date") or "") or None,
+        )
+        try:
+            source_parameters = json.loads(str(source.get("parameters_json") or "{}"))
+        except json.JSONDecodeError:
+            source_parameters = {}
+        capital_weight = self.catalog.capital_weights(strategy_id)[strategy_id]
+        daily_count = max(
+            int(source_parameters.get("resolved_daily_bars") or 120),
+            required_bar_lookback((self.strategies[strategy_id].metadata,)),
+        )
+        parameters = {
+            **source_parameters,
+            "strategy_id": strategy_id,
+            "components": [strategy_id],
+            "composition_mode": "standalone",
+            "capital_weights": {strategy_id: capital_weight},
+            "start_date": start_date,
+            "end_date": end_date,
+            "execution_cost_multiplier": execution_cost_multiplier,
+            "snapshot_replay": True,
+            "cache_status": "snapshot_replay",
+            "source_backtest_id": source_backtest_id,
+            "source_snapshot_id": snapshot_id,
+            "strategy_versions": {
+                strategy_id: self.strategies[strategy_id].metadata.version
+            },
+            "chan_replay_contract_version": CHAN_REPLAY_CONTRACT_VERSION,
+        }
+        backtest_id = uuid4().hex
+        started_at = datetime.now().astimezone().isoformat()
+        self.database.execute(
+            """INSERT INTO backtests
+            (backtest_id, strategy_id, status, started_at, start_date, end_date, parameters_json)
+            VALUES (?, ?, 'RUNNING', ?, ?, ?, ?)""",
+            (
+                backtest_id,
+                strategy_id,
+                started_at,
+                start_date,
+                end_date,
+                json.dumps(parameters, ensure_ascii=False),
+            ),
+        )
+        replay_started = perf_counter()
+        try:
+            data_plan = build_data_plan((self.strategies[strategy_id].metadata,))
+            dataset, memory_hit = self._load_snapshot_dataset(snapshot_id, data_plan)
+            _ensure_date_range_available(dataset.index_bars, start_date, end_date)
+            end_eligible = filter_universe(
+                _slice_to_date(dataset.daily_front, end_date),
+                dataset.names,
+                StrategyConfig(tdx_root=self.config.tdx_root, daily_lookback=daily_count),
+            )
+            parameters.update(
+                {
+                    "loaded_symbols": len(dataset.daily_front),
+                    "resolved_symbols": len(end_eligible),
+                    "stock_pool_hash": _stock_pool_hash(list(end_eligible)),
+                    "universe_distribution": _universe_distribution(list(end_eligible)),
+                    "cache_status": "memory_hit" if memory_hit else "snapshot_replay",
+                    "data_asof": end_date,
+                }
+            )
+            sector_query = self.snapshots.dataset_query(snapshot_id, "sector_membership")
+            parameters["sector_membership_quality"] = sector_query.get(
+                "quality", "LIMITED"
+            )
+            parameters["sector_membership_source"] = sector_query.get(
+                "source", "snapshot"
+            )
+            parameters["sector_membership_effective_asof"] = sector_query.get(
+                "asof", ""
+            )
+            parameters["sector_membership_hash"] = sector_query.get("content_hash", "")
+            execution_config = _execution_cost_config(
+                self.config.portfolio, execution_cost_multiplier
+            )
+            result = self._run_chan(
+                backtest_id,
+                dataset.names,
+                dataset.daily_front,
+                dataset.daily_raw,
+                dataset.index_bars,
+                dataset.sector_members,
+                daily_count,
+                start_date,
+                end_date,
+                capital_weight=capital_weight,
+                execution_config=execution_config,
+                schedule_cache_key=f"{snapshot_id}:{start_date}:{end_date}",
+            )
+            metrics = self._combine_results({strategy_id: result})
+            parameters["stage_durations_seconds"] = {
+                "snapshot_replay_total": round(perf_counter() - replay_started, 3)
+            }
+            metrics.update(
+                {
+                    "backtest_id": backtest_id,
+                    "strategy_id": strategy_id,
+                    "snapshot_id": snapshot_id,
+                    "parameters": parameters,
+                    "components": {strategy_id: result["metrics"]},
+                }
+            )
+            self.database.execute(
+                """UPDATE backtests SET status='SUCCEEDED', finished_at=?, snapshot_id=?,
+                parameters_json=?, metrics_json=? WHERE backtest_id=?""",
+                (
+                    datetime.now().astimezone().isoformat(),
+                    snapshot_id,
+                    json.dumps(parameters, ensure_ascii=False),
+                    json.dumps(metrics, ensure_ascii=False),
+                    backtest_id,
+                ),
+            )
+            return metrics
+        except Exception as exc:
+            self.database.execute(
+                "UPDATE backtests SET status='FAILED', finished_at=?, error=? WHERE backtest_id=?",
+                (datetime.now().astimezone().isoformat(), str(exc), backtest_id),
+            )
+            raise
+
     def replay_course49(
         self,
         source_backtest_id: str,
@@ -1303,6 +1856,7 @@ class BacktestService:
         start_date: str | None = None,
         end_date: str | None = None,
         execution_cost_multiplier: float = 1.0,
+        progress_callback: Callable[..., None] | None = None,
     ) -> dict[str, Any]:
         source_rows = self.database.query(
             "SELECT * FROM backtests WHERE backtest_id=?",
@@ -1346,6 +1900,7 @@ class BacktestService:
             "end_date": end_date,
             "execution_cost_multiplier": execution_cost_multiplier,
             "snapshot_replay": True,
+            "cache_status": _snapshot_replay_cache_status(source_parameters),
             "source_backtest_id": source_backtest_id,
             "source_snapshot_id": snapshot_id,
             "course49_event_minimum_streak": source_minimum_streak,
@@ -1416,6 +1971,27 @@ class BacktestService:
             execution_config = _execution_cost_config(
                 self.config.portfolio, execution_cost_multiplier
             )
+            replay_dataset = BacktestDataset(
+                names,
+                daily_front,
+                daily_raw,
+                index_bars,
+                sector_members,
+                benchmark_bars,
+                lhb_history,
+                market_activity,
+            )
+            prepared = self._prepare_course49_features(
+                snapshot_id,
+                (strategy_id,),
+                replay_dataset,
+                playbook_ids=list(parameters.get("playbook_ids") or []),
+            )
+            prepared["playbook_ids"] = list(parameters.get("playbook_ids") or [])
+            prepared["stock_pool_hash"] = str(parameters.get("stock_pool_hash") or "")
+            prepared["sector_membership_hash"] = str(
+                parameters.get("sector_membership_hash") or ""
+            )
             result = self._run_course49(
                 backtest_id,
                 names,
@@ -1432,6 +2008,7 @@ class BacktestService:
                 benchmark_bars=benchmark_bars,
                 capital_weight=0.5,
                 execution_config=execution_config,
+                prepared_features=prepared,
             )
             metrics = self._combine_results({strategy_id: result})
             parameters["stage_durations_seconds"] = {
@@ -1478,6 +2055,8 @@ class BacktestService:
         end_date: str | None,
         *,
         capital_weight: float,
+        execution_config: PortfolioConfig,
+        schedule_cache_key: str = "",
     ) -> dict[str, Any]:
         output_dir = self.config.runtime_dir / "backtests" / backtest_id / "chan_v1"
         risk = replace(
@@ -1486,37 +2065,81 @@ class BacktestService:
             max_positions=self.config.portfolio.max_strategy_positions,
             max_position_weight=self.config.portfolio.max_strategy_symbol_weight,
         )
+        history_lookback = required_bar_lookback(
+            (self.strategies["chan_v1"].metadata,)
+        )
+        bounded_front, bounded_raw, bounded_index = _slice_chan_replay_history(
+            daily_front,
+            daily_raw,
+            index_bars,
+            start_date,
+            end_date,
+            history_lookback,
+        )
         legacy_config = replace(
             StrategyConfig(),
             tdx_root=self.config.tdx_root,
             output_dir=output_dir,
             cache_dir=self.config.cache_dir / "legacy",
-            daily_lookback=daily_count,
+            daily_lookback=history_lookback,
             risk=risk,
+            costs=_legacy_chan_cost_config(execution_config),
         )
-        eligible = filter_universe(daily_front, names, legacy_config)
-        eligible_raw = {code: frame for code, frame in daily_raw.items() if code in eligible}
-        schedule, _ = build_daily_schedule(index_bars, eligible, names, sector_members, legacy_config)
-        schedule = _slice_schedule(schedule, start_date, end_date)
-        candidate_codes = sorted(set().union(*(set(items) for items in schedule.values())) if schedule else set())
-        signal_front = {code: eligible[code] for code in candidate_codes if code in eligible}
-        signal_raw = {code: eligible_raw[code] for code in candidate_codes if code in eligible_raw}
+        # Eligibility is evaluated inside build_daily_schedule at each historical date.
+        # An end-of-window prefilter would leak future suspension and turnover state.
+        cached_schedule = self._chan_schedule_cache.get(schedule_cache_key)
+        if cached_schedule is None:
+            leader_schedule, market_schedule = build_daily_schedule(
+                bounded_index,
+                bounded_front,
+                names,
+                sector_members,
+                legacy_config,
+            )
+            window_schedule = _slice_schedule(leader_schedule, start_date, end_date)
+            candidate_codes = tuple(
+                sorted(
+                    set().union(*(set(items) for items in window_schedule.values()))
+                    if window_schedule
+                    else set()
+                )
+            )
+            if schedule_cache_key:
+                self._chan_schedule_cache[schedule_cache_key] = (
+                    leader_schedule,
+                    market_schedule,
+                    candidate_codes,
+                )
+        else:
+            leader_schedule, market_schedule, candidate_codes = cached_schedule
+        signal_front = {
+            code: bounded_front[code]
+            for code in candidate_codes
+            if code in bounded_front
+        }
+        signal_raw = {
+            code: bounded_raw[code]
+            for code in candidate_codes
+            if code in bounded_raw
+        }
         metrics = run_legacy_chan_backtest(
             legacy_config,
             names,
-            eligible,
-            eligible_raw,
-            index_bars,
+            bounded_front,
+            bounded_raw,
+            bounded_index,
             sector_members,
             signal_front,
             signal_raw,
             start_date=start_date,
             end_date=end_date,
+            leader_schedule=leader_schedule,
+            market_schedule=market_schedule,
         )
         equity = _read_csv(output_dir / "backtest_equity.csv")
         trades = _read_csv(output_dir / "backtest_trades.csv")
         if equity.empty:
-            fallback_days = list(_trading_days(index_bars.index).unique())
+            fallback_days = list(_trading_days(bounded_index.index).unique())
             if start_date:
                 fallback_days = [day for day in fallback_days if day >= _trading_day(start_date)]
             if end_date:
@@ -1602,6 +2225,7 @@ class BacktestService:
         pending: list[PlatformSignal] = []
         trades: list[dict[str, Any]] = []
         equity_rows: list[dict[str, Any]] = []
+        execution_funnel = _empty_execution_funnel()
         dates = list(_trading_days(index_bars.index).unique())
         if start_date:
             dates = [item for item in dates if item >= _trading_day(start_date)]
@@ -1628,10 +2252,27 @@ class BacktestService:
             elif family == "course49_v2":
                 eligible_codes = _matrix_codes_at(eligibility_matrix, current_date)
                 candidate_codes = _matrix_codes_at(v2_candidate_matrix, current_date)
-                required_codes = candidate_codes | set(positions) | {
-                    signal.code for signal in pending
-                }
-                visible_codes = required_codes & eligible_codes
+                pullback_selected = (
+                    strategy_id == "course49_system"
+                    and LEADER_PULLBACK_PLAYBOOK_ID
+                    in set(prepared_features.get("playbook_ids") or [])
+                )
+                if pullback_selected:
+                    candidate_codes |= _matrix_codes_at(
+                        prepared_features.get("pullback_candidate_matrix", pd.DataFrame()),
+                        current_date,
+                    )
+                pending_codes = {signal.code for signal in pending}
+                if pullback_selected:
+                    visible_codes = (
+                        (candidate_codes & eligible_codes)
+                        | set(positions)
+                        | pending_codes
+                    )
+                else:
+                    visible_codes = (
+                        candidate_codes | set(positions) | pending_codes
+                    ) & eligible_codes
                 visible_front = _slice_daily_codes(
                     daily_front, current_date, visible_codes
                 )
@@ -1663,6 +2304,7 @@ class BacktestService:
                 cash,
                 reserved,
                 execution_config,
+                execution_funnel,
             )
             trades.extend(day_trades)
             filled_signal_ids = {item["signal_id"] for item in day_trades}
@@ -1724,6 +2366,13 @@ class BacktestService:
                         "eligible_count": len(eligible_codes),
                     }
                 result = strategy.scan(**scan_arguments)
+                for signal in result.signals:
+                    if signal.side == "BUY":
+                        _record_execution_funnel(
+                            execution_funnel,
+                            signal.playbook_id or "unattributed",
+                            "generated_buy_signals",
+                        )
                 if is_adaptive:
                     runtime_state = dict(result.state.get("runtime_state") or {})
                     self.database.save_backtest_state(
@@ -1771,6 +2420,7 @@ class BacktestService:
             metrics["playbook_attribution"] = _evidence_attribution(
                 trade_frame, "playbook_id"
             )
+        metrics["execution_funnel"] = _finalize_execution_funnel(execution_funnel)
         self._persist_rows(backtest_id, strategy_id, equity, trade_frame)
         return {"metrics": metrics, "equity": equity, "trades": trade_frame}
 
@@ -1784,31 +2434,69 @@ class BacktestService:
         cash: float,
         reserved_codes: set[str],
         config: PortfolioConfig | None = None,
+        execution_funnel: dict[str, Any] | None = None,
     ) -> tuple[float, list[dict[str, Any]]]:
         trades: list[dict[str, Any]] = []
         config = config or self.config.portfolio
+        execution_funnel = execution_funnel if execution_funnel is not None else _empty_execution_funnel()
         for signal in sorted(pending, key=lambda item: (item.side != "SELL", -item.strength, item.code)):
             current_day = _trading_day(current_date)
             if _trading_day(signal.generated_at) >= current_day:
                 continue
+            playbook_id = signal.playbook_id or "unattributed"
+            if signal.side == "BUY":
+                _record_execution_funnel(
+                    execution_funnel, playbook_id, "attempted_next_open"
+                )
             frame = bars.get(signal.code)
             if frame is None or frame.empty:
+                if signal.side == "BUY":
+                    _record_execution_funnel(
+                        execution_funnel, playbook_id, "blocked_missing_bars"
+                    )
                 continue
             frame_days = _trading_days(frame.index)
             row = frame[frame_days == current_day]
             prior = frame[frame_days < current_day]
             if row.empty or prior.empty:
+                if signal.side == "BUY":
+                    _record_execution_funnel(
+                        execution_funnel, playbook_id, "blocked_missing_bars"
+                    )
                 continue
             open_price = float(row["Open"].iloc[-1])
             previous_close = float(prior["Close"].iloc[-1])
             ratio = price_limit_ratio(signal.code, names.get(signal.code, ""))
             if signal.side == "BUY":
                 if open_price >= previous_close * (1 + ratio - 0.001):
+                    _record_execution_funnel(
+                        execution_funnel, playbook_id, "blocked_limit_up_open"
+                    )
+                    continue
+                open_gap = open_price / previous_close - 1.0
+                entry_gap_min = signal.evidence.get("entry_gap_min")
+                entry_gap_max = signal.evidence.get("entry_gap_max")
+                if (
+                    entry_gap_min is not None
+                    and open_gap < float(entry_gap_min)
+                ) or (
+                    entry_gap_max is not None
+                    and open_gap > float(entry_gap_max)
+                ):
+                    _record_execution_funnel(
+                        execution_funnel, playbook_id, "blocked_open_gap"
+                    )
                     continue
                 distinct = set(positions) | reserved_codes
                 if signal.code in positions or signal.code in reserved_codes:
+                    _record_execution_funnel(
+                        execution_funnel, playbook_id, "blocked_portfolio"
+                    )
                     continue
                 if len(positions) >= config.max_strategy_positions or len(distinct) >= config.max_total_positions:
+                    _record_execution_funnel(
+                        execution_funnel, playbook_id, "blocked_portfolio"
+                    )
                     continue
                 execution = open_price * (1 + config.slippage_rate)
                 strategy_equity = cash + sum(item.quantity * item.last_price for item in positions.values())
@@ -1821,6 +2509,9 @@ class BacktestService:
                         break
                     quantity -= config.board_lot
                 if quantity <= 0:
+                    _record_execution_funnel(
+                        execution_funnel, playbook_id, "blocked_insufficient_cash"
+                    )
                     continue
                 value = quantity * execution
                 fees = max(config.min_commission, value * config.commission_rate)
@@ -1836,6 +2527,9 @@ class BacktestService:
                     fees,
                 )
                 trades.append(_trade(signal, current_date, quantity, execution, fees, None))
+                _record_execution_funnel(
+                    execution_funnel, playbook_id, "filled_buy_orders"
+                )
             else:
                 position = positions.get(signal.code)
                 if position is None or current_date.date() <= date.fromisoformat(position.entry_date):
@@ -1855,6 +2549,212 @@ class BacktestService:
                 del positions[signal.code]
         return cash, trades
 
+    def _fill_us_pending(
+        self,
+        strategy_id: str,
+        pending: list[PlatformSignal],
+        current_date: pd.Timestamp,
+        bars: dict[str, pd.DataFrame],
+        positions: dict[str, HistoricalPosition],
+        cash: float,
+        config: USPortfolioConfig,
+    ) -> tuple[float, list[dict[str, Any]]]:
+        """Execute US orders at next open and enforce stops on every session."""
+
+        trades: list[dict[str, Any]] = []
+        current_day = _trading_day(current_date)
+
+        def daily_row(code: str) -> pd.DataFrame:
+            frame = bars.get(code)
+            if frame is None or frame.empty:
+                return pd.DataFrame()
+            frame_days = _trading_days(frame.index)
+            return frame[frame_days == current_day]
+
+        # A gap below the stop exists at the opening print and therefore takes
+        # precedence over discretionary opening orders.
+        for code, position in list(positions.items()):
+            row = daily_row(code)
+            if row.empty:
+                continue
+            open_price = _finite_price(row.get("Open"))
+            if open_price is None or open_price > position.stop_price:
+                continue
+            execution = open_price * (1 - config.slippage_rate)
+            value = position.quantity * execution
+            fees = _us_sell_fees(value, position.quantity, config)
+            pnl = (
+                (execution - position.average_price) * position.quantity
+                - position.entry_fees
+                - fees
+            )
+            cash += value - fees
+            stop_signal = PlatformSignal(
+                run_id="us_stop",
+                strategy_id=strategy_id,
+                strategy_version=self.strategies[strategy_id].metadata.version,
+                generated_at=current_date.to_pydatetime(),
+                available_at=current_date.to_pydatetime(),
+                code=code,
+                side="SELL",
+                strength=1.0,
+                target_weight=0.0,
+                horizon="next_open",
+                valid_until=(current_date + pd.Timedelta(days=1)).to_pydatetime(),
+                stop_price=position.stop_price,
+                status=SignalStatus.PROPOSED,
+                reason_codes=("US_FIXED_STOP",),
+                evidence={"stop_price": position.stop_price},
+            )
+            trades.append(
+                _trade(
+                    stop_signal,
+                    current_date,
+                    position.quantity,
+                    execution,
+                    fees,
+                    pnl,
+                )
+            )
+            del positions[code]
+
+        for signal in sorted(
+            pending, key=lambda item: (item.side != "SELL", -item.strength, item.code)
+        ):
+            if _trading_day(signal.generated_at) >= current_day:
+                continue
+            frame = bars.get(signal.code)
+            if frame is None or frame.empty:
+                continue
+            frame_days = _trading_days(frame.index)
+            row = frame[frame_days == current_day]
+            if row.empty:
+                continue
+            open_price = _finite_price(row.get("Open"))
+            if open_price is None:
+                continue
+            if signal.side == "BUY":
+                if (
+                    signal.code in positions
+                    or len(positions)
+                    >= min(config.max_strategy_positions, config.max_total_positions)
+                ):
+                    continue
+                execution = open_price * (1 + config.slippage_rate)
+                equity = cash + sum(
+                    position.quantity * position.last_price
+                    for position in positions.values()
+                )
+                target = min(
+                    signal.target_weight,
+                    config.max_strategy_symbol_weight,
+                    config.max_total_symbol_weight,
+                )
+                budget = min(cash, equity * max(0.0, target))
+                quantity = int(budget / execution / config.board_lot) * config.board_lot
+                while quantity > 0:
+                    value = quantity * execution
+                    fees = max(config.min_commission, value * config.commission_rate)
+                    if value + fees <= cash:
+                        break
+                    quantity -= config.board_lot
+                if quantity <= 0:
+                    continue
+                value = quantity * execution
+                fees = max(config.min_commission, value * config.commission_rate)
+                cash -= value + fees
+                stop_ratio = float(signal.evidence.get("stop_ratio", config.fixed_stop_loss))
+                positions[signal.code] = HistoricalPosition(
+                    signal.code,
+                    quantity,
+                    execution,
+                    current_date.date().isoformat(),
+                    execution * (1 - stop_ratio),
+                    execution,
+                    json.dumps(signal.evidence, ensure_ascii=False),
+                    fees,
+                )
+                trades.append(_trade(signal, current_date, quantity, execution, fees, None))
+            else:
+                position = positions.get(signal.code)
+                if position is None:
+                    continue
+                execution = open_price * (1 - config.slippage_rate)
+                value = position.quantity * execution
+                fees = _us_sell_fees(value, position.quantity, config)
+                pnl = (
+                    (execution - position.average_price) * position.quantity
+                    - position.entry_fees
+                    - fees
+                )
+                cash += value - fees
+                trades.append(
+                    _trade(
+                        signal,
+                        current_date,
+                        position.quantity,
+                        execution,
+                        fees,
+                        pnl,
+                    )
+                )
+                del positions[signal.code]
+
+        # After all opening orders, enforce intraday stops for both retained and
+        # newly opened positions. If the open was above the stop and Low crossed
+        # it later, the stop price is the first observable executable level.
+        for code, position in list(positions.items()):
+            row = daily_row(code)
+            if row.empty:
+                continue
+            open_price = _finite_price(row.get("Open"))
+            low_price = _finite_price(row.get("Low"))
+            if (
+                open_price is None
+                or low_price is None
+                or open_price <= position.stop_price
+                or low_price > position.stop_price
+            ):
+                continue
+            execution = position.stop_price * (1 - config.slippage_rate)
+            value = position.quantity * execution
+            fees = _us_sell_fees(value, position.quantity, config)
+            pnl = (
+                (execution - position.average_price) * position.quantity
+                - position.entry_fees
+                - fees
+            )
+            cash += value - fees
+            stop_signal = PlatformSignal(
+                run_id="us_stop",
+                strategy_id=strategy_id,
+                strategy_version=self.strategies[strategy_id].metadata.version,
+                generated_at=current_date.to_pydatetime(),
+                available_at=current_date.to_pydatetime(),
+                code=code,
+                side="SELL",
+                strength=1.0,
+                target_weight=0.0,
+                horizon="intraday_stop",
+                valid_until=(current_date + pd.Timedelta(days=1)).to_pydatetime(),
+                stop_price=position.stop_price,
+                status=SignalStatus.PROPOSED,
+                reason_codes=("US_FIXED_STOP",),
+                evidence={"stop_price": position.stop_price},
+            )
+            trades.append(
+                _trade(
+                    stop_signal,
+                    current_date,
+                    position.quantity,
+                    execution,
+                    fees,
+                    pnl,
+                )
+            )
+            del positions[code]
+        return cash, trades
+
     def _run_generic_signal_strategy(
         self,
         backtest_id: str,
@@ -1869,24 +2769,53 @@ class BacktestService:
         end_date: str | None,
         *,
         capital_weight: float,
-        execution_config: PortfolioConfig,
+        execution_config: PortfolioConfig | USPortfolioConfig,
     ) -> dict[str, Any]:
         strategy = self.strategies[strategy_id]
-        initial_cash = self.config.portfolio.initial_cash * capital_weight
+        is_us = self._strategy_market(strategy_id) == "US"
+        initial_cash = (
+            self.config.us_portfolio.initial_cash * capital_weight
+            if is_us
+            else self.config.portfolio.initial_cash * capital_weight
+        )
         cash = initial_cash
         positions: dict[str, HistoricalPosition] = {}
         pending: list[PlatformSignal] = []
         trades: list[dict[str, Any]] = []
         equity_rows: list[dict[str, Any]] = []
         runtime_state: dict[str, dict[str, Any]] = {}
-        dates = list(_trading_days(index_bars.index).unique())
+        all_dates = list(_trading_days(index_bars.index).unique())
+        dates = list(all_dates)
         if start_date:
             dates = [item for item in dates if item >= _trading_day(start_date)]
         if end_date:
             dates = [item for item in dates if item <= _trading_day(end_date)]
         if not dates:
             raise ValueError("Backtest date range contains no trading days")
+        calendar_date_set = set(all_dates)
+
+        def is_rebalance_day(current: pd.Timestamp) -> bool:
+            if not is_us:
+                return True
+            month_end = (current + pd.offsets.MonthEnd(0)).normalize()
+            return not any(
+                candidate > current and candidate <= month_end
+                for candidate in calendar_date_set
+            )
         required_codes = set(self._required_codes(strategy_id))
+        prepare_backtest_data = getattr(strategy, "prepare_backtest_data", None)
+        prepared_backtest_data = (
+            dict(
+                prepare_backtest_data(
+                    front_bars=daily_front,
+                    raw_bars=daily_raw,
+                    index_bars=index_bars,
+                )
+                or {}
+            )
+            if callable(prepare_backtest_data)
+            else {}
+        )
 
         for current_date in dates:
             visible_front = _slice_daily(daily_front, current_date)
@@ -1898,7 +2827,13 @@ class BacktestService:
                 visible_raw = {
                     code: frame for code, frame in visible_raw.items() if code in required_codes
                 }
+            if is_us:
+                visible_front = _us_point_in_time_visible(visible_front, current_date)
+                visible_raw = _us_point_in_time_visible(visible_raw, current_date)
             visible_benchmarks = _slice_daily(benchmark_bars, current_date)
+            visible_index = index_bars[
+                _trading_days(index_bars.index) <= current_date
+            ]
             if not visible_raw:
                 equity_rows.append(
                     {
@@ -1909,16 +2844,27 @@ class BacktestService:
                     }
                 )
                 continue
-            cash, day_trades = self._fill_course49_pending(
-                pending,
-                current_date,
-                visible_raw,
-                names,
-                positions,
-                cash,
-                set(),
-                execution_config,
-            )
+            if is_us:
+                cash, day_trades = self._fill_us_pending(
+                    strategy_id,
+                    pending,
+                    current_date,
+                    visible_raw,
+                    positions,
+                    cash,
+                    execution_config,
+                )
+            else:
+                cash, day_trades = self._fill_course49_pending(
+                    pending,
+                    current_date,
+                    visible_raw,
+                    names,
+                    positions,
+                    cash,
+                    set(),
+                    execution_config,
+                )
             trades.extend(day_trades)
             filled_signal_ids = {item["signal_id"] for item in day_trades}
             pending = _roll_course49_pending(
@@ -1951,8 +2897,13 @@ class BacktestService:
                 names=names,
                 sector_members=sector_members,
                 benchmark_bars=visible_benchmarks,
+                index_bars=visible_index,
                 positions=position_rows,
                 runtime_state=runtime_state,
+                prepared_backtest_data=prepared_backtest_data,
+                backtest_mode=True,
+                is_rebalance_day=is_rebalance_day(current_date),
+                tradable_codes=set(daily_front) if is_us else None,
             )
             _validate_scan_result(
                 strategy_id,
@@ -2403,17 +3354,39 @@ def _validate_scan_result(
             raise ValueError("Strategy output strength must be between 0 and 1")
 
 
-def _select_universe(codes: list[str], universe: str, stock_codes: list[str]) -> list[str]:
-    supported = {"all_a", "main_board", "growth", "star", "beijing", "custom"}
+def _select_universe(
+    codes: list[str],
+    universe: str,
+    stock_codes: list[str],
+    *,
+    market: str = "CN",
+) -> list[str]:
+    supported = {
+        "all_a", "main_board", "growth", "star", "beijing", "all_us",
+        "sp500_ivv_proxy_v1", "custom",
+    }
     if universe not in supported:
         raise ValueError(f"Unknown stock universe: {universe}")
+    market = market.upper()
+    if market == "US" and universe not in {"all_us", "sp500_ivv_proxy_v1", "custom"}:
+        raise ValueError("US strategies require the 'all_us' or 'custom' universe")
+    if market != "US" and universe in {"all_us", "sp500_ivv_proxy_v1"}:
+        raise ValueError("CN strategies cannot use the 'all_us' universe")
     available = set(codes)
     if universe == "custom":
-        requested = [_normalize_stock_code(code) for code in stock_codes if code.strip()]
+        requested = [
+            _normalize_us_stock_code(code)
+            if market == "US"
+            else _normalize_stock_code(code)
+            for code in stock_codes
+            if code.strip()
+        ]
         missing = [code for code in requested if code not in available]
         if missing:
             raise ValueError(f"Stocks are unavailable in TDX: {', '.join(missing[:10])}")
         return list(dict.fromkeys(requested))
+    if universe in {"all_us", "sp500_ivv_proxy_v1"}:
+        return [code for code in codes if code.endswith(".US")]
     if universe == "all_a":
         return codes
     if universe == "growth":
@@ -2449,6 +3422,76 @@ def _slice_to_date(
         code: frame[_trading_days(frame.index) <= cutoff]
         for code, frame in bars.items()
     }
+
+
+def _us_point_in_time_visible(
+    bars: dict[str, pd.DataFrame],
+    asof: Any,
+    membership: USPointInTimeUniverse | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Apply point-in-time membership and reject stale US observations.
+
+    When no external membership artifact is supplied, the only defensible
+    fallback is to require a same-session bar. That preserves IPO/delist timing
+    present in the price files, but it is not a substitute for a delisting-aware
+    master and therefore is never accepted by the historical loader above.
+    """
+
+    day = _trading_day(asof)
+    members = membership.members_on(day) if membership is not None else None
+    visible: dict[str, pd.DataFrame] = {}
+    for code, frame in bars.items():
+        if not code.endswith(".US") or frame.empty:
+            continue
+        if members is not None and code not in members:
+            continue
+        frame_days = _trading_days(frame.index)
+        if not bool((frame_days == day).any()):
+            continue
+        visible[code] = frame
+    return visible
+
+
+def _slice_chan_replay_history(
+    daily_front: dict[str, pd.DataFrame],
+    daily_raw: dict[str, pd.DataFrame],
+    index_bars: pd.DataFrame,
+    start_date: str | None,
+    end_date: str | None,
+    warmup_bars: int,
+) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame], pd.DataFrame]:
+    index_days = pd.DatetimeIndex(_trading_days(index_bars.index).unique()).sort_values()
+    if end_date:
+        index_days = index_days[index_days <= _trading_day(end_date)]
+    lower: pd.Timestamp | None = None
+    if start_date and len(index_days):
+        prior_days = index_days[index_days < _trading_day(start_date)]
+        if len(prior_days):
+            lower = pd.Timestamp(prior_days[max(0, len(prior_days) - warmup_bars)])
+    upper = _trading_day(end_date) if end_date else None
+
+    def sliced_frame(frame: pd.DataFrame) -> pd.DataFrame:
+        days = _trading_days(frame.index)
+        mask = pd.Series(True, index=frame.index)
+        if lower is not None:
+            mask &= days >= lower
+        if upper is not None:
+            mask &= days <= upper
+        result = frame.loc[mask.to_numpy()].copy()
+        result.attrs.update(frame.attrs)
+        return result
+
+    front = {
+        code: result
+        for code, frame in daily_front.items()
+        if not (result := sliced_frame(frame)).empty
+    }
+    raw = {
+        code: result
+        for code, frame in daily_raw.items()
+        if not (result := sliced_frame(frame)).empty
+    }
+    return front, raw, sliced_frame(index_bars)
 
 
 def _market_segment(code: str) -> str:
@@ -2668,6 +3711,19 @@ def _normalize_stock_code(value: str) -> str:
     return f"{code}.{suffix}"
 
 
+def _normalize_us_stock_code(value: str) -> str:
+    code = value.strip().upper()
+    if code.endswith(".US"):
+        ticker = code[:-3]
+    elif "." not in code:
+        ticker = code
+    else:
+        raise ValueError(f"US stock code must use the .US suffix: {value}")
+    if not ticker or any(character.isspace() for character in ticker):
+        raise ValueError(f"Invalid US stock code: {value}")
+    return f"{ticker}.US"
+
+
 def _snapshot_event_minimum_streak(parameters: dict[str, Any]) -> int:
     value = parameters.get("course49_event_minimum_streak")
     if value is not None:
@@ -2675,6 +3731,10 @@ def _snapshot_event_minimum_streak(parameters: dict[str, Any]) -> int:
     if parameters.get("course49_event_scope") == "strategy_candidates":
         return 2
     return 1
+
+
+def _snapshot_replay_cache_status(parameters: dict[str, Any]) -> str:
+    return str(parameters.get("cache_status") or "snapshot_replay")
 
 
 def _validate_date_range(start_date: str | None, end_date: str | None) -> tuple[str | None, str | None]:
@@ -2695,6 +3755,30 @@ def _execution_cost_config(
         min_commission=config.min_commission * multiplier,
         stamp_duty_rate=config.stamp_duty_rate * multiplier,
         slippage_rate=config.slippage_rate * multiplier,
+    )
+
+
+def _us_execution_cost_config(
+    config: USPortfolioConfig,
+    multiplier: float,
+) -> USPortfolioConfig:
+    return replace(
+        config,
+        commission_rate=config.commission_rate * multiplier,
+        min_commission=config.min_commission * multiplier,
+        slippage_rate=config.slippage_rate * multiplier,
+        sec_sell_fee_rate=config.sec_sell_fee_rate * multiplier,
+        finra_taf_per_share=config.finra_taf_per_share * multiplier,
+        finra_taf_cap=config.finra_taf_cap * multiplier,
+    )
+
+
+def _legacy_chan_cost_config(config: PortfolioConfig) -> CostConfig:
+    return CostConfig(
+        commission_rate=config.commission_rate,
+        min_commission=config.min_commission,
+        stamp_duty_rate=config.stamp_duty_rate,
+        slippage_rate=config.slippage_rate,
     )
 
 
@@ -2791,6 +3875,56 @@ def _performance_metrics(
     }
     metrics["validation"] = _validation_summary(metrics)
     return metrics
+
+
+_EXECUTION_FUNNEL_FIELDS = (
+    "generated_buy_signals",
+    "attempted_next_open",
+    "filled_buy_orders",
+    "blocked_limit_up_open",
+    "blocked_open_gap",
+    "blocked_portfolio",
+    "blocked_insufficient_cash",
+    "blocked_missing_bars",
+)
+
+
+def _empty_execution_funnel() -> dict[str, Any]:
+    return {
+        **{field: 0 for field in _EXECUTION_FUNNEL_FIELDS},
+        "by_playbook": {},
+    }
+
+
+def _record_execution_funnel(
+    funnel: dict[str, Any],
+    playbook_id: str,
+    field: str,
+) -> None:
+    if field not in _EXECUTION_FUNNEL_FIELDS:
+        raise ValueError(f"Unknown execution funnel field: {field}")
+    funnel[field] = int(funnel.get(field, 0) or 0) + 1
+    by_playbook = funnel.setdefault("by_playbook", {})
+    item = by_playbook.setdefault(
+        playbook_id,
+        {key: 0 for key in _EXECUTION_FUNNEL_FIELDS},
+    )
+    item[field] = int(item.get(field, 0) or 0) + 1
+
+
+def _finalize_execution_funnel(funnel: dict[str, Any]) -> dict[str, Any]:
+    result = {field: int(funnel.get(field, 0) or 0) for field in _EXECUTION_FUNNEL_FIELDS}
+    attempts = result["attempted_next_open"]
+    result["fill_rate"] = result["filled_buy_orders"] / attempts if attempts else 0.0
+    result["by_playbook"] = {}
+    for playbook_id, raw in sorted((funnel.get("by_playbook") or {}).items()):
+        item = {field: int(raw.get(field, 0) or 0) for field in _EXECUTION_FUNNEL_FIELDS}
+        playbook_attempts = item["attempted_next_open"]
+        item["fill_rate"] = (
+            item["filled_buy_orders"] / playbook_attempts if playbook_attempts else 0.0
+        )
+        result["by_playbook"][playbook_id] = item
+    return result
 
 
 def _validation_summary(metrics: dict[str, Any]) -> dict[str, Any]:
@@ -2917,7 +4051,7 @@ def _slice_daily(bars: dict[str, pd.DataFrame], asof: pd.Timestamp) -> dict[str,
     result = {}
     cutoff = _trading_day(asof)
     for code, frame in bars.items():
-        item = frame[_trading_days(frame.index) <= cutoff]
+        item = _slice_frame_to_day(frame, cutoff)
         if len(item) >= 20:
             result[code] = item
     return result
@@ -2934,10 +4068,21 @@ def _slice_daily_codes(
         frame = bars.get(code)
         if frame is None:
             continue
-        item = frame[_trading_days(frame.index) <= cutoff]
+        item = _slice_frame_to_day(frame, cutoff)
         if len(item) >= 20:
             result[code] = item
     return result
+
+
+def _slice_frame_to_day(frame: pd.DataFrame, cutoff: pd.Timestamp) -> pd.DataFrame:
+    index = pd.DatetimeIndex(frame.index)
+    if index.is_monotonic_increasing:
+        boundary = cutoff + pd.Timedelta(days=1)
+        if index.tz is not None:
+            boundary = boundary.tz_localize(index.tz)
+        stop = int(index.searchsorted(boundary, side="left"))
+        return frame.iloc[:stop]
+    return frame[_trading_days(index) <= cutoff]
 
 
 def _matrix_codes_at(matrix: pd.DataFrame, asof: pd.Timestamp) -> set[str]:
@@ -3018,7 +4163,10 @@ def _trading_day(value: Any) -> pd.Timestamp:
 
 
 def _trading_days(values: Any) -> pd.DatetimeIndex:
-    return pd.DatetimeIndex([_trading_day(value) for value in values])
+    index = pd.DatetimeIndex(values)
+    if index.tz is not None:
+        index = index.tz_localize(None)
+    return index.normalize()
 
 
 def _read_csv(path: Path) -> pd.DataFrame:
@@ -3053,6 +4201,27 @@ def _trade(
         "playbook_id": signal.playbook_id,
         "policy_version": signal.policy_version,
     }
+
+
+def _finite_price(values: Any) -> float | None:
+    if values is None:
+        return None
+    numeric = pd.to_numeric(values, errors="coerce").dropna()
+    if numeric.empty:
+        return None
+    value = float(numeric.iloc[-1])
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def _us_sell_fees(
+    value: float,
+    quantity: int,
+    config: USPortfolioConfig,
+) -> float:
+    commission = max(config.min_commission, value * config.commission_rate)
+    sec_fee = value * config.sec_sell_fee_rate
+    finra_taf = min(config.finra_taf_cap, quantity * config.finra_taf_per_share)
+    return commission + sec_fee + finra_taf
 
 
 def _evidence_attribution(trades: pd.DataFrame, field: str) -> list[dict[str, Any]]:

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from research_platform.models import OrderGroupAction
+from research_platform.service import PlatformService
 from research_platform.strategies.pairs_arbitrage import PairSpec, PairsArbitrageStrategy
+from research_platform.tests.helpers import temporary_config
 
 
 def pair_bars(spike: float = 1.0) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -23,6 +27,24 @@ class PairsArbitrageTests(unittest.TestCase):
     def setUp(self) -> None:
         self.pair = PairSpec("LEFT.SH", "RIGHT.SH", "test pair")
         self.strategy = PairsArbitrageStrategy((self.pair,))
+
+    def test_rejected_baseline_is_backtest_only(self) -> None:
+        metadata = self.strategy.metadata
+
+        self.assertEqual(metadata.lifecycle, "HISTORICAL_REJECTED")
+        self.assertFalse(metadata.scan_enabled)
+        self.assertTrue(metadata.backtest_enabled)
+
+    def test_rejected_baseline_cannot_scan_directly_or_through_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = PlatformService(temporary_config(Path(directory)))
+
+            for strategy_id in ("pairs_arbitrage_v1", "adaptive_multi_strategy"):
+                with self.subTest(strategy_id=strategy_id), self.assertRaisesRegex(
+                    ValueError,
+                    "not enabled for scanning",
+                ):
+                    service.run_scan([strategy_id])
 
     def test_entry_is_an_atomic_long_short_group(self) -> None:
         left, right = pair_bars(1.005)

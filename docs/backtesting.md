@@ -11,9 +11,9 @@ py -3 -m research_platform backtest-replay --source-backtest-id <ID> --execution
 py -3 -m research_platform validate-course49 --baseline-backtest-id <ID> --stress-backtest-id <STRESS_ID> --historical-holdout-backtest-id <HOLDOUT_ID>
 ```
 
-页面中的“2 倍成本回放”支持所有版本化 Course49 策略并执行相同流程。正式收益验证要求：完整历史至少 250 个交易日和 30 笔平仓；四段时间切片至少一半为正；同版本非重叠历史留出集至少 250 日、20 笔平仓且总收益为正；平仓收益中位数为正，剔除前三大赢家后仍为正；策略冻结日 `2026-08-09` 之后至少 60 个交易日、10 笔平仓且年化不低于 20%；2 倍佣金、税费和滑点回放保持正收益。冻结日前达到 20% 只能标记为 `HISTORICAL_RETURN_TARGET_MET`，不能称为已验证。
+页面中的“2 倍成本回放”支持所有版本化 Course49 策略和 `chan_v1` 并执行相同流程。正式收益验证要求：完整历史至少 250 个交易日和 30 笔平仓；四段时间切片至少一半为正；同版本非重叠历史留出集至少 250 日、20 笔平仓且总收益为正；平仓收益中位数为正，剔除前三大赢家后仍为正；策略冻结日 `2026-08-09` 之后至少 60 个交易日、10 笔平仓且年化不低于 20%；2 倍佣金、税费和滑点回放保持正收益。冻结日前达到 20% 只能标记为 `HISTORICAL_RETURN_TARGET_MET`，不能称为已验证。
 
-Python 是主回测引擎，确保策略逻辑、执行限制和研究数据库使用同一套实现。`combined` 运行 `chan_v1 + course49_system`；`course49_system_compare` 让旧 V2 与新体系共享快照；`adaptive_multi_strategy` 使用 35% Course49、25% 缠论和 40% 配对套利资金分舱。V1-V11 仅作为研究归档回放。
+Python 是主回测引擎，确保策略逻辑、执行限制和研究数据库使用同一套实现。默认入口为 `course49_system`。`combined` 保留 `chan_v1 + course49_system` 的历史比较；Chan V1 五段审计为 0/5 盈利窗口，因此该组不支持扫描。`course49_system_compare` 让旧 V2 与新体系共享快照。`adaptive_multi_strategy` 保留 35% Course49、25% 缠论和 40% 配对套利的历史资金分舱，只用于回测比较。V1-V11 仅作为研究归档回放。
 
 ```powershell
 py -3 -m research_platform backtest --strategy chan_v1 --daily-bars 180
@@ -30,9 +30,12 @@ py -3 -m research_platform backtest --strategy course49_v6_compare --sampling-mo
 py -3 -m research_platform backtest --strategy course49_v9_compare --sampling-mode full
 py -3 -m research_platform backtest --strategy course49_v10_compare --sampling-mode full
 py -3 -m research_platform backtest --strategy course49_v11_compare --sampling-mode full
+py -3 -m research_platform backtest --strategy course49_system --playbooks leader_pullback_reclaim --sampling-mode full
 py -3 -m research_platform backtest --strategy combined --universe growth --start 2025-08-01 --end 2026-08-01
 py -3 -m research_platform backtest --strategy pairs_arbitrage_v1 --daily-bars 320
 py -3 -m research_platform backtest --strategy adaptive_multi_strategy --daily-bars 320
+py -3 -m research_platform pairs-arbitrage-study
+py -3 -m research_platform chan-study
 py -3 -m research_platform backtest --strategy course49_v2 --start 2025-01-01 --end 2026-01-01 --refresh-data
 py -3 -m research_platform backtest --strategy chan_v1 --universe custom --codes 600519.SH,000001.SZ
 py -3 -m research_platform diagnose-course49 --backtest-id <BACKTEST_ID>
@@ -48,7 +51,7 @@ py -3 -m research_platform diagnose-course49 --backtest-id <BACKTEST_ID>
 
 `diagnose-course49` 默认从完整 Parquet 快照重建市场阶段，输出 `data/research/course49_reward_<ID>_snapshot.json` 和逐事件 CSV；增加 `--scope backtest` 可严格限制到原回测状态窗口。报告同时保留事件研究的持有日收盘收益，并以“观察 N 个持有日后下一开盘退出”的 `execution_net_return_*` 作为摘要口径，与平台实际成交模型一致。它独立于组合回测，用于定位市场阶段、连板高度和涨停制度的条件收益；事件重叠、持仓上限和资金占用仍以正式回测为准。
 
-配对套利使用收盘生成意图、下一交易日两腿同时开盘成交，任何一腿缺失或涨跌停阻断都会取消整组当日成交。权益按 `现金 + 多头市值 - 空头市值` 计算，并展示总敞口、净敞口、完成组合胜率和组合盈亏。做空仅是研究模拟，不代表通达信或实际账户具备融券资格。
+配对套利使用收盘生成意图、下一交易日两腿同时开盘成交，任何一腿缺失或涨跌停阻断都会取消整组当日成交。权益按 `现金 + 多头市值 - 空头市值` 计算，并展示总敞口、净敞口、完成组合胜率和组合盈亏。做空仅是研究模拟，不代表通达信或实际账户具备融券资格。V1 的五段同快照 1 倍/2 倍成本审计见 [`pairs-arbitrage-research.md`](pairs-arbitrage-research.md)；结论为 `HISTORICAL_REJECTED`。
 
 ## 可信性要求
 
@@ -60,6 +63,11 @@ py -3 -m research_platform diagnose-course49 --backtest-id <BACKTEST_ID>
 - 非资金分舱组合目前只支持扫描，后端拒绝以独立曲线相加伪装成融合回测。
 - 当前板块成员来自通达信当前快照；跨多年题材回测需警惕成分变化造成的幸存者偏差。
 - 事件研究只能用于发现候选规则；策略晋级必须使用未参与规则选择的样本外区间，并报告交易数、资金利用率、回撤和成本敏感性。
+
+`early_winner_v1` 不进入通用策略回测入口。它通过研究项目验证端点在同一不可变快照上
+比较规则、固定 ML 与纯 RS60，并使用下一日未复权开盘、一字涨跌停、T+1、行业上限、
+ADV20 2% 委托上限、基础/双倍成本及最高 5 个收益样本归因。完整冻结窗口和状态门槛见
+[`early-winner-research.md`](early-winner-research.md)。
 
 通达信 Lambda 后续只用于客户端侧快速验证与结果对照，不取代主回测记录。
 

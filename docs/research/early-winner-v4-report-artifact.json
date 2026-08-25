@@ -1,0 +1,917 @@
+{
+  "manifest": {
+    "blocks": [
+      {
+        "body": "# 早期强势股 V4：开发审计与晋级阻断报告",
+        "id": "title",
+        "layout": "full",
+        "type": "markdown"
+      },
+      {
+        "body": "## 技术结论：V4 不具备晋级依据\n\nV4 在 2020–2023 四个开发区样本外年度全部失败，ML 的双倍成本最差相位收益逐年均为负；2020 和 2023 的最弱相位还只有 1 个实际投资周期。与此同时，交易所官方终止上市数据与当前 TDX 母表对账发现 239 只历史证券在资格过滤前已被遗漏。因此平台状态必须保持 `BLOCKED_DATA`，既不能解封 2024/2025，也不能生成交易部署。",
+        "id": "summary",
+        "layout": "full",
+        "type": "markdown"
+      },
+      {
+        "cardIds": [
+          "project_status",
+          "oos_years",
+          "missing_universe",
+          "frozen_access"
+        ],
+        "id": "headline_metrics",
+        "layout": "full",
+        "type": "metric-strip"
+      },
+      {
+        "body": "## 年度证据显示模型没有跨年稳定优势\n\n下图在完全相同的共同周期和资金可用边界上比较 ML 与 RS60。2020 年 ML 只是少亏，2021–2023 的 Precision@20 低于 RS60；所有年度的 ML 双倍成本收益都为负。结果支持拒绝 V4，而不是继续在同一 15 特征族上调参。",
+        "id": "year_result_text",
+        "layout": "full",
+        "type": "markdown"
+      },
+      {
+        "chartId": "year_returns",
+        "id": "year_result_chart_block",
+        "layout": "full",
+        "type": "chart"
+      },
+      {
+        "body": "## 原 15 特征族多数弱、反向或重复\n\n按 2018–2023 开发区逐年周等权 IC 汇总，只有 `event_score` 略为正且 5/6 年同号，但强度不足以形成可晋级组合；60 日动量和价格偏离类特征平均为负。相关矩阵的熵有效秩约为 5.99/15，`return_n` 与 `relative_return_n` 的横截面秩完全一致，成交量比与成交额比相关约 0.99。这说明增加同类特征或重调 ML 参数缺乏证据基础。",
+        "id": "feature_text",
+        "layout": "full",
+        "type": "markdown"
+      },
+      {
+        "chartId": "feature_ic",
+        "id": "feature_chart_block",
+        "layout": "full",
+        "type": "chart"
+      },
+      {
+        "body": "## 口径与方法保持点时和执行一致\n\n决策时点为每周最后一个交易日收盘；下一市场交易日开盘执行；不可成交的入选槽位保留现金且不回填。标签持有 40 个市场交易日，未复权价格用于成交，ForwardFactor 用于公司行动后的总收益。组合采用 8 个起始相位、共同的候选与基准资金边界、20bp 基础成本和 40bp 双倍成本。候选排名不使用下一日可成交性。2024、2025 和 2026 均未被本报告读取。",
+        "id": "definitions",
+        "layout": "full",
+        "type": "markdown"
+      },
+      {
+        "id": "quality_table_block",
+        "layout": "full",
+        "tableId": "quality_table",
+        "type": "table"
+      },
+      {
+        "body": "## 历史母体缺失是高严重度阻断，不只是普通 caveat\n\n当前历史构建从今天仍可见的 TDX `get_stock_list` 反推所有年份。上交所、深交所官方终止上市资料中有 239 只证券曾与 2018–2023 重叠，但当前 TDX 与 V3/V4 代码并集覆盖均为 0。北交所还存在旧代码换新代码、精选层日期和转板区间尚未闭环的问题。这个偏差发生在 ST、上市天数、流动性和停牌过滤之前，故无法用现有 1,441 只样本证明“全 A”结果。此外，V4 事件证据没有保存唯一选中公告，训练标签仍条件化于次日可成交样本，端点 MDD 也不是逐日盯市回撤。",
+        "id": "limitations",
+        "layout": "full",
+        "type": "markdown"
+      },
+      {
+        "body": "## 下一步：先补母表与事件证据，再一次性证伪 V5\n\n1. 用交易所官方终止上市、换码和转板记录建立区间有效的历史证券母表，并为缺失证券取得经批准、可追溯的历史行情源。\n2. 重建 2018–2023 特征和执行标签，量化幸存者偏差对宽度、排名和收益的影响。\n3. V5 只预注册 `selected_event_score DESC, amount_ratio ASC` 的确定性规则，并把选中公告的哈希、类型、发布时间和生效时间逐条冻结；不再训练同类 ML。\n4. 仅当历史母表、事件溯源和开发期样本门禁全部通过后，才允许一次性读取 2024/2025；失败即拒绝，规则变化另建 V6。",
+        "id": "next_steps",
+        "layout": "full",
+        "type": "markdown"
+      },
+      {
+        "body": "## 尚待回答的问题\n\n- TDX 无法返回的退市证券，采用哪个经用户批准且可核验的历史行情源？\n- 补齐母体后，负动量 IC 是否仍存在，还是幸存者偏差的产物？\n- V5 在冻结期若只因活跃周期不足，应继续前瞻累积样本，还是停止该特征族？",
+        "id": "questions",
+        "layout": "full",
+        "type": "markdown"
+      }
+    ],
+    "cards": [
+      {
+        "dataset": "headline",
+        "description": "开发审计失败且历史母表门禁失败，研究项目不得晋级。",
+        "filter": {
+          "id": "headline"
+        },
+        "id": "project_status",
+        "metrics": [
+          {
+            "field": "project_status",
+            "label": "项目状态"
+          }
+        ],
+        "sourceId": "v4_headline"
+      },
+      {
+        "dataset": "headline",
+        "description": "2020–2023 四个开发区样本外年度通过数。",
+        "filter": {
+          "id": "headline"
+        },
+        "id": "oos_years",
+        "metrics": [
+          {
+            "field": "passed_years",
+            "format": "number",
+            "label": "通过年度"
+          },
+          {
+            "field": "total_oos_years",
+            "format": "number",
+            "label": "总年度"
+          }
+        ],
+        "sourceId": "v4_headline"
+      },
+      {
+        "dataset": "headline",
+        "description": "交易所官方记录中曾与开发期重叠、但当前母表在资格过滤前遗漏的证券。",
+        "filter": {
+          "id": "headline"
+        },
+        "id": "missing_universe",
+        "metrics": [
+          {
+            "field": "missing_historical_symbols",
+            "format": "number",
+            "label": "母表缺失证券"
+          },
+          {
+            "field": "tdx_coverage",
+            "format": "number",
+            "label": "TDX 覆盖"
+          }
+        ],
+        "sourceId": "v4_headline"
+      },
+      {
+        "dataset": "headline",
+        "description": "冻结期尚未读取；数据门禁未通过时保持封存。",
+        "filter": {
+          "id": "headline"
+        },
+        "id": "frozen_access",
+        "metrics": [
+          {
+            "field": "frozen_years_read",
+            "format": "number",
+            "label": "冻结期读取"
+          }
+        ],
+        "sourceId": "v4_headline"
+      }
+    ],
+    "charts": [
+      {
+        "combinationRationale": "颜色只编码方法这一第二分类维度，年度已由横轴承载。",
+        "comparisonContext": {
+          "baseline": "RS60",
+          "denominator": "equal-weight Top20 capital with cash for unfilled slots",
+          "grain": "year × method",
+          "unit": "rate"
+        },
+        "dataset": "year_metrics",
+        "encodings": {
+          "color": {
+            "field": "method",
+            "label": "方法",
+            "type": "nominal"
+          },
+          "tooltip": [
+            {
+              "field": "double_cost_return",
+              "format": "percent",
+              "label": "双倍成本收益",
+              "type": "quantitative"
+            },
+            {
+              "field": "precision_at_20",
+              "format": "percent",
+              "label": "Precision@20",
+              "type": "quantitative"
+            },
+            {
+              "field": "min_phase_invested_periods",
+              "format": "number",
+              "label": "最少投资周期",
+              "type": "quantitative"
+            }
+          ],
+          "x": {
+            "field": "year",
+            "label": "年度",
+            "type": "ordinal"
+          },
+          "y": {
+            "field": "total_return",
+            "format": "percent",
+            "label": "组合收益",
+            "type": "quantitative"
+          }
+        },
+        "id": "year_returns",
+        "intent": "comparison",
+        "layout": "full",
+        "question": "ML 是否在每个开发区样本外年度稳定优于 RS60？",
+        "rationale": "四个离散年度与两个方法适合用分组柱状图直接比较收益符号和幅度。",
+        "showDescription": true,
+        "sourceId": "v4_audit",
+        "subtitle": "2020–2023 开发区样本外年度；同一共同资金边界，数值为复合收益",
+        "title": "V4 年度组合收益",
+        "type": "bar"
+      },
+      {
+        "comparisonContext": {
+          "baseline": "IC = 0",
+          "denominator": "six development years",
+          "grain": "feature",
+          "unit": "Spearman correlation"
+        },
+        "dataset": "feature_metrics",
+        "encodings": {
+          "tooltip": [
+            {
+              "field": "positive_years",
+              "format": "number",
+              "label": "正 IC 年数",
+              "type": "quantitative"
+            },
+            {
+              "field": "minimum_ic",
+              "format": "number",
+              "label": "最小年度 IC",
+              "type": "quantitative"
+            },
+            {
+              "field": "maximum_ic",
+              "format": "number",
+              "label": "最大年度 IC",
+              "type": "quantitative"
+            }
+          ],
+          "x": {
+            "field": "feature",
+            "label": "特征",
+            "type": "nominal"
+          },
+          "y": {
+            "field": "mean_ic",
+            "format": "number",
+            "label": "平均 IC",
+            "type": "quantitative"
+          }
+        },
+        "id": "feature_ic",
+        "intent": "comparison",
+        "layout": "full",
+        "question": "哪些 V4 特征提供稳定的未来40日横截面排序信息？",
+        "rationale": "15 个长标签特征适合按平均 IC 排序的水平柱状图，并保留正负零线。",
+        "referenceLines": [
+          {
+            "axis": "y",
+            "color": "neutral",
+            "label": "无排序关系",
+            "lineStyle": "solid",
+            "value": 0
+          }
+        ],
+        "showDescription": true,
+        "sourceId": "v4_features",
+        "subtitle": "2018–2023 开发区，按年度周等权 IC 再做六年平均；零线表示无排序关系",
+        "title": "V4 特征平均 Spearman IC",
+        "type": "horizontalBar"
+      }
+    ],
+    "description": "2018–2023 点时开发区的可复现模型审计、特征归因和历史母表质量结论。",
+    "generatedAt": "2026-08-12T23:00:00+08:00",
+    "sources": [
+      {
+        "id": "v4_headline",
+        "label": "V4 审计结论快照",
+        "path": "data/research/early_winner_v4/report_sources.sqlite",
+        "query": {
+          "description": "读取经冻结审计与官方母表对账生成的项目结论指标。",
+          "engine": "Python/pandas",
+          "executed_at": "2026-08-12T23:00:00+08:00",
+          "filters": [
+            "id = 'headline'",
+            "frozen_years_read = 0"
+          ],
+          "language": "python",
+          "metric_definitions": [
+            "passed_years：2020–2023 四个开发区样本外年度中通过全部门禁的年度数。",
+            "missing_historical_symbols：SSE/SZSE 官方记录中曾与2018–2023重叠但当前TDX母表未覆盖的证券数。"
+          ],
+          "sql": "SELECT * FROM v4_headline WHERE id = 'headline'",
+          "tables_used": [
+            "data/research/early_winner_v4/report_sources.sqlite"
+          ]
+        }
+      },
+      {
+        "id": "v4_audit",
+        "label": "V4 冻结开发审计年度结果",
+        "path": "data/research/early_winner_v4/report_sources.sqlite",
+        "query": {
+          "description": "读取不可变 V4 开发审计中的 ML 与 RS60 年度指标。",
+          "engine": "Python/pandas",
+          "executed_at": "2026-08-12T23:00:00+08:00",
+          "filters": [
+            "test_year in 2020..2023",
+            "frozen years 2024/2025 excluded"
+          ],
+          "language": "python",
+          "metric_definitions": [
+            "total_return：八相位共同资金边界下的年度复合收益。",
+            "double_cost_return：按 40bp 往返成本压力测试的年度复合收益。",
+            "Precision@20：每个可排名周 Top20 中未来40日同期横截面前5%标签占比。",
+            "min_phase_invested_periods：八个起始相位中最少的实际投资周期数。"
+          ],
+          "sql": "SELECT year, method, total_return, double_cost_return, precision_at_20, pr_auc, ic, max_drawdown, min_phase_periods, min_phase_invested_periods, gate_passed FROM v4_year_metrics ORDER BY year, method",
+          "tables_used": [
+            "data/research/early_winner_v4/report_sources.sqlite"
+          ]
+        }
+      },
+      {
+        "id": "v4_features",
+        "label": "V4 2018–2023 冻结特征分片",
+        "path": "data/research/early_winner_v4/report_sources.sqlite",
+        "query": {
+          "description": "按周横截面计算每个特征与未来40交易日收益的 Spearman IC，再按六年等权汇总。",
+          "engine": "Python/pandas",
+          "executed_at": "2026-08-12T23:00:00+08:00",
+          "filters": [
+            "2018-01-01 <= asof <= 2023-12-31",
+            "v4_eligible = true",
+            "entry_executable = true",
+            "forward_return_40 is not null",
+            "2024/2025/2026 excluded"
+          ],
+          "language": "python",
+          "metric_definitions": [
+            "mean_ic：每年周等权 Spearman IC 的六年算术平均。",
+            "positive_years：六个开发年度中 mean yearly IC > 0 的年度数。"
+          ],
+          "sql": "SELECT feature, mean_ic, positive_years, minimum_ic, maximum_ic, years_observed FROM v4_feature_metrics ORDER BY mean_ic DESC",
+          "tables_used": [
+            "data/research/early_winner_v4/report_sources.sqlite"
+          ]
+        }
+      },
+      {
+        "id": "v4_quality",
+        "label": "V4 数据质量与母表对账结果",
+        "path": "data/research/early_winner_v4/report_sources.sqlite",
+        "query": {
+          "description": "读取内部一致性检查和历史母表对账的审计指标。",
+          "engine": "Python/pandas",
+          "executed_at": "2026-08-12T23:00:00+08:00",
+          "filters": [
+            "2018-01-01 <= asof <= 2023-12-31",
+            "frozen years excluded"
+          ],
+          "language": "python",
+          "metric_definitions": [
+            "status=PASS 仅代表对应检查通过；历史母表 FAIL 会覆盖内部一致性通过项。",
+            "交易所核对缺失证券指资格过滤前遗漏，不等于这些证券全部满足策略准入。"
+          ],
+          "sql": "SELECT metric, value, status, definition FROM v4_quality_metrics ORDER BY metric",
+          "tables_used": [
+            "data/research/early_winner_v4/report_sources.sqlite"
+          ]
+        }
+      },
+      {
+        "id": "universe_audit",
+        "label": "历史证券母表官方对账",
+        "path": "docs/research/early-winner-v4-universe-audit.md",
+        "query": {
+          "description": "以交易所官方终止上市数据对账当前 TDX 与 V3/V4 历史代码并集。",
+          "engine": "Python/pandas",
+          "executed_at": "2026-08-12T23:00:00+08:00",
+          "filters": [
+            "listed_at <= 2023-12-31",
+            "delisted_at >= 2018-01-01",
+            "A shares only"
+          ],
+          "language": "python",
+          "metric_definitions": [
+            "missing historical securities：在2018–2023任一时间上市但未进入当前TDX母表的终止上市证券数。",
+            "本对账说明母体缺失，不主张这些证券均会通过120日、ST、流动性或停牌过滤。"
+          ],
+          "tables_used": [
+            "docs/research/early-winner-v4-universe-audit.md"
+          ]
+        }
+      }
+    ],
+    "surface": "report",
+    "tables": [
+      {
+        "columns": [
+          {
+            "field": "metric",
+            "label": "检查项",
+            "type": "text"
+          },
+          {
+            "field": "value",
+            "format": "number",
+            "label": "值"
+          },
+          {
+            "field": "status",
+            "label": "状态",
+            "type": "text"
+          },
+          {
+            "field": "definition",
+            "label": "解释",
+            "type": "text"
+          }
+        ],
+        "dataset": "quality_metrics",
+        "defaultSort": {
+          "direction": "asc",
+          "field": "metric"
+        },
+        "density": "spacious",
+        "id": "quality_table",
+        "layout": "full",
+        "showDescription": true,
+        "sourceId": "v4_quality",
+        "subtitle": "通过项仅证明已纳入母体的内部一致性；历史覆盖失败会覆盖其他通过项",
+        "title": "V4 数据质量与母表门禁"
+      }
+    ],
+    "title": "早期强势股 V4：开发审计与晋级阻断报告",
+    "version": 1
+  },
+  "package_info": {
+    "audit_id": "ewv4_dev_837bd0a4b015422a493c6918",
+    "audit_sha256": "cf4105941c2ede20a6d6d181e64ca09e7151679f5bf8e2d2a0a8c0c61941d18f",
+    "chart_map": [
+      {
+        "claim": "V4 无跨年稳定优势",
+        "family": "comparison",
+        "fields": [
+          "year",
+          "method",
+          "total_return"
+        ],
+        "palette_policy": "hard two-root cap",
+        "question": "ML 是否逐年优于 RS60？",
+        "section": "年度证据",
+        "type": "grouped bar"
+      },
+      {
+        "claim": "15 特征多数弱、反向或冗余",
+        "family": "comparison and ranking",
+        "fields": [
+          "feature",
+          "mean_ic"
+        ],
+        "palette_policy": "single-root preferred with neutral zero line",
+        "question": "哪些特征有稳定排序能力？",
+        "section": "特征归因",
+        "type": "horizontal bar"
+      }
+    ],
+    "feature_shards": [
+      {
+        "name": "ewv4f_05b1a6ec6218d7e59027_2018.parquet",
+        "sha256": "11c2f25b81bc3c7715e3b9c649f08d7e4742af3fda85463a53480c7361fe3ae1"
+      },
+      {
+        "name": "ewv4f_05b1a6ec6218d7e59027_2019.parquet",
+        "sha256": "816c91ad40716c009b7e87c38cfa6ccfb84e04e75760a43156a0c6f3b0ca6e68"
+      },
+      {
+        "name": "ewv4f_05b1a6ec6218d7e59027_2020.parquet",
+        "sha256": "44d81faa50060fd031c5efb252e839b46dd006b65a7cd9466b2da54fb07dd418"
+      },
+      {
+        "name": "ewv4f_05b1a6ec6218d7e59027_2021.parquet",
+        "sha256": "e8ea15be6de562e563da3f67f32272354198b805154360a3fa409b7ac6d9a4fa"
+      },
+      {
+        "name": "ewv4f_05b1a6ec6218d7e59027_2022.parquet",
+        "sha256": "38be5eb9668a92351eda9007eaab003b23e6d403defcb87fd57758bffa0bc6d8"
+      },
+      {
+        "name": "ewv4f_05b1a6ec6218d7e59027_2023.parquet",
+        "sha256": "d581d1b4864a2e8abec9ee6e034d8674c6417467372eff713914a4ccd4a3c2ed"
+      }
+    ],
+    "frozen_validation_opened": false,
+    "omissions": [
+      "No daily mark-to-market curve: V4 audit stores endpoint portfolio metrics only.",
+      "No 2024/2025 validation result: frozen years remain sealed by design.",
+      "No candidate list: V4 did not pass development gates and must not emit candidates."
+    ],
+    "report_database_sha256": "7c26ec2fbbefbac78858ab2e0c91741f0d0cb8cae7256e67b798109036c624b0",
+    "snapshot_prefix": "05b1a6ec6218d7e59027",
+    "supporting_notebook": "docs/research/early-winner-v4-development-audit.ipynb"
+  },
+  "snapshot": {
+    "datasets": {
+      "feature_metrics": [
+        {
+          "feature": "event_score",
+          "maximum_ic": 0.039804,
+          "mean_ic": 0.0164515,
+          "minimum_ic": -0.044627,
+          "positive_years": 5,
+          "years_observed": 6
+        },
+        {
+          "feature": "breakout_distance",
+          "maximum_ic": 0.079288,
+          "mean_ic": 0.008014666666666665,
+          "minimum_ic": -0.083466,
+          "positive_years": 4,
+          "years_observed": 6
+        },
+        {
+          "feature": "return_120",
+          "maximum_ic": 0.182169,
+          "mean_ic": 0.005487666666666664,
+          "minimum_ic": -0.129339,
+          "positive_years": 3,
+          "years_observed": 6
+        },
+        {
+          "feature": "relative_return_120",
+          "maximum_ic": 0.182169,
+          "mean_ic": 0.005487666666666664,
+          "minimum_ic": -0.129339,
+          "positive_years": 3,
+          "years_observed": 6
+        },
+        {
+          "feature": "industry_momentum",
+          "maximum_ic": 0.061078,
+          "mean_ic": -0.02124983333333334,
+          "minimum_ic": -0.120523,
+          "positive_years": 3,
+          "years_observed": 6
+        },
+        {
+          "feature": "industry_breadth",
+          "maximum_ic": 0.009509,
+          "mean_ic": -0.027912999999999997,
+          "minimum_ic": -0.093455,
+          "positive_years": 2,
+          "years_observed": 6
+        },
+        {
+          "feature": "return_60",
+          "maximum_ic": 0.07976,
+          "mean_ic": -0.03518516666666667,
+          "minimum_ic": -0.136419,
+          "positive_years": 3,
+          "years_observed": 6
+        },
+        {
+          "feature": "relative_return_60",
+          "maximum_ic": 0.07976,
+          "mean_ic": -0.03518516666666667,
+          "minimum_ic": -0.136419,
+          "positive_years": 3,
+          "years_observed": 6
+        },
+        {
+          "feature": "volume_ratio",
+          "maximum_ic": -0.003006,
+          "mean_ic": -0.03548083333333333,
+          "minimum_ic": -0.072767,
+          "positive_years": 0,
+          "years_observed": 6
+        },
+        {
+          "feature": "industry_amount_trend",
+          "maximum_ic": -5.3e-05,
+          "mean_ic": -0.0359175,
+          "minimum_ic": -0.079387,
+          "positive_years": 0,
+          "years_observed": 6
+        },
+        {
+          "feature": "amount_ratio",
+          "maximum_ic": 0.001659,
+          "mean_ic": -0.03914566666666667,
+          "minimum_ic": -0.084311,
+          "positive_years": 1,
+          "years_observed": 6
+        },
+        {
+          "feature": "ma20_slope",
+          "maximum_ic": -0.001604,
+          "mean_ic": -0.0508485,
+          "minimum_ic": -0.109349,
+          "positive_years": 0,
+          "years_observed": 6
+        },
+        {
+          "feature": "price_to_ma60",
+          "maximum_ic": 0.026637,
+          "mean_ic": -0.051366833333333334,
+          "minimum_ic": -0.128191,
+          "positive_years": 2,
+          "years_observed": 6
+        },
+        {
+          "feature": "return_20",
+          "maximum_ic": 0.008127,
+          "mean_ic": -0.05397333333333334,
+          "minimum_ic": -0.123466,
+          "positive_years": 1,
+          "years_observed": 6
+        },
+        {
+          "feature": "relative_return_20",
+          "maximum_ic": 0.008127,
+          "mean_ic": -0.05397333333333334,
+          "minimum_ic": -0.123466,
+          "positive_years": 1,
+          "years_observed": 6
+        }
+      ],
+      "headline": [
+        {
+          "frozen_years_read": 0,
+          "id": "headline",
+          "missing_historical_symbols": 239,
+          "passed_years": 0,
+          "project_status": "BLOCKED_DATA",
+          "tdx_coverage": 0,
+          "total_oos_years": 4
+        }
+      ],
+      "quality_metrics": [
+        {
+          "definition": "SSE/SZSE 官方终止上市记录中曾与 2018–2023 重叠、当前母表未覆盖的证券",
+          "metric": "交易所核对缺失证券",
+          "status": "FAIL",
+          "value": 239
+        },
+        {
+          "definition": "六个开发年度内的周末决策截面",
+          "metric": "决策周数",
+          "status": "PASS",
+          "value": 307
+        },
+        {
+          "definition": "2018–2023 周末决策日与证券代码唯一组合",
+          "metric": "决策粒度行数",
+          "status": "PASS",
+          "value": 155107
+        },
+        {
+          "definition": "已明确排除并保留审计行，未静默回退",
+          "metric": "执行状态不完整行",
+          "status": "PASS",
+          "value": 249
+        },
+        {
+          "definition": "(asof, code) 重复行",
+          "metric": "粒度重复",
+          "status": "PASS",
+          "value": 0
+        },
+        {
+          "definition": "仅为当前 TDX 母表可见代码；不等于历史全 A 母体",
+          "metric": "证券代码数",
+          "status": "FAIL",
+          "value": 1441
+        }
+      ],
+      "year_metrics": [
+        {
+          "double_cost_return": -0.042891201178759775,
+          "gate_passed": 0,
+          "ic": -0.06232659734000916,
+          "max_drawdown": -0.17157396773954026,
+          "method": "ML",
+          "min_phase_invested_periods": 1,
+          "min_phase_periods": 5,
+          "pr_auc": 0.1094273172731331,
+          "precision_at_20": 0.11346153846153847,
+          "total_return": -0.03814805143890215,
+          "year": "2020"
+        },
+        {
+          "double_cost_return": -0.20250468714919795,
+          "gate_passed": 0,
+          "ic": -0.08841167404359568,
+          "max_drawdown": -0.3365834755089476,
+          "method": "RS60",
+          "min_phase_invested_periods": 1,
+          "min_phase_periods": 5,
+          "pr_auc": 0.1027960580176975,
+          "precision_at_20": 0.09807692307692309,
+          "total_return": -0.19673535394209501,
+          "year": "2020"
+        },
+        {
+          "double_cost_return": -0.05341889857410498,
+          "gate_passed": 0,
+          "ic": -0.0655362161996224,
+          "max_drawdown": -0.22979596016536463,
+          "method": "ML",
+          "min_phase_invested_periods": 3,
+          "min_phase_periods": 5,
+          "pr_auc": 0.1031225667787595,
+          "precision_at_20": 0.1,
+          "total_return": -0.046669189338510275,
+          "year": "2021"
+        },
+        {
+          "double_cost_return": -0.07213970330265979,
+          "gate_passed": 0,
+          "ic": -0.12399312203113662,
+          "max_drawdown": -0.2576012834320722,
+          "method": "RS60",
+          "min_phase_invested_periods": 3,
+          "min_phase_periods": 5,
+          "pr_auc": 0.11553038231030074,
+          "precision_at_20": 0.14285714285714285,
+          "total_return": -0.06540264276086682,
+          "year": "2021"
+        },
+        {
+          "double_cost_return": -0.09659802596166711,
+          "gate_passed": 0,
+          "ic": -0.12635576594255435,
+          "max_drawdown": -0.20983428123758419,
+          "method": "ML",
+          "min_phase_invested_periods": 2,
+          "min_phase_periods": 5,
+          "pr_auc": 0.10826512751720951,
+          "precision_at_20": 0.12,
+          "total_return": -0.09278886466778169,
+          "year": "2022"
+        },
+        {
+          "double_cost_return": -0.10206109679059866,
+          "gate_passed": 0,
+          "ic": -0.13620355467668338,
+          "max_drawdown": -0.19185773619319024,
+          "method": "RS60",
+          "min_phase_invested_periods": 2,
+          "min_phase_periods": 5,
+          "pr_auc": 0.12086036953441658,
+          "precision_at_20": 0.1775,
+          "total_return": -0.09826237866610499,
+          "year": "2022"
+        },
+        {
+          "double_cost_return": -0.024219130835888114,
+          "gate_passed": 0,
+          "ic": 0.0365775527705609,
+          "max_drawdown": -0.16651272165102005,
+          "method": "ML",
+          "min_phase_invested_periods": 1,
+          "min_phase_periods": 4,
+          "pr_auc": 0.12375171795915874,
+          "precision_at_20": 0.1346153846153846,
+          "total_return": -0.022219130835888112,
+          "year": "2023"
+        },
+        {
+          "double_cost_return": 0.024668846898830865,
+          "gate_passed": 0,
+          "ic": 0.04622434029470056,
+          "max_drawdown": -0.2154651603422333,
+          "method": "RS60",
+          "min_phase_invested_periods": 1,
+          "min_phase_periods": 4,
+          "pr_auc": 0.13677725179075934,
+          "precision_at_20": 0.18076923076923074,
+          "total_return": 0.026668846898830756,
+          "year": "2023"
+        }
+      ]
+    },
+    "generatedAt": "2026-08-12T23:00:00+08:00",
+    "status": "ready",
+    "version": 1
+  },
+  "sources": [
+    {
+      "id": "v4_headline",
+      "label": "V4 审计结论快照",
+      "path": "data/research/early_winner_v4/report_sources.sqlite",
+      "query": {
+        "description": "读取经冻结审计与官方母表对账生成的项目结论指标。",
+        "engine": "Python/pandas",
+        "executed_at": "2026-08-12T23:00:00+08:00",
+        "filters": [
+          "id = 'headline'",
+          "frozen_years_read = 0"
+        ],
+        "language": "python",
+        "metric_definitions": [
+          "passed_years：2020–2023 四个开发区样本外年度中通过全部门禁的年度数。",
+          "missing_historical_symbols：SSE/SZSE 官方记录中曾与2018–2023重叠但当前TDX母表未覆盖的证券数。"
+        ],
+        "sql": "SELECT * FROM v4_headline WHERE id = 'headline'",
+        "tables_used": [
+          "data/research/early_winner_v4/report_sources.sqlite"
+        ]
+      }
+    },
+    {
+      "id": "v4_audit",
+      "label": "V4 冻结开发审计年度结果",
+      "path": "data/research/early_winner_v4/report_sources.sqlite",
+      "query": {
+        "description": "读取不可变 V4 开发审计中的 ML 与 RS60 年度指标。",
+        "engine": "Python/pandas",
+        "executed_at": "2026-08-12T23:00:00+08:00",
+        "filters": [
+          "test_year in 2020..2023",
+          "frozen years 2024/2025 excluded"
+        ],
+        "language": "python",
+        "metric_definitions": [
+          "total_return：八相位共同资金边界下的年度复合收益。",
+          "double_cost_return：按 40bp 往返成本压力测试的年度复合收益。",
+          "Precision@20：每个可排名周 Top20 中未来40日同期横截面前5%标签占比。",
+          "min_phase_invested_periods：八个起始相位中最少的实际投资周期数。"
+        ],
+        "sql": "SELECT year, method, total_return, double_cost_return, precision_at_20, pr_auc, ic, max_drawdown, min_phase_periods, min_phase_invested_periods, gate_passed FROM v4_year_metrics ORDER BY year, method",
+        "tables_used": [
+          "data/research/early_winner_v4/report_sources.sqlite"
+        ]
+      }
+    },
+    {
+      "id": "v4_features",
+      "label": "V4 2018–2023 冻结特征分片",
+      "path": "data/research/early_winner_v4/report_sources.sqlite",
+      "query": {
+        "description": "按周横截面计算每个特征与未来40交易日收益的 Spearman IC，再按六年等权汇总。",
+        "engine": "Python/pandas",
+        "executed_at": "2026-08-12T23:00:00+08:00",
+        "filters": [
+          "2018-01-01 <= asof <= 2023-12-31",
+          "v4_eligible = true",
+          "entry_executable = true",
+          "forward_return_40 is not null",
+          "2024/2025/2026 excluded"
+        ],
+        "language": "python",
+        "metric_definitions": [
+          "mean_ic：每年周等权 Spearman IC 的六年算术平均。",
+          "positive_years：六个开发年度中 mean yearly IC > 0 的年度数。"
+        ],
+        "sql": "SELECT feature, mean_ic, positive_years, minimum_ic, maximum_ic, years_observed FROM v4_feature_metrics ORDER BY mean_ic DESC",
+        "tables_used": [
+          "data/research/early_winner_v4/report_sources.sqlite"
+        ]
+      }
+    },
+    {
+      "id": "v4_quality",
+      "label": "V4 数据质量与母表对账结果",
+      "path": "data/research/early_winner_v4/report_sources.sqlite",
+      "query": {
+        "description": "读取内部一致性检查和历史母表对账的审计指标。",
+        "engine": "Python/pandas",
+        "executed_at": "2026-08-12T23:00:00+08:00",
+        "filters": [
+          "2018-01-01 <= asof <= 2023-12-31",
+          "frozen years excluded"
+        ],
+        "language": "python",
+        "metric_definitions": [
+          "status=PASS 仅代表对应检查通过；历史母表 FAIL 会覆盖内部一致性通过项。",
+          "交易所核对缺失证券指资格过滤前遗漏，不等于这些证券全部满足策略准入。"
+        ],
+        "sql": "SELECT metric, value, status, definition FROM v4_quality_metrics ORDER BY metric",
+        "tables_used": [
+          "data/research/early_winner_v4/report_sources.sqlite"
+        ]
+      }
+    },
+    {
+      "id": "universe_audit",
+      "label": "历史证券母表官方对账",
+      "path": "docs/research/early-winner-v4-universe-audit.md",
+      "query": {
+        "description": "以交易所官方终止上市数据对账当前 TDX 与 V3/V4 历史代码并集。",
+        "engine": "Python/pandas",
+        "executed_at": "2026-08-12T23:00:00+08:00",
+        "filters": [
+          "listed_at <= 2023-12-31",
+          "delisted_at >= 2018-01-01",
+          "A shares only"
+        ],
+        "language": "python",
+        "metric_definitions": [
+          "missing historical securities：在2018–2023任一时间上市但未进入当前TDX母表的终止上市证券数。",
+          "本对账说明母体缺失，不主张这些证券均会通过120日、ST、流动性或停牌过滤。"
+        ],
+        "tables_used": [
+          "docs/research/early-winner-v4-universe-audit.md"
+        ]
+      }
+    }
+  ],
+  "surface": "report"
+}

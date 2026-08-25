@@ -25,11 +25,12 @@ from .models import (
     RunStatus,
     RuntimeAdapter,
     SignalStatus,
+    StrategyCategory,
     StrategyMetadata,
 )
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 13
 
 
 def _file_sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
@@ -67,6 +68,7 @@ CREATE TABLE IF NOT EXISTS strategies (
     framework_id TEXT NOT NULL DEFAULT '',
     policy_version TEXT NOT NULL DEFAULT '',
     archived INTEGER NOT NULL DEFAULT 0,
+    category TEXT NOT NULL DEFAULT 'independent',
     updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS strategy_groups (
@@ -448,6 +450,67 @@ CREATE TABLE IF NOT EXISTS decision_outcomes (
     FOREIGN KEY(signal_id) REFERENCES signals(signal_id)
 );
 CREATE INDEX IF NOT EXISTS idx_decision_outcomes_signal ON decision_outcomes(signal_id, evaluated_at DESC);
+CREATE TABLE IF NOT EXISTS strategy_observations (
+    observation_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    strategy_version TEXT NOT NULL,
+    code TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    stage TEXT NOT NULL,
+    signal_asof TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    score REAL NOT NULL,
+    entry_allowed INTEGER NOT NULL DEFAULT 0,
+    target_weight REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    executable INTEGER NOT NULL DEFAULT 0,
+    block_reason TEXT NOT NULL DEFAULT '',
+    entry_time TEXT,
+    entry_price REAL,
+    return_5d REAL,
+    return_20d REAL,
+    mae_20d REAL,
+    mfe_20d REAL,
+    candidate_json TEXT NOT NULL DEFAULT '{}',
+    evaluation_json TEXT NOT NULL DEFAULT '{}',
+    hypothesis_id TEXT NOT NULL DEFAULT '',
+    hypothesis_rank INTEGER,
+    hypothesis_selected INTEGER NOT NULL DEFAULT 0,
+    conversion_status TEXT NOT NULL DEFAULT 'NOT_APPLICABLE',
+    converted_at TEXT,
+    conversion_days INTEGER,
+    conversion_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(strategy_id, strategy_version, code, stage, signal_asof),
+    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_observations_status
+ON strategy_observations(strategy_id, status, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_strategy_observations_cohort
+ON strategy_observations(strategy_id, stage, signal_asof DESC);
+CREATE TABLE IF NOT EXISTS v9_repo_shadow_protocols (
+    protocol_hash TEXT PRIMARY KEY,
+    observer_version TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    strategy_version TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS v9_repo_shadow_events (
+    event_id TEXT PRIMARY KEY,
+    protocol_hash TEXT NOT NULL,
+    session_date TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    data_hash TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    UNIQUE(protocol_hash, session_date, event_type),
+    FOREIGN KEY(protocol_hash) REFERENCES v9_repo_shadow_protocols(protocol_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_v9_repo_shadow_events_session
+ON v9_repo_shadow_events(protocol_hash, session_date, event_type);
 CREATE TABLE IF NOT EXISTS strategy_experiments (
     experiment_id TEXT PRIMARY KEY,
     base_strategy_id TEXT NOT NULL,
@@ -482,6 +545,279 @@ CREATE TABLE IF NOT EXISTS experiment_artifacts (
     metadata_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
     FOREIGN KEY(experiment_id) REFERENCES strategy_experiments(experiment_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS research_projects (
+    project_id TEXT PRIMARY KEY,
+    version TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'research_project',
+    lifecycle TEXT NOT NULL DEFAULT 'RESEARCH_ONLY',
+    status TEXT NOT NULL DEFAULT 'DATA_BUILDING',
+    data_asof TEXT,
+    data_gates_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS research_data_batches (
+    batch_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    dataset TEXT NOT NULL,
+    source TEXT NOT NULL,
+    status TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    published_start TEXT,
+    published_end TEXT,
+    row_count INTEGER NOT NULL DEFAULT 0,
+    path TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL DEFAULT '',
+    schema_hash TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY(project_id) REFERENCES research_projects(project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_research_data_batches_project
+ON research_data_batches(project_id, fetched_at DESC);
+CREATE TABLE IF NOT EXISTS research_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    method TEXT NOT NULL,
+    asof TEXT NOT NULL,
+    code TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    industry TEXT NOT NULL DEFAULT '',
+    rank INTEGER NOT NULL,
+    score REAL NOT NULL,
+    probability REAL,
+    factor_json TEXT NOT NULL DEFAULT '{}',
+    gate_json TEXT NOT NULL DEFAULT '{}',
+    evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+    snapshot_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(project_id, method, asof, code),
+    FOREIGN KEY(project_id) REFERENCES research_projects(project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_research_candidates_lookup
+ON research_candidates(project_id, method, asof DESC, rank);
+CREATE TABLE IF NOT EXISTS research_models (
+    model_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    artifact_path TEXT NOT NULL DEFAULT '',
+    artifact_hash TEXT NOT NULL DEFAULT '',
+    feature_schema_hash TEXT NOT NULL DEFAULT '',
+    training_start TEXT,
+    training_end TEXT,
+    validation_start TEXT,
+    validation_end TEXT,
+    test_start TEXT,
+    test_end TEXT,
+    random_seed INTEGER NOT NULL DEFAULT 49,
+    library_version TEXT NOT NULL DEFAULT '',
+    metrics_json TEXT NOT NULL DEFAULT '{}',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY(project_id) REFERENCES research_projects(project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_research_models_project
+ON research_models(project_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS research_validations (
+    validation_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    finished_at TEXT,
+    snapshot_id TEXT NOT NULL DEFAULT '',
+    rule_metrics_json TEXT NOT NULL DEFAULT '{}',
+    ml_metrics_json TEXT NOT NULL DEFAULT '{}',
+    baseline_metrics_json TEXT NOT NULL DEFAULT '{}',
+    stress_metrics_json TEXT NOT NULL DEFAULT '{}',
+    gates_json TEXT NOT NULL DEFAULT '{}',
+    champion_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY(project_id) REFERENCES research_projects(project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_research_validations_project
+ON research_validations(project_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS early_winner_history_builds (
+    build_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    start_year INTEGER NOT NULL,
+    end_year INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    expected_shards INTEGER NOT NULL DEFAULT 0,
+    completed_shards INTEGER NOT NULL DEFAULT 0,
+    last_completed_year INTEGER,
+    calendar_hash TEXT NOT NULL DEFAULT '',
+    manifest_path TEXT NOT NULL DEFAULT '',
+    manifest_hash TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    error TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY(project_id) REFERENCES research_projects(project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_early_winner_history_status
+ON early_winner_history_builds(project_id, updated_at DESC);
+CREATE TABLE IF NOT EXISTS early_winner_history_shards (
+    build_id TEXT NOT NULL,
+    shard_year INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    batch_id TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL DEFAULT '',
+    row_count INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    error TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(build_id, shard_year),
+    FOREIGN KEY(build_id) REFERENCES early_winner_history_builds(build_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS trading_deployments (
+    deployment_id TEXT PRIMARY KEY,
+    strategy_id TEXT NOT NULL UNIQUE,
+    project_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    champion_json TEXT NOT NULL DEFAULT '{}',
+    validation_id TEXT NOT NULL DEFAULT '',
+    snapshot_id TEXT NOT NULL DEFAULT '',
+    account_alias TEXT NOT NULL DEFAULT '',
+    max_capital_cny REAL,
+    max_account_fraction REAL,
+    shadow_started_at TEXT,
+    pilot_started_at TEXT,
+    live_started_at TEXT,
+    high_water_equity REAL,
+    last_equity REAL,
+    last_equity_date TEXT,
+    last_halt_at TEXT,
+    metrics_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(project_id) REFERENCES research_projects(project_id)
+);
+CREATE TABLE IF NOT EXISTS trading_order_batches (
+    batch_id TEXT PRIMARY KEY,
+    deployment_id TEXT NOT NULL,
+    rebalance_date TEXT NOT NULL,
+    execution_date TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    status TEXT NOT NULL,
+    confirmation_code TEXT NOT NULL,
+    champion_hash TEXT NOT NULL,
+    snapshot_id TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
+    approval_deadline TEXT NOT NULL,
+    approved_at TEXT,
+    decided_at TEXT,
+    decision_note TEXT NOT NULL DEFAULT '',
+    expires_at TEXT NOT NULL,
+    FOREIGN KEY(deployment_id) REFERENCES trading_deployments(deployment_id)
+);
+CREATE INDEX IF NOT EXISTS idx_trading_batches_status
+ON trading_order_batches(deployment_id, status, execution_date DESC);
+CREATE TABLE IF NOT EXISTS trading_order_intents (
+    intent_id TEXT PRIMARY KEY,
+    batch_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    code TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    industry TEXT NOT NULL DEFAULT '',
+    side TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    target_weight REAL NOT NULL,
+    requested_quantity INTEGER NOT NULL DEFAULT 0,
+    limit_price REAL,
+    adv20 REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    automatic_risk_exit INTEGER NOT NULL DEFAULT 0,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TEXT,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY(batch_id) REFERENCES trading_order_batches(batch_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_trading_intents_batch
+ON trading_order_intents(batch_id, status, side, code);
+CREATE TABLE IF NOT EXISTS trading_broker_orders (
+    broker_order_row_id TEXT PRIMARY KEY,
+    intent_id TEXT NOT NULL,
+    broker_order_id TEXT NOT NULL DEFAULT '',
+    mode TEXT NOT NULL,
+    status TEXT NOT NULL,
+    submitted_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    order_quantity INTEGER NOT NULL,
+    filled_quantity INTEGER NOT NULL DEFAULT 0,
+    limit_price REAL NOT NULL,
+    average_fill_price REAL,
+    response_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY(intent_id) REFERENCES trading_order_intents(intent_id)
+);
+CREATE INDEX IF NOT EXISTS idx_trading_broker_orders_intent
+ON trading_broker_orders(intent_id, updated_at DESC);
+CREATE TABLE IF NOT EXISTS trading_broker_fills (
+    fill_id TEXT PRIMARY KEY,
+    broker_order_row_id TEXT NOT NULL,
+    intent_id TEXT NOT NULL,
+    code TEXT NOT NULL,
+    side TEXT NOT NULL,
+    filled_at TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    price REAL NOT NULL,
+    arrival_price REAL NOT NULL,
+    slippage REAL NOT NULL,
+    fees REAL NOT NULL DEFAULT 0,
+    FOREIGN KEY(broker_order_row_id) REFERENCES trading_broker_orders(broker_order_row_id),
+    FOREIGN KEY(intent_id) REFERENCES trading_order_intents(intent_id)
+);
+CREATE TABLE IF NOT EXISTS trading_position_snapshots (
+    snapshot_row_id TEXT PRIMARY KEY,
+    deployment_id TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    source TEXT NOT NULL,
+    asset_json TEXT NOT NULL DEFAULT '{}',
+    positions_json TEXT NOT NULL DEFAULT '[]',
+    orders_json TEXT NOT NULL DEFAULT '[]',
+    content_hash TEXT NOT NULL,
+    FOREIGN KEY(deployment_id) REFERENCES trading_deployments(deployment_id)
+);
+CREATE TABLE IF NOT EXISTS trading_reconciliations (
+    reconciliation_id TEXT PRIMARY KEY,
+    deployment_id TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    snapshot_row_id TEXT NOT NULL DEFAULT '',
+    differences_json TEXT NOT NULL DEFAULT '[]',
+    resolved_at TEXT,
+    resolution_note TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY(deployment_id) REFERENCES trading_deployments(deployment_id)
+);
+CREATE INDEX IF NOT EXISTS idx_trading_reconciliations_status
+ON trading_reconciliations(deployment_id, status, captured_at DESC);
+CREATE TABLE IF NOT EXISTS trading_risk_events (
+    risk_event_id TEXT PRIMARY KEY,
+    deployment_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    status TEXT NOT NULL,
+    triggered_at TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    resolved_at TEXT,
+    resolution_note TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY(deployment_id) REFERENCES trading_deployments(deployment_id)
+);
+CREATE TABLE IF NOT EXISTS trading_scheduler_heartbeats (
+    scheduler_id TEXT PRIMARY KEY,
+    deployment_id TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    status TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY(deployment_id) REFERENCES trading_deployments(deployment_id)
 );
 """
 
@@ -586,10 +922,15 @@ class Database:
                 "framework_id": "TEXT NOT NULL DEFAULT ''",
                 "policy_version": "TEXT NOT NULL DEFAULT ''",
                 "archived": "INTEGER NOT NULL DEFAULT 0",
+                "category": "TEXT NOT NULL DEFAULT 'independent'",
             }
             for column, definition in strategy_migrations.items():
                 if column not in strategy_columns:
                     connection.execute(f"ALTER TABLE strategies ADD COLUMN {column} {definition}")
+            connection.execute(
+                """UPDATE strategies SET category='research_project'
+                WHERE lifecycle='RESEARCH_ONLY'"""
+            )
             decision_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(signal_decisions)")
             }
@@ -605,6 +946,24 @@ class Database:
                     connection.execute(
                         f"ALTER TABLE signal_decisions ADD COLUMN {column} {definition}"
                     )
+            observation_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(strategy_observations)").fetchall()
+            }
+            observation_migrations = {
+                "hypothesis_id": "TEXT NOT NULL DEFAULT ''",
+                "hypothesis_rank": "INTEGER",
+                "hypothesis_selected": "INTEGER NOT NULL DEFAULT 0",
+                "conversion_status": "TEXT NOT NULL DEFAULT 'NOT_APPLICABLE'",
+                "converted_at": "TEXT",
+                "conversion_days": "INTEGER",
+                "conversion_json": "TEXT NOT NULL DEFAULT '{}'",
+            }
+            for column, definition in observation_migrations.items():
+                if column not in observation_columns:
+                    connection.execute(
+                        f"ALTER TABLE strategy_observations ADD COLUMN {column} {definition}"
+                    )
             group_position_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(paper_group_positions)").fetchall()
@@ -612,6 +971,14 @@ class Database:
             if "entry_fees" not in group_position_columns:
                 connection.execute(
                     "ALTER TABLE paper_group_positions ADD COLUMN entry_fees REAL NOT NULL DEFAULT 0"
+                )
+            validation_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(research_validations)").fetchall()
+            }
+            if "champion_json" not in validation_columns:
+                connection.execute(
+                    "ALTER TABLE research_validations ADD COLUMN champion_json TEXT NOT NULL DEFAULT '{}'"
                 )
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
@@ -634,6 +1001,12 @@ class Database:
             connection.execute(
                 """UPDATE paper_accounts SET frozen=1
                 WHERE strategy_id GLOB 'course49_v[0-9]*'"""
+            )
+            connection.execute(
+                """UPDATE paper_accounts SET frozen=1
+                WHERE strategy_id IN (
+                    SELECT strategy_id FROM strategies WHERE category='research_project'
+                )"""
             )
 
     def execute(self, sql: str, params: Iterable[Any] = ()) -> None:
@@ -658,8 +1031,8 @@ class Database:
                     asset_classes, execution_model, supports_short, data_requirements_json,
                    strategy_family, lifecycle, scan_enabled, backtest_enabled, runtime_adapter,
                     plugin_api_version, plugin_origin, framework_id, policy_version, archived,
-                    updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    category, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(strategy_id) DO UPDATE SET version=excluded.version, name=excluded.name,
                    description=excluded.description, frequency=excluded.frequency,
                    requires_approval=excluded.requires_approval, enabled=excluded.enabled,
@@ -674,6 +1047,7 @@ class Database:
                    framework_id=excluded.framework_id,
                    policy_version=excluded.policy_version,
                    archived=excluded.archived,
+                   category=excluded.category,
                    updated_at=excluded.updated_at""",
                 (
                     metadata.strategy_id,
@@ -700,19 +1074,194 @@ class Database:
                     metadata.framework_id,
                     metadata.policy_version,
                     int(metadata.archived),
+                    StrategyCategory(metadata.category).value,
                     now,
                 ),
             )
-            initial = self.config.portfolio.initial_cash * self.config.portfolio.strategy_budget_weight
-            connection.execute(
-                "INSERT OR IGNORE INTO paper_accounts(strategy_id, initial_cash, cash, updated_at) VALUES (?, ?, ?, ?)",
-                (metadata.strategy_id, initial, initial, now),
-            )
-            if metadata.archived:
+            category = StrategyCategory(metadata.category)
+            if category != StrategyCategory.RESEARCH_PROJECT:
+                initial = (
+                    self.config.portfolio.initial_cash
+                    * self.config.portfolio.strategy_budget_weight
+                )
+                connection.execute(
+                    "INSERT OR IGNORE INTO paper_accounts(strategy_id, initial_cash, cash, updated_at) VALUES (?, ?, ?, ?)",
+                    (metadata.strategy_id, initial, initial, now),
+                )
+            if metadata.archived or category == StrategyCategory.RESEARCH_PROJECT:
                 connection.execute(
                     "UPDATE paper_accounts SET frozen=1 WHERE strategy_id=?",
                     (metadata.strategy_id,),
                 )
+
+    def upsert_research_project(
+        self,
+        *,
+        project_id: str,
+        version: str,
+        name: str,
+        description: str,
+        status: str = "DATA_BUILDING",
+        data_asof: str | None = None,
+        data_gates: dict[str, Any] | None = None,
+    ) -> None:
+        now = datetime.now().astimezone().isoformat()
+        with self.connect() as connection:
+            existing = connection.execute(
+                "SELECT created_at FROM research_projects WHERE project_id=?",
+                (project_id,),
+            ).fetchone()
+            created_at = str(existing["created_at"]) if existing is not None else now
+            connection.execute(
+                """INSERT INTO research_projects
+                (project_id, version, name, description, category, lifecycle, status,
+                 data_asof, data_gates_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'research_project', 'RESEARCH_ONLY', ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    version=excluded.version,
+                    name=excluded.name,
+                    description=excluded.description,
+                    status=excluded.status,
+                    data_asof=excluded.data_asof,
+                    data_gates_json=excluded.data_gates_json,
+                    updated_at=excluded.updated_at""",
+                (
+                    project_id,
+                    version,
+                    name,
+                    description,
+                    status,
+                    data_asof,
+                    json.dumps(data_gates or {}, ensure_ascii=False),
+                    created_at,
+                    now,
+                ),
+            )
+
+    def update_research_project(
+        self,
+        project_id: str,
+        *,
+        status: str,
+        data_asof: str | None = None,
+        data_gates: dict[str, Any] | None = None,
+    ) -> None:
+        now = datetime.now().astimezone().isoformat()
+        fields = ["status=?", "updated_at=?"]
+        values: list[Any] = [status, now]
+        if data_asof is not None:
+            fields.append("data_asof=?")
+            values.append(data_asof)
+        if data_gates is not None:
+            fields.append("data_gates_json=?")
+            values.append(json.dumps(data_gates, ensure_ascii=False))
+        values.append(project_id)
+        self.execute(
+            f"UPDATE research_projects SET {', '.join(fields)} WHERE project_id=?",
+            values,
+        )
+
+    def save_research_data_batch(self, record: dict[str, Any]) -> None:
+        columns = (
+            "batch_id",
+            "project_id",
+            "dataset",
+            "source",
+            "status",
+            "fetched_at",
+            "published_start",
+            "published_end",
+            "row_count",
+            "path",
+            "content_hash",
+            "schema_hash",
+            "metadata_json",
+            "error",
+        )
+        values = dict(record)
+        values["metadata_json"] = json.dumps(values.pop("metadata", {}), ensure_ascii=False)
+        with self.connect() as connection:
+            connection.execute(
+                f"INSERT OR REPLACE INTO research_data_batches ({','.join(columns)}) "
+                f"VALUES ({','.join('?' for _ in columns)})",
+                [values.get(column) for column in columns],
+            )
+
+    def replace_research_candidates(
+        self,
+        project_id: str,
+        method: str,
+        asof: str,
+        candidates: Iterable[dict[str, Any]],
+    ) -> None:
+        rows = list(candidates)
+        with self.connect() as connection:
+            connection.execute(
+                "DELETE FROM research_candidates WHERE project_id=? AND method=? AND asof=?",
+                (project_id, method, asof),
+            )
+            if not rows:
+                return
+            connection.executemany(
+                """INSERT INTO research_candidates
+                (candidate_id, project_id, run_id, strategy_id, method, asof, code,
+                 name, industry, rank, score, probability, factor_json, gate_json,
+                 evidence_refs_json, snapshot_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        row["candidate_id"],
+                        project_id,
+                        row["run_id"],
+                        row["strategy_id"],
+                        method,
+                        asof,
+                        row["code"],
+                        row.get("name", ""),
+                        row.get("industry", ""),
+                        int(row["rank"]),
+                        float(row["score"]),
+                        row.get("probability"),
+                        json.dumps(row.get("factors", {}), ensure_ascii=False),
+                        json.dumps(row.get("gates", {}), ensure_ascii=False),
+                        json.dumps(row.get("evidence_refs", []), ensure_ascii=False),
+                        row.get("snapshot_id", ""),
+                        row["created_at"],
+                    )
+                    for row in rows
+                ],
+            )
+
+    def save_research_model(self, record: dict[str, Any]) -> None:
+        values = dict(record)
+        values["metrics_json"] = json.dumps(values.pop("metrics", {}), ensure_ascii=False)
+        values["metadata_json"] = json.dumps(values.pop("metadata", {}), ensure_ascii=False)
+        columns = tuple(values)
+        with self.connect() as connection:
+            connection.execute(
+                f"INSERT OR REPLACE INTO research_models ({','.join(columns)}) "
+                f"VALUES ({','.join('?' for _ in columns)})",
+                [values[column] for column in columns],
+            )
+
+    def save_research_validation(self, record: dict[str, Any]) -> None:
+        values = dict(record)
+        for key in (
+            "rule_metrics",
+            "ml_metrics",
+            "baseline_metrics",
+            "stress_metrics",
+            "gates",
+            "champion",
+        ):
+            values[f"{key}_json"] = json.dumps(values.pop(key, {}), ensure_ascii=False)
+        columns = tuple(values)
+        with self.connect() as connection:
+            connection.execute(
+                f"INSERT OR REPLACE INTO research_validations ({','.join(columns)}) "
+                f"VALUES ({','.join('?' for _ in columns)})",
+                [values[column] for column in columns],
+            )
 
     def upsert_strategy_group(self, group: StrategyGroupDefinition) -> None:
         now = datetime.now().astimezone().isoformat()
@@ -887,7 +1436,7 @@ class Database:
                 raise KeyError(intent_id)
             if intent["status"] != SignalStatus.PROPOSED.value:
                 raise ValueError(f"Order group is not pending approval: {intent['status']}")
-            if now > intent["valid_until"]:
+            if pd.Timestamp(now).timestamp() > pd.Timestamp(intent["valid_until"]).timestamp():
                 connection.execute(
                     "UPDATE order_group_intents SET status=? WHERE intent_id=?",
                     (SignalStatus.EXPIRED.value, intent_id),
@@ -987,7 +1536,7 @@ class Database:
                 ).fetchone()
                 if account is not None and bool(account["frozen"]):
                     raise ValueError("Archived strategy account is frozen")
-            if now > signal["valid_until"]:
+            if pd.Timestamp(now).timestamp() > pd.Timestamp(signal["valid_until"]).timestamp():
                 connection.execute(
                     "UPDATE signals SET status=? WHERE signal_id=?",
                     (SignalStatus.EXPIRED.value, signal_id),
@@ -1026,7 +1575,7 @@ class Database:
                     now,
                 ),
             )
-            if decision == SignalStatus.APPROVED and signal["side"] == "BUY":
+            if decision == SignalStatus.APPROVED:
                 connection.execute(
                     """INSERT OR IGNORE INTO paper_orders
                     (order_id, signal_id, strategy_id, code, side, status, signal_time, target_weight, reason)
@@ -1039,12 +1588,24 @@ class Database:
         return self.query("SELECT * FROM signals WHERE signal_id=?", (signal_id,))[0]
 
     def expire_signals(self, now: datetime) -> int:
+        now_epoch = pd.Timestamp(now).timestamp()
+        candidates = self.query(
+            "SELECT signal_id, valid_until FROM signals WHERE status=?",
+            (SignalStatus.PROPOSED.value,),
+        )
+        expired = [
+            str(item["signal_id"])
+            for item in candidates
+            if pd.Timestamp(item["valid_until"]).timestamp() < now_epoch
+        ]
+        if not expired:
+            return 0
         with self.connect() as connection:
-            cursor = connection.execute(
-                "UPDATE signals SET status=? WHERE status=? AND valid_until<?",
-                (SignalStatus.EXPIRED.value, SignalStatus.PROPOSED.value, now.isoformat()),
+            connection.executemany(
+                "UPDATE signals SET status=? WHERE signal_id=?",
+                [(SignalStatus.EXPIRED.value, signal_id) for signal_id in expired],
             )
-            return cursor.rowcount
+        return len(expired)
 
     def list_signals(self, limit: int = 200, status: str | None = None) -> list[dict[str, Any]]:
         if status:

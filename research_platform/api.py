@@ -10,7 +10,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .ai_research import AIResearchService
 from .backtest_engine import BacktestService
@@ -22,6 +22,13 @@ from .composition import (
 )
 from .config import PlatformConfig
 from .data_cache import DataCacheManager
+from .early_winner_research import (
+    ResearchDataBlockedError,
+)
+from .strategies.early_winner_v2 import PROJECT_ID as EARLY_WINNER_V2_PROJECT_ID
+from .strategies.early_winner_v3 import PROJECT_ID as EARLY_WINNER_V3_PROJECT_ID
+from .strategies.early_winner_v4 import PROJECT_ID as EARLY_WINNER_V4_PROJECT_ID
+from .strategies.early_winner_v5 import PROJECT_ID as EARLY_WINNER_V5_PROJECT_ID
 from .feedback import FeedbackService
 from .jobs import JobManager
 from .models import SignalStatus
@@ -30,7 +37,7 @@ from .strategy_lab import StrategyLabService
 
 
 class ScanRequest(BaseModel):
-    strategies: list[str] = Field(default_factory=lambda: ["combined"])
+    strategies: list[str] = Field(default_factory=lambda: ["course49_system"])
     mode: Literal["research", "paper"] = "research"
     push_tdx: bool = False
     refresh_sectors: bool = False
@@ -41,12 +48,15 @@ class ScanRequest(BaseModel):
 
 
 class BacktestRequest(BaseModel):
-    strategy_id: str = Field(default="combined", min_length=1, max_length=64)
+    strategy_id: str = Field(default="course49_system", min_length=1, max_length=64)
     start_date: str | None = None
     end_date: str | None = None
     daily_bars: int = Field(default=180, ge=90, le=2000)
     max_stocks: int | None = Field(default=None, ge=1)
-    universe: Literal["all_a", "main_board", "growth", "star", "beijing", "custom"] = "all_a"
+    universe: Literal[
+        "all_a", "main_board", "growth", "star", "beijing", "all_us",
+        "sp500_ivv_proxy_v1", "custom"
+    ] = "all_a"
     stock_codes: list[str] = Field(default_factory=list, max_length=500)
     refresh_sectors: bool = False
     sampling_mode: Literal["full", "stratified"] = "full"
@@ -54,6 +64,26 @@ class BacktestRequest(BaseModel):
     execution_cost_multiplier: float = Field(default=1.0, ge=0.0, le=5.0)
     refresh_data: bool = False
     playbook_ids: list[str] = Field(default_factory=list, max_length=20)
+    pit_release_id: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+    @model_validator(mode="after")
+    def validate_strict_us_contract(self) -> "BacktestRequest":
+        if self.strategy_id != "us_momentum_v1":
+            return self
+        if self.universe != "sp500_ivv_proxy_v1":
+            raise ValueError("us_momentum_v1 requires sp500_ivv_proxy_v1")
+        if not self.pit_release_id:
+            raise ValueError("us_momentum_v1 requires a DATA_READY pit_release_id")
+        if self.stock_codes or self.max_stocks is not None or self.sampling_mode != "full":
+            raise ValueError("strict US backtests prohibit custom codes and sampling")
+        if self.refresh_data or self.refresh_sectors:
+            raise ValueError("strict US backtests only use the immutable release")
+        return self
 
 
 class BacktestReplayRequest(BaseModel):
@@ -76,6 +106,11 @@ class DecisionRequest(BaseModel):
 
 class BriefRequest(BaseModel):
     run_id: str = Field(min_length=1, max_length=64)
+
+
+class EarlyWinnerHistoryBuildRequest(BaseModel):
+    start_year: int = Field(default=2018, ge=2000, le=2100)
+    end_year: int = Field(default=2025, ge=2000, le=2100)
 
 
 class ExperimentRequest(BaseModel):
@@ -125,6 +160,23 @@ def create_app(config: PlatformConfig | None = None) -> FastAPI:
     ai_research = AIResearchService(service.config, service.database)
     feedback = FeedbackService(service.config, service.database)
     strategy_lab = StrategyLabService(service.config, service.database)
+    early_winner = service.early_winner
+    early_winner_v2 = service.early_winner_v2
+    early_winner_v3 = service.early_winner_v3
+    early_winner_v4 = service.early_winner_v4
+    early_winner_v5 = service.early_winner_v5
+    early_winner_v6 = service.early_winner_v6
+    early_winner_trading = service.early_winner_trading
+    from .us_paper import USMomentumPaperService, USPaperConfig
+    from .us_pit import USPITService
+    from .us_program import USMomentumProgram
+    from .us_tdx import check_tq_preflight
+
+    us_pit = USPITService(service.config.us_pit_dir)
+    us_paper = USMomentumPaperService(
+        USPaperConfig(database_path=service.config.us_paper_database_path)
+    )
+    us_program = USMomentumProgram(service.config.us_program_database_path)
     app = FastAPI(title="通达信多策略投研平台", version="0.3.0", docs_url="/api/docs")
     app.add_middleware(
         CORSMiddleware,
@@ -141,6 +193,43 @@ def create_app(config: PlatformConfig | None = None) -> FastAPI:
     @app.get("/api/sources")
     def sources() -> list[dict[str, object]]:
         return service.data_hub.sources.as_records()
+
+    @app.get("/api/data/us-pit/releases")
+    def us_pit_releases() -> list[dict[str, Any]]:
+        return us_pit.list_releases()
+
+    @app.get("/api/data/us-pit/releases/{release_id}")
+    def us_pit_release(release_id: str) -> dict[str, Any]:
+        try:
+            return us_pit.release_detail(release_id)
+        except (FileNotFoundError, KeyError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail="US PIT release not found") from exc
+
+    @app.get("/api/data/us-pit/releases/{release_id}/quality")
+    def us_pit_quality(release_id: str) -> dict[str, Any]:
+        try:
+            return us_pit.validate_release(release_id).to_dict()
+        except (FileNotFoundError, KeyError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail="US PIT release not found") from exc
+
+    @app.get("/api/us-paper/status")
+    def us_paper_status() -> dict[str, Any]:
+        payload = us_paper.status()
+        preflight = check_tq_preflight(portable_root=config.tdx_root).as_dict()
+        program = us_program.status()
+        payload["deployment_gate"] = preflight
+        payload["broker_writes_enabled"] = False
+        payload["program"] = program
+        # Connectivity is only the prerequisite for the separate 20-session
+        # quote qualification.  It never promotes an empty account by itself.
+        payload["qualification"] = program["state"]
+        payload["qualification_detail"] = (
+            "The executor is admitted only after DATA_READY, BACKTEST_QUALIFIED "
+            "and the 20-session TDX qualification."
+            if preflight["ready"]
+            else "TDX deployment preflight is not ready."
+        )
+        return payload
 
     @app.get("/api/strategies")
     def strategies() -> list[dict[str, Any]]:
@@ -337,6 +426,7 @@ def create_app(config: PlatformConfig | None = None) -> FastAPI:
             execution_cost_multiplier=request.execution_cost_multiplier,
             refresh_data=request.refresh_data,
             playbook_ids=request.playbook_ids,
+            pit_release_id=request.pit_release_id,
         )
         return {"job_id": job_id, "status": "QUEUED"}
 
@@ -344,7 +434,7 @@ def create_app(config: PlatformConfig | None = None) -> FastAPI:
     def replay_backtest(request: BacktestReplayRequest) -> dict[str, str]:
         job_id = jobs.submit(
             "backtest",
-            backtests.replay_course49,
+            backtests.replay_backtest,
             request.source_backtest_id,
             strategy_id=request.strategy_id,
             start_date=request.start_date,
@@ -452,6 +542,185 @@ def create_app(config: PlatformConfig | None = None) -> FastAPI:
             "status": "QUEUED",
         }
 
+    @app.get("/api/research/early-winner")
+    def early_winner_detail() -> dict[str, Any]:
+        return early_winner.detail()
+
+    @app.get("/api/research/early-winner-v2")
+    def early_winner_v2_detail() -> dict[str, Any]:
+        return early_winner_v2.detail()
+
+    @app.post("/api/research/early-winner-v2/development-audit", status_code=202)
+    def audit_early_winner_v2() -> dict[str, str]:
+        active = jobs.active("early_winner_v2_project")
+        if active:
+            return {"job_id": str(active["job_id"]), "status": str(active["status"])}
+
+        def run_action(progress_callback: Any | None = None) -> dict[str, Any]:
+            try:
+                return early_winner_v2.run_development_audit(
+                    progress_callback=progress_callback
+                )
+            except ResearchDataBlockedError as exc:
+                service.database.update_research_project(
+                    EARLY_WINNER_V2_PROJECT_ID,
+                    status="BLOCKED_DATA",
+                )
+                return {
+                    "project_id": EARLY_WINNER_V2_PROJECT_ID,
+                    "status": "BLOCKED_DATA",
+                    "error": str(exc),
+                    "trade_signals": 0,
+                }
+
+        return {
+            "job_id": jobs.submit("early_winner_v2_project", run_action),
+            "status": "QUEUED",
+        }
+
+    @app.get("/api/research/early-winner-v3")
+    def early_winner_v3_detail() -> dict[str, Any]:
+        return early_winner_v3.detail()
+
+    def submit_early_winner_v3(action: str) -> dict[str, str]:
+        active = jobs.active("early_winner_v3_project")
+        if active:
+            return {"job_id": str(active["job_id"]), "status": str(active["status"])}
+
+        def run_action(progress_callback: Any | None = None) -> dict[str, Any]:
+            try:
+                if action == "supplement":
+                    return early_winner_v3.build_supplemental_snapshot(
+                        progress_callback=progress_callback
+                    )
+                if action == "development-audit":
+                    return early_winner_v3.run_development_audit(
+                        progress_callback=progress_callback
+                    )
+                raise ValueError(action)
+            except ResearchDataBlockedError as exc:
+                service.database.update_research_project(
+                    EARLY_WINNER_V3_PROJECT_ID, status="BLOCKED_DATA"
+                )
+                return {
+                    "project_id": EARLY_WINNER_V3_PROJECT_ID,
+                    "status": "BLOCKED_DATA",
+                    "error": str(exc),
+                    "trade_signals": 0,
+                }
+
+        return {
+            "job_id": jobs.submit("early_winner_v3_project", run_action),
+            "status": "QUEUED",
+        }
+
+    @app.post("/api/research/early-winner-v3/supplement", status_code=202)
+    def supplement_early_winner_v3() -> dict[str, str]:
+        return submit_early_winner_v3("supplement")
+
+    @app.post("/api/research/early-winner-v3/development-audit", status_code=202)
+    def audit_early_winner_v3() -> dict[str, str]:
+        return submit_early_winner_v3("development-audit")
+
+    @app.get("/api/research/early-winner-v4")
+    def early_winner_v4_detail() -> dict[str, Any]:
+        return early_winner_v4.detail()
+
+    @app.get("/api/research/early-winner-v5")
+    def early_winner_v5_detail() -> dict[str, Any]:
+        """Read-only V5 preregistration. Frozen validation has no API action."""
+
+        return early_winner_v5.detail()
+
+    @app.get("/api/research/early-winner-v6")
+    def early_winner_v6_detail() -> dict[str, Any]:
+        """Read-only V6 protocol and frozen-ledger status."""
+
+        return early_winner_v6.detail()
+
+    def submit_early_winner_v4(action: str) -> dict[str, str]:
+        active = jobs.active("early_winner_v4_project")
+        if active:
+            return {"job_id": str(active["job_id"]), "status": str(active["status"])}
+
+        def run_action(progress_callback: Any | None = None) -> dict[str, Any]:
+            try:
+                if action == "build-labels":
+                    return early_winner_v4.build_label_snapshot(
+                        progress_callback=progress_callback
+                    )
+                if action == "development-audit":
+                    return early_winner_v4.run_development_audit(
+                        progress_callback=progress_callback
+                    )
+                raise ValueError(action)
+            except Exception:
+                service.database.update_research_project(
+                    EARLY_WINNER_V4_PROJECT_ID, status="BLOCKED_DATA"
+                )
+                raise
+
+        return {
+            "job_id": jobs.submit("early_winner_v4_project", run_action),
+            "status": "QUEUED",
+        }
+
+    @app.post("/api/research/early-winner-v4/build-labels", status_code=202)
+    def build_early_winner_v4_labels() -> dict[str, str]:
+        return submit_early_winner_v4("build-labels")
+
+    @app.post("/api/research/early-winner-v4/development-audit", status_code=202)
+    def audit_early_winner_v4() -> dict[str, str]:
+        return submit_early_winner_v4("development-audit")
+
+    @app.get("/api/research/early-winner/candidates")
+    def early_winner_candidates(
+        method: Literal["rule", "ml"] | None = None,
+        asof: str | None = None,
+    ) -> list[dict[str, Any]]:
+        try:
+            return early_winner.candidates(method=method, asof=asof)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/research/early-winner/refresh", status_code=202)
+    def refresh_early_winner() -> dict[str, str]:
+        raise HTTPException(
+            status_code=410,
+            detail="early_winner_v1 is audit-only; use a newly sealed research version",
+        )
+
+    @app.post("/api/research/early-winner/train", status_code=202)
+    def train_early_winner() -> dict[str, str]:
+        raise HTTPException(
+            status_code=410,
+            detail="early_winner_v1 is audit-only; use a newly sealed research version",
+        )
+
+    @app.post("/api/research/early-winner/validate", status_code=202)
+    def validate_early_winner() -> dict[str, str]:
+        raise HTTPException(
+            status_code=410,
+            detail="early_winner_v1 is audit-only; use a newly sealed research version",
+        )
+
+    @app.get("/api/research/early-winner/history/status")
+    def early_winner_history_status() -> dict[str, Any]:
+        return early_winner.history_status()
+
+    @app.post("/api/research/early-winner/history/build", status_code=202)
+    def build_early_winner_history(request: EarlyWinnerHistoryBuildRequest) -> dict[str, str]:
+        if request.end_year < request.start_year:
+            raise HTTPException(status_code=422, detail="end_year must not precede start_year")
+        raise HTTPException(
+            status_code=410,
+            detail="early_winner_v1 history builder is retired after the survivorship-bias audit",
+        )
+
+    # This application profile is research + paper-only.  Legacy real-trading
+    # routes are deliberately not mounted; callers receive 404 instead of a
+    # feature that could be enabled by configuration or an operator token.
+
     @app.post("/api/research/briefs", status_code=202)
     def generate_brief(request: BriefRequest) -> dict[str, str]:
         active = jobs.active("research_brief")
@@ -485,6 +754,95 @@ def create_app(config: PlatformConfig | None = None) -> FastAPI:
     @app.get("/api/research/feedback/summary")
     def feedback_summary() -> dict[str, Any]:
         return feedback.summary()
+
+    @app.post("/api/research/weekly-triangle/observations/refresh", status_code=202)
+    def refresh_weekly_triangle_observations() -> dict[str, str]:
+        active = jobs.active("weekly_triangle_observations")
+        if active:
+            return {"job_id": str(active["job_id"]), "status": str(active["status"])}
+        return {
+            "job_id": jobs.submit(
+                "weekly_triangle_observations",
+                service.weekly_triangle_observations.refresh,
+            ),
+            "status": "QUEUED",
+        }
+
+    @app.get("/api/research/weekly-triangle/observations")
+    def weekly_triangle_observations(
+        limit: int = Query(default=200, ge=1, le=1000),
+    ) -> dict[str, Any]:
+        return service.weekly_triangle_observations.summary(limit)
+
+    @app.get("/api/research/weekly-triangle/setup-stability")
+    def weekly_triangle_setup_stability() -> dict[str, Any]:
+        path = (
+            service.config.repository_root
+            / "data"
+            / "research"
+            / "weekly_triangle_v1"
+            / "setup_stability.json"
+        )
+        if not path.exists():
+            return {"status": "NOT_AVAILABLE", "path": str(path)}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Weekly triangle setup study is unreadable: {exc}",
+            ) from exc
+        payload["status"] = (
+            "PROMOTION_QUALIFIED"
+            if payload.get("promotion_qualified")
+            else "RESEARCH_ONLY"
+        )
+        payload["path"] = str(path)
+        return payload
+
+    @app.get("/api/research/pairs-arbitrage/validation")
+    def pairs_arbitrage_validation() -> dict[str, Any]:
+        path = (
+            service.config.repository_root
+            / "data"
+            / "research"
+            / "pairs_arbitrage_v1"
+            / "historical_validation.json"
+        )
+        if not path.exists():
+            return {"status": "NOT_AVAILABLE", "path": str(path)}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Pairs-arbitrage validation is unreadable: {exc}",
+            ) from exc
+        payload["status"] = str(payload.get("decision") or "UNKNOWN")
+        payload["path"] = str(path)
+        return payload
+
+    @app.get("/api/research/chan/validation")
+    def chan_validation() -> dict[str, Any]:
+        path = (
+            service.config.repository_root
+            / "data"
+            / "research"
+            / "chan_v1"
+            / "historical_validation.json"
+        )
+        if not path.exists():
+            return {"status": "NOT_AVAILABLE", "path": str(path)}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Chan validation is unreadable: {exc}",
+            ) from exc
+        payload["status"] = str(payload.get("decision") or "UNKNOWN")
+        payload["path"] = str(path)
+        return payload
 
     @app.post("/api/research/experiments", status_code=202)
     def create_experiment(request: ExperimentRequest) -> dict[str, str]:

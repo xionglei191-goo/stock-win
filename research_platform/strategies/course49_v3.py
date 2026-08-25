@@ -181,8 +181,18 @@ class Course49V3Strategy(Course49V2Strategy):
         names: dict[str, str],
         sector_members: dict[str, dict[str, Any]],
         feature_matrix: dict[str, pd.DataFrame] | None = None,
+        asof: pd.Timestamp | None = None,
+        eligible_codes: set[str] | None = None,
     ) -> list[dict[str, Any]]:
-        del front_bars, raw_bars, names, sector_members, feature_matrix
+        del (
+            front_bars,
+            raw_bars,
+            names,
+            sector_members,
+            feature_matrix,
+            asof,
+            eligible_codes,
+        )
         return []
 
     def leader_in_entry_scope(

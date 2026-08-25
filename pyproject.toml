@@ -9,18 +9,31 @@ description = "Local multi-strategy research platform backed by TongdaXin data"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "cryptography>=44,<47",
   "fastapi>=0.115",
+  "exchange-calendars==4.13.2",
   "numpy>=2.0",
   "pandas>=2.2",
   "pyarrow>=18",
+  "pypdf>=5,<7",
   "pydantic>=2.10",
   "openai>=2,<3",
   "psutil>=6",
+  "requests>=2.32,<3",
+  "scikit-learn>=1.5,<2",
   "uvicorn>=0.34",
 ]
 
 [project.optional-dependencies]
-dev = ["httpx>=0.28"]
+dev = [
+  "httpx>=0.28",
+  "ipykernel>=6,<8",
+  "nbclient>=0.10,<1",
+  "nbformat>=5.10,<6",
+]
+us-data = [
+  "akshare==1.18.84",
+]
 
 [tool.setuptools.packages.find]
 include = ["research_platform*", "strategy_v1*"]

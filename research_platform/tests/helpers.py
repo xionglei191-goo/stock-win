@@ -15,5 +15,10 @@ def temporary_config(root: Path) -> PlatformConfig:
         snapshot_dir=root / "data" / "snapshots",
         frontend_dist=root / "frontend" / "dist",
         strategy_lab_dir=root / "data" / "strategy_lab",
+        us_pit_dir=root / "data" / "us_pit",
+        us_paper_database_path=root / "data" / "us_paper.db",
+        us_paper_runtime_database_path=root / "data" / "us_paper_runtime.db",
+        us_program_database_path=root / "data" / "us_momentum_program.db",
+        us_tdx_shadow_database_path=root / "data" / "us_tdx_shadow.db",
         strategy_plugin_dir=root / "strategy_plugins",
     )

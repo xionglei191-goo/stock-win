@@ -188,7 +188,7 @@ export type Backtest = {
   error?: string
 }
 
-export type BacktestUniverse = 'all_a' | 'main_board' | 'growth' | 'star' | 'beijing' | 'custom'
+export type BacktestUniverse = 'all_a' | 'main_board' | 'growth' | 'star' | 'beijing' | 'all_us' | 'sp500_ivv_proxy_v1' | 'custom'
 export type SamplingMode = 'full' | 'stratified'
 export type StrategyId = string
 
@@ -205,6 +205,7 @@ export type BacktestRequest = {
   execution_cost_multiplier: number
   refresh_data: boolean
   playbook_ids?: string[]
+  pit_release_id?: string
 }
 
 export type BacktestReplayRequest = {
@@ -296,6 +297,20 @@ export type BacktestMetrics = {
   execution_model?: 'SINGLE_LEG' | 'MULTI_LEG'
   components?: Record<string, BacktestMetrics>
   playbook_attribution?: AttributionRow[]
+  execution_funnel?: ExecutionFunnel
+}
+
+export type ExecutionFunnel = {
+  generated_buy_signals: number
+  attempted_next_open: number
+  filled_buy_orders: number
+  blocked_limit_up_open: number
+  blocked_open_gap: number
+  blocked_portfolio: number
+  blocked_insufficient_cash: number
+  blocked_missing_bars: number
+  fill_rate: number
+  by_playbook: Record<string, Omit<ExecutionFunnel, 'by_playbook'>>
 }
 
 export type AttributionRow = {
@@ -397,6 +412,115 @@ export type DataRequirement = {
   available?: boolean
 }
 
+export type USPITQualityIssue = {
+  code: string
+  severity: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW'
+  dataset: string
+  message: string
+  evidence: Record<string, unknown>
+}
+
+export type USPITQualityReport = {
+  policy_version: string
+  status: 'DATA_READY' | 'DATA_BLOCKED'
+  includes_delisted: boolean
+  issues: USPITQualityIssue[]
+  metrics: Record<string, unknown>
+}
+
+export type USPITReleaseSummary = {
+  release_id: string
+  universe_id: 'sp500_ivv_proxy_v1'
+  created_at: string
+  status: 'DATA_READY' | 'DATA_BLOCKED'
+  includes_delisted: boolean
+  quality_policy_version: string
+  artifact_count: number
+  source_count: number
+  certified_start?: string | null
+  certified_end?: string | null
+  metrics?: Record<string, unknown>
+  quality?: USPITQualityReport
+  quality_report?: USPITQualityReport
+}
+
+export type USPITArtifact = {
+  name: string
+  filename: string
+  object_sha256: string
+  size_bytes: number
+  media_type: string
+  row_count?: number | null
+  schema_sha256?: string | null
+}
+
+export type USPITSource = {
+  source_id: string
+  source_version: string
+  role: string
+  license_class: string
+  object_sha256: string
+  observed_at: string
+  url: string
+  dataset: string
+  as_of_date?: string | null
+  published_at?: string | null
+  metadata?: Record<string, unknown>
+}
+
+export type USPITReleaseDetail = USPITReleaseSummary & {
+  format_version: string
+  artifacts: Record<string, USPITArtifact>
+  sources: USPITSource[]
+  metadata: Record<string, unknown>
+}
+
+export type USPaperAccount = {
+  account_id?: string
+  status: string
+  initial_cash?: number
+  cash?: number
+  updated_at?: string
+  degraded_reason?: string
+  killed_at?: string | null
+  kill_reason?: string
+  [key: string]: unknown
+}
+
+export type USPaperGate = {
+  status?: string
+  detail?: string
+  reason?: string
+  [key: string]: unknown
+}
+
+export type USPaperStatus = {
+  mode: 'PAPER'
+  paper_only: true
+  status?: string
+  account: USPaperAccount
+  periods?: Array<Record<string, unknown>>
+  orders: Array<Record<string, unknown>>
+  positions: Array<Record<string, unknown>>
+  fills: Array<Record<string, unknown>>
+  events: Array<Record<string, unknown>>
+  deployment_gate?: string | USPaperGate
+  qualification?: string | USPaperGate
+  qualification_detail?: string
+  broker_writes_enabled?: boolean
+  program?: {
+    state: 'DATA_BLOCKED' | 'DATA_READY' | 'BACKTEST_QUALIFIED' | 'PAPER_COLLECTING' | 'PAPER_QUALIFIED' | 'HISTORICAL_FAILED' | 'PAPER_BLOCKED'
+    release_id?: string | null
+    data_ready?: boolean
+    historical_qualified?: boolean
+    tdx_qualified?: boolean
+    paper_qualified?: boolean
+    broker_writes_enabled: false
+    [key: string]: unknown
+  }
+  heartbeat?: Record<string, unknown> | null
+}
+
 export type StrategyPlugin = {
   strategy_id: string
   version: string
@@ -413,12 +537,13 @@ export type StrategyPlugin = {
   lifecycle: string
   scan_enabled: boolean
   backtest_enabled: boolean
-  runtime_adapter: 'chan_daily' | 'course49_daily' | 'generic_daily'
+  runtime_adapter: 'chan_daily' | 'course49_daily' | 'generic_daily' | 'us_strict'
   plugin_api_version: string
   plugin_origin: string
   framework_id: string
   policy_version: string
   archived: boolean
+  category: 'independent' | 'research_project'
 }
 
 export type StrategyGroupMember = {
@@ -442,7 +567,7 @@ export type StrategyGroup = {
   scan_block_reason: string
   backtest_block_reason: string
   members: StrategyGroupMember[]
-  category?: 'framework' | 'independent' | 'research_archive'
+  category?: 'framework' | 'independent' | 'research_archive' | 'research_project'
 }
 
 export type StrategyGroupDraft = Omit<
@@ -463,6 +588,339 @@ export type StrategyCatalog = {
   groups: StrategyGroup[]
   frameworks: StrategyFramework[]
   plugin_issues: PluginLoadIssue[]
+}
+
+export type EarlyWinnerCandidate = {
+  candidate_id: string
+  project_id: string
+  strategy_id: string
+  method: 'rule' | 'ml'
+  asof: string
+  code: string
+  name: string
+  industry: string
+  rank: number
+  score: number
+  probability?: number | null
+  factor: Record<string, number>
+  gate: Record<string, boolean>
+  evidence_refs: string[]
+  snapshot_id: string
+}
+
+export type EarlyWinnerProject = {
+  project_id: 'early_winner_v1'
+  version: string
+  name: string
+  description: string
+  category: 'research_project'
+  lifecycle: 'RESEARCH_ONLY'
+  status: 'DATA_BUILDING' | 'VALIDATING' | 'OBSERVATION_ONLY' | 'BLOCKED_DATA' | 'VALIDATION_REJECTED'
+  data_asof?: string | null
+  data_gates: Record<string, { ready?: boolean; status?: string; detail?: string; row_count?: number }>
+  strategies: Array<Pick<StrategyPlugin, 'strategy_id' | 'version' | 'name' | 'lifecycle' | 'category' | 'scan_enabled' | 'backtest_enabled'>>
+  latest_model: Record<string, unknown> | null
+  latest_validation: Record<string, unknown> | null
+  latest_batches: Array<Record<string, unknown>>
+  history: {
+    status: string
+    artifact_status?: string
+    evidence_retained?: boolean
+    trust_policy?: {
+      ready?: boolean
+      status?: string
+      version?: string
+      reasons?: string[]
+    }
+  }
+  stored_status?: string
+  candidates: { rule: EarlyWinnerCandidate[]; ml: EarlyWinnerCandidate[] }
+  overlap: string[]
+  trade_signals_enabled: false
+  tdx_push_enabled: false
+  promotion_allowed: false
+  write_actions_enabled: false
+  candidate_generation_enabled: false
+  artifacts_audit_only: true
+}
+
+export type EarlyWinnerV2DevelopmentAudit = {
+  validation_id: string
+  status: string
+  snapshot_id: string
+  ml_metrics: Record<string, unknown>
+  baseline_metrics: Record<string, unknown>
+  stress_metrics: Record<string, unknown>
+  gates: Record<string, { yearly?: Record<string, boolean>; passed?: boolean }>
+  error: string
+}
+
+export type EarlyWinnerV2Project = {
+  project_id: 'early_winner_v2'
+  version: string
+  name: string
+  description: string
+  category: 'research_project'
+  lifecycle: 'RESEARCH_ONLY'
+  status: 'DEVELOPMENT_AUDIT_REQUIRED' | 'DEVELOPMENT_AUDITING' | 'DEVELOPMENT_REJECTED' | 'DEVELOPMENT_READY' | 'BLOCKED_DATA'
+  data_asof?: string | null
+  data_gates: Record<string, { ready?: boolean; status?: string; detail?: string; row_count?: number }>
+  strategy: Pick<StrategyPlugin, 'strategy_id' | 'version' | 'name' | 'lifecycle' | 'category' | 'scan_enabled' | 'backtest_enabled'>
+  development_years: number[]
+  excluded_tuning_years: number[]
+  forward_year: number
+  forward_validation_opened: false
+  candidate_generation_enabled: false
+  trade_signals_enabled: false
+  promotion_allowed: false
+  latest_development_audit: EarlyWinnerV2DevelopmentAudit | null
+  latest_batches: Array<Record<string, unknown>>
+}
+
+export type EarlyWinnerV3Project = Omit<EarlyWinnerV2Project,
+  'project_id' | 'status' | 'forward_year' | 'forward_validation_opened'> & {
+  project_id: 'early_winner_v3'
+  status: 'DATA_BUILDING' | 'DEVELOPMENT_AUDIT_REQUIRED' | 'DEVELOPMENT_AUDITING' | 'DEVELOPMENT_REJECTED' | 'DEVELOPMENT_READY' | 'BLOCKED_DATA'
+  frozen_validation_opened: false
+}
+
+export type EarlyWinnerV4DataGate = {
+  ready?: boolean
+  status?: string
+  detail?: string
+  row_count?: number
+  promotion_blocked?: boolean
+  source_dataset_count?: number
+  required_source_dataset_count?: number
+  source_datasets?: string[]
+  missing_source_datasets?: string[]
+  finding_counts?: Record<string, number>
+  manifest_hash?: string
+  report_hash?: string
+}
+
+export type EarlyWinnerV4Project = Omit<EarlyWinnerV3Project,
+  'project_id' | 'status' | 'data_gates'> & {
+  project_id: 'early_winner_v4'
+  status: 'DATA_BUILDING' | 'DEVELOPMENT_AUDIT_REQUIRED' | 'DEVELOPMENT_AUDITING' | 'DEVELOPMENT_REJECTED' | 'DEVELOPMENT_READY' | 'BLOCKED_DATA'
+  data_gates: Record<string, EarlyWinnerV4DataGate>
+  protocol: {
+    holding_trading_days: 40
+    embargo_trading_days: 20
+    market_breadth_threshold: number
+    target_quantile: number
+    target_requires_positive_return: boolean
+    feature_set: string[]
+    random_seed: number
+  }
+}
+
+export type EarlyWinnerV5Project = {
+  project_id: 'early_winner_v5'
+  version: string
+  name: string
+  description: string
+  category: 'research_project'
+  lifecycle: 'RESEARCH_ONLY'
+  status: 'BLOCKED_DATA' | 'DESIGN_ONLY' | 'INCONCLUSIVE_SAMPLE' | 'VALIDATION_REJECTED' | 'OBSERVATION_ONLY'
+  data_asof?: string | null
+  data_gates: Record<string, {
+    ready?: boolean
+    status?: string
+    detail?: string
+    protocol_version?: string
+    protocol_hash?: string
+    snapshot_hash?: string
+  }>
+  strategy: Pick<StrategyPlugin, 'strategy_id' | 'version' | 'name' | 'lifecycle' | 'category' | 'scan_enabled' | 'backtest_enabled'>
+  protocol: {
+    protocol_version: string
+    candidate_rule: {
+      selected_event_score_strictly_positive: boolean
+      hard_negative_blocks_new_position: boolean
+      sort: string[]
+      portfolio_size: number
+      maximum_per_industry: number
+      unfilled_slots: 'CASH_NO_REFILL'
+      rank_before_entry_executable: boolean
+    }
+    evaluation: {
+      holding_trading_days: number
+      non_overlap_phases: number
+      baseline: string
+      paired_cycle_policy: string
+      cost_policy: string
+      drawdown_policy: string
+    }
+    protocol_change_policy: 'ANY_CHANGE_REQUIRES_V6'
+    promotion_allowed: false
+  }
+  protocol_hash: string
+  design_years: number[]
+  frozen_validation_years: number[]
+  observation_years: number[]
+  frozen_validation_opened: false
+  candidate_generation_enabled: false
+  trade_signals_enabled: false
+  promotion_allowed: false
+}
+
+export type EarlyWinnerV6OpenState =
+  | 'NOT_SEALED'
+  | 'SEALED'
+  | 'CONSUMING'
+  | 'RESULT_COMMITTED'
+  | 'FAILED_CLOSED'
+
+export type EarlyWinnerV6Gate = {
+  ready?: boolean
+  status?: string
+  detail?: string
+  [key: string]: unknown
+}
+
+export type EarlyWinnerV6Project = {
+  project_id: 'early_winner_v6'
+  version: string
+  name: string
+  description: string
+  category: 'research_project'
+  lifecycle: 'RESEARCH_ONLY'
+  status: string
+  data_asof?: string | null
+  data_gates: Record<string, EarlyWinnerV6Gate>
+  strategy: Pick<StrategyPlugin, 'strategy_id' | 'version' | 'name' | 'lifecycle' | 'category' | 'scan_enabled' | 'backtest_enabled'>
+  protocol: {
+    protocol_version: string
+    lifecycle: 'RESEARCH_ONLY'
+    candidate_rule: {
+      required_event_score: string
+      hard_negative: string
+      sort: string[]
+      industry_maximum: number
+      portfolio_size: number
+      unfilled_slot: string
+    }
+    frozen_open: {
+      manifest_version: string
+      formats: string[]
+      path_policy: string
+      per_shard_binding: string[]
+      database_state_machine: Array<Exclude<EarlyWinnerV6OpenState, 'NOT_SEALED'>>
+      one_open_only: boolean
+    }
+    event_provenance: Record<string, unknown>
+    dependency_lock: {
+      evaluator_bundle_hash: string
+      label_schema_hash: string
+      dependency_lock_hash: string
+      [key: string]: unknown
+    }
+    assessment: {
+      result_artifact: string
+      ranking_metrics_source: string
+      portfolio_metrics_source: string
+      any_change_requires: string
+      [key: string]: unknown
+    }
+  }
+  protocol_hash: string
+  design_years: number[]
+  frozen_validation_years: number[]
+  observation_years: number[]
+  historical_universe_master: EarlyWinnerV6Gate & {
+    snapshot_id?: string
+    manifest_hash?: string
+    coverage_start?: string
+    coverage_end?: string
+    promotion_blocked?: boolean
+  }
+  frozen_open_state: EarlyWinnerV6OpenState
+  frozen_validation_opened: boolean
+  candidate_generation_enabled: false
+  trade_signals_enabled: false
+  promotion_allowed: false
+  v5_disposition: {
+    status: 'PREREGISTRATION_REJECTED'
+    superseded_by: 'early_winner_v6'
+    v5_protocol_results_immutable: true
+    reasons: string[]
+  }
+}
+
+export type TradingOrderIntent = {
+  intent_id: string
+  code: string
+  name: string
+  industry: string
+  side: 'BUY' | 'SELL'
+  reason: string
+  target_weight: number
+  requested_quantity: number
+  limit_price?: number | null
+  status: string
+  automatic_risk_exit: number
+  evidence: Record<string, unknown>
+}
+
+export type TradingOrderBatch = {
+  batch_id: string
+  rebalance_date: string
+  execution_date: string
+  mode: 'SHADOW' | 'LIVE' | 'LIVE_RISK'
+  status: string
+  champion_hash: string
+  snapshot_id: string
+  generated_at: string
+  approval_deadline: string
+  approved_at?: string | null
+  decision_note: string
+  intents?: TradingOrderIntent[]
+}
+
+export type TradingQualificationMetrics = {
+  weeks: number
+  fills: number
+  exits: number
+  execution_rate: number
+  median_slippage: number
+  p95_slippage: number
+  data_success_rate?: number
+  point_in_time_failures?: number
+  duplicate_orders?: number
+  unauthorized_orders?: number
+  unresolved_reconciliations?: number
+  passed: boolean
+}
+
+export type EarlyWinnerTradingDeployment = {
+  deployment_id: string
+  strategy_id: 'early_winner_trade_v1'
+  project_id: 'early_winner_v1'
+  state: string
+  champion: Record<string, unknown>
+  validation_id: string
+  snapshot_id: string
+  account_alias: string
+  max_capital_cny?: number | null
+  max_account_fraction?: number | null
+  shadow_started_at?: string | null
+  pilot_started_at?: string | null
+  live_started_at?: string | null
+  funding_complete: boolean
+  live_write_enabled: boolean
+  account_configured: boolean
+  account_handle_persisted: false
+  operator_token_configured: boolean
+  scheduler_enabled: boolean
+  next_rebalance_date: string
+  latest_reconciliation: Record<string, unknown> | null
+  risk_events: Array<Record<string, unknown>>
+  order_batches: TradingOrderBatch[]
+  qualification: {
+    shadow: TradingQualificationMetrics
+    live_pilot: TradingQualificationMetrics
+  }
 }
 
 export type PlaybookState = {

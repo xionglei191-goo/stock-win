@@ -80,6 +80,8 @@ const strategyNames: Record<string, string> = {
   course49_v7: '49课 V7',
   course49_v8: '49课 V8',
   course49_v9: '49课 V9（留出否决）',
+  weekly_triangle_v1: '周线收敛三角形',
+  weekly_bull_platform_v1: '周线底部平台多头',
 }
 
 export function DecisionDialog({ signal, decision, pending, onClose, onConfirm }: {

@@ -163,6 +163,7 @@ class PaperBroker:
             stop_price=execution_price * (1 - self.config.risk.fixed_stop_loss),
             sector_code=order.sector_code,
             last_price=execution_price,
+            entry_fees=fee,
         )
         self.trades.append(
             {
@@ -188,7 +189,11 @@ class PaperBroker:
         value = execution_price * position.quantity
         fee = _commission(value, self.config) + value * self.config.costs.stamp_duty_rate
         self.state.cash += value - fee
-        pnl = (execution_price - position.average_price) * position.quantity - fee
+        pnl = (
+            (execution_price - position.average_price) * position.quantity
+            - fee
+            - position.entry_fees
+        )
         self.trades.append(
             {
                 "timestamp": timestamp.isoformat(),

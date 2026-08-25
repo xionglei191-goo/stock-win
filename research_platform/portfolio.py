@@ -75,6 +75,15 @@ class PaperPortfolio:
         fills: list[dict[str, Any]] = []
         orders = self.database.query("SELECT * FROM paper_orders WHERE status='PENDING' ORDER BY signal_time, order_id")
         for order in orders:
+            signal_rows = self.database.query(
+                "SELECT valid_until FROM signals WHERE signal_id=?",
+                (order["signal_id"],),
+            )
+            valid_until = (
+                pd.Timestamp(signal_rows[0]["valid_until"])
+                if signal_rows
+                else None
+            )
             frame = bars.get(order["code"])
             if frame is None or frame.empty or "Open" not in frame.columns:
                 continue
@@ -82,7 +91,19 @@ class PaperPortfolio:
             frame.index = pd.to_datetime(frame.index)
             signal_time = _align_timestamp(frame.index, pd.Timestamp(order["signal_time"]))
             candidates = frame[frame.index > signal_time]
+            if valid_until is not None:
+                comparable_valid_until = _align_timestamp(frame.index, valid_until)
+                candidates = candidates[candidates.index <= comparable_valid_until]
             if candidates.empty:
+                latest = pd.Timestamp(frame.index[-1])
+                if (
+                    valid_until is not None
+                    and latest > _align_timestamp(frame.index, valid_until)
+                ):
+                    self.database.execute(
+                        "UPDATE paper_orders SET status='CANCELED', block_reason=? WHERE order_id=?",
+                        ("SIGNAL_EXPIRED", order["order_id"]),
+                    )
                 continue
             one_session = str(order["strategy_id"]).startswith("course49_") and order["side"] == "BUY"
             if one_session:

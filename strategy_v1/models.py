@@ -68,6 +68,7 @@ class Position:
     stop_price: float
     sector_code: str = ""
     last_price: float = 0.0
+    entry_fees: float = 0.0
 
 
 @dataclass
