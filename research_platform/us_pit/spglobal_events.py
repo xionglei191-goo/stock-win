@@ -29,7 +29,7 @@ SPGLOBAL_EVENT_REVIEW_VERSION = "us-pit-spglobal-event-review-v1"
 SPGLOBAL_EVENT_EVIDENCE_REVIEW_VERSION = "us-pit-spglobal-event-evidence-review-v1"
 SPGLOBAL_EVENT_EVIDENCE_REVIEW_VERSION_V2 = "us-pit-spglobal-event-evidence-review-v2"
 SEC_IDENTITY_CROSSCHECK_VERSION = "us-pit-sec-identity-crosscheck-v1"
-SPGLOBAL_EVENT_REPARSE_VERSION = "spglobal-table-narrative-parser-v3"
+SPGLOBAL_EVENT_REPARSE_VERSION = "spglobal-table-narrative-parser-v4"
 
 
 @dataclass(frozen=True)
@@ -272,6 +272,22 @@ def build_spglobal_event_candidates(
     ]
     if not selected:
         raise ValueError("source batches contain no official S&P 500 event announcements")
+
+    # When the same announcement was parsed under multiple parser revisions,
+    # only the highest revision's dependency is eligible for candidate build;
+    # older revisions stay frozen in their original batches but never participate.
+    def _revision_rank(item: SourceDependency) -> int:
+        match = re.search(
+            r"v(\d+)$", str(dict(item.metadata).get("parser_revision") or "")
+        )
+        return int(match.group(1)) if match else 0
+
+    latest_by_url: dict[str, SourceDependency] = {}
+    for item in selected:
+        prior = latest_by_url.get(item.url)
+        if prior is None or _revision_rank(item) > _revision_rank(prior):
+            latest_by_url[item.url] = item
+    selected = list(latest_by_url.values())
 
     archive_pages = [
         item
