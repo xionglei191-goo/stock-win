@@ -382,7 +382,80 @@ class SECIdentityCandidateTests(unittest.TestCase):
             self.assertFalse(frame["action_terms_verified"].any())
             self.assertFalse(frame["approved"].any())
             self.assertFalse(result.manifest["direct_build_allowed"])
-            self.assertEqual("sec-form-window-items-v2", result.manifest["discovery_algorithm"])
+            self.assertEqual("sec-form-window-items-v4", result.manifest["discovery_algorithm"])
+
+    def test_filing_candidates_admit_successor_issuer_8k12b(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = USPITStore(root / "pit")
+            service = USPITService(store)
+            company_batch = service.sync(
+                SECCompanyIdentityIndexAdapter(
+                    user_agent="Research test@example.com",
+                    transport=_Transport(_company_index()),
+                    clock=lambda: OBSERVED,
+                ),
+                SyncRequest(date(2026, 8, 14), date(2026, 8, 14), OBSERVED),
+            )
+            cik_result = build_sec_cik_candidates(
+                store, [company_batch.batch_id], _request_package(root), root / "candidates"
+            )
+            ciks = load_unique_candidate_ciks(cik_result.path)
+            recent = {
+                "accessionNumber": [
+                    "0000000123-24-000001",
+                    "0000000123-24-000002",
+                    "0000000123-24-000003",
+                    "0000000123-24-000004",
+                ],
+                "filingDate": ["2024-12-15", "2024-06-01", "2024-06-02", "2024-06-03"],
+                "reportDate": ["2024-12-14", "2024-05-31", "2024-06-01", "2024-06-02"],
+                "acceptanceDateTime": [
+                    "2024-12-15T16:30:00.000Z",
+                    "2024-06-01T16:30:00.000Z",
+                    "2024-06-02T16:30:00.000Z",
+                    "2024-06-03T16:30:00.000Z",
+                ],
+                "form": ["8-K", "8-K12B", "8-K12B", "8-K12G3"],
+                "items": ["1.01,2.01", "1.01,3.03,5.03", "9.01", "1.01,5.03,8.01"],
+                "primaryDocument": [
+                    "event.htm",
+                    "succession.htm",
+                    "other.htm",
+                    "twelveg3.htm",
+                ],
+                "primaryDocDescription": [
+                    "CURRENT REPORT",
+                    "SUCCESSOR COMPANY REPORT",
+                    "CURRENT REPORT",
+                    "SUCCESSOR ISSUER NOTICE",
+                ],
+            }
+            payloads: dict[str, bytes] = {}
+            for cik in ciks:
+                main = f"https://data.sec.gov/submissions/CIK{cik}.json"
+                payloads[main] = json.dumps(
+                    {"cik": str(int(cik)), "filings": {"recent": recent, "files": []}}
+                ).encode()
+            submission_batch = service.sync(
+                SECCompanySubmissionsAdapter(
+                    ciks,
+                    user_agent="Research test@example.com",
+                    transport=_URLTransport(payloads),
+                    clock=lambda: OBSERVED,
+                    minimum_request_interval_seconds=0,
+                ),
+                SyncRequest(date(2019, 1, 1), date(2026, 8, 14), OBSERVED),
+            )
+            result = build_sec_filing_candidates(
+                store, [submission_batch.batch_id], cik_result.path, root / "filings"
+            )
+            frame = pd.read_parquet(result.path / "sec_filing_candidates.parquet")
+            selected = frame.loc[frame["accession_number"].astype(str).ne("")]
+            self.assertEqual({"8-K", "8-K12B", "8-K12G3"}, set(selected["form"]))
+            self.assertIn("0000000123-24-000002", set(selected["accession_number"]))
+            self.assertNotIn("0000000123-24-000003", set(selected["accession_number"]))
+            self.assertIn("0000000123-24-000004", set(selected["accession_number"]))
 
     def test_complete_submission_capture_verifies_identity_and_eastern_acceptance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

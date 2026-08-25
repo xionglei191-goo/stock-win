@@ -16,11 +16,12 @@ from .store import USPITStore
 
 SEC_FILING_CANDIDATE_VERSION = "us-pit-sec-filing-candidates-v2"
 RELEVANT_FORMS = frozenset({
-    "8-K", "8-K/A", "S-4", "S-4/A", "425", "DEFA14A", "PREM14A",
-    "SC 13E3", "SC 13E3/A", "10-12B", "10-12B/A", "10-12G", "10-12G/A",
+    "8-K", "8-K/A", "8-K12B", "8-K12B/A", "8-K12G3", "8-K12G3/A", "S-4",
+    "S-4/A", "425", "DEFA14A", "PREM14A", "SC 13E3", "SC 13E3/A", "10-12B",
+    "10-12B/A", "10-12G", "10-12G/A",
 })
 RELEVANT_8K_ITEMS = frozenset({"1.01", "2.01", "3.03", "5.03", "8.01"})
-FILING_DISCOVERY_ALGORITHM = "sec-form-window-items-v2"
+FILING_DISCOVERY_ALGORITHM = "sec-form-window-items-v4"
 
 
 @dataclass(frozen=True)
@@ -149,7 +150,9 @@ def build_sec_filing_candidates(
                 raise ValueError("SEC submissions filing date is invalid") from exc
             if form not in RELEVANT_FORMS or not start <= filing_date <= end:
                 continue
-            if form in {"8-K", "8-K/A"} and not (items & RELEVANT_8K_ITEMS):
+            if form in {
+                "8-K", "8-K/A", "8-K12B", "8-K12B/A", "8-K12G3", "8-K12G3/A"
+            } and not (items & RELEVANT_8K_ITEMS):
                 continue
             matched += 1
             accession = filing["accessionNumber"]
