@@ -7,8 +7,13 @@ to data/ops_logs/uspit_worker.log so failures remain diagnosable.
 from __future__ import annotations
 
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
+
+# Prevent the spawned console-subsystem python.exe from allocating a new
+# console (which Windows Terminal would show as a visible window).
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 ROOT = Path(r"D:\Project\stock")
 PYTHON = Path(r"C:\Users\Administrator\AppData\Local\Programs\Python\Python314\python.exe")
@@ -29,6 +34,7 @@ def main() -> None:
         cwd=str(ROOT),
         capture_output=True,
         text=True,
+        creationflags=CREATE_NO_WINDOW,
     )
     with log.open("a", encoding="utf-8") as handle:
         handle.write(
