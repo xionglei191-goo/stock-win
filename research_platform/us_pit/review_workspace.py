@@ -540,7 +540,15 @@ class USPITReviewWorkspaceAssembler:
                 row["security_id"] = canonical_ids[str(row["holding_candidate_id"])]
                 if validation_anchor:
                     signal_issuer = signal_issuer_ids.get(str(row["security_id"]))
-                    if signal_issuer is None:
+                    row_issuer = _clean_text(row.get("issuer_id"))
+                    if signal_issuer is not None:
+                        row["issuer_id_resolved"] = signal_issuer
+                    elif row_issuer and row_issuer.startswith("us_issuer_"):
+                        # Operator-reviewed issuer identity bound from an
+                        # allow-listed non-anchor official source (e.g. the
+                        # frozen SEC company index) during identity review.
+                        row["issuer_id_resolved"] = row_issuer
+                    else:
                         unresolved.append(
                             {
                                 "code": "ISSUER_IDENTITY_NOT_EXPLICITLY_APPROVED",
@@ -552,8 +560,6 @@ class USPITReviewWorkspaceAssembler:
                             }
                         )
                         row["issuer_id_resolved"] = None
-                    else:
-                        row["issuer_id_resolved"] = signal_issuer
                 else:
                     row["issuer_id_resolved"] = _issuer_id(pd.Series(row))
                 # A historical validation response observed today can verify an
