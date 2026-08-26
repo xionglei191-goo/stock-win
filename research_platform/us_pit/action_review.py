@@ -820,10 +820,10 @@ def _validate_terms(
         ratio is None
         or ratio <= 0
         or not successor.startswith("us_")
-        or cost_basis is None
-        or not 0 <= cost_basis < 1
     ):
-        raise ValueError("SPINOFF requires ratio, stable successor, and cost basis fraction")
+        raise ValueError("SPINOFF requires ratio and stable successor")
+    if action_type == "SPINOFF" and cost_basis is not None and not 0 <= cost_basis < 1:
+        raise ValueError("SPINOFF cost basis fraction must lie in [0, 1) when provided")
 
 
 def _aware_iso(value: Any, *, required: bool) -> str:
@@ -836,6 +836,25 @@ def _aware_iso(value: Any, *, required: bool) -> str:
     if timestamp.tzinfo is None:
         raise ValueError("action timestamp must be timezone-aware")
     return timestamp.isoformat()
+
+
+def validate_execution_action_terms(action: Mapping[str, Any]) -> None:
+    """Execution-context gate for approved corporate actions (D2-B).
+
+    Membership replay may admit a SPINOFF without a cost-basis fraction,
+    but any order/execution consumer must refuse it: trading-grade spinoff
+    handling needs the tax-cost allocation.  Call this before using an
+    action row to mutate positions, cash, or cost basis.
+    """
+    kind = str(action.get("action_type", "")).strip().upper()
+    if kind != "SPINOFF":
+        return
+    raw = action.get("cost_basis_fraction")
+    if raw is None or pd.isna(raw) or str(raw).strip() == "":
+        raise ValueError(
+            "execution use of SPINOFF action "
+            f"{str(action.get('action_id', ''))!r} requires cost_basis_fraction"
+        )
 
 
 def _date_text(value: Any) -> str:

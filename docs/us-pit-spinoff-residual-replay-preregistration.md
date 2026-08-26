@@ -99,3 +99,26 @@ Ralliant 比例待从 Form 10 精确摘录。
 
 在 D1/D2 获得批准前，2020-03-31、2022-06/09、2025-03/06/09 五个锚点日
 维持 DATA_BLOCKED 属实且诚实。
+
+---
+
+## 决策与实施结果（2026-08-25，操作员批准 D1+D2）
+
+- **D2 已按方案 B 实施**：`_validate_terms` 允许 SPINOFF 免填 cost_basis
+  （成员重放语境）；新增 `validate_execution_action_terms` 强制交易语境
+  必须有 cost_basis_fraction。回归测试通过。
+- **D1 已实施**：`scripts/admit_action_anchored_membership_events.py`
+  按哈希校验链把被阻断的 GDI ADD（event 7bdbf451…）绑定到已批准行动
+  （approval f0351634…）的 predecessor 稳定 ID us_isin_us36467w1099，
+  admission_id bbb42c71…。
+- 另发现并更正 r4 生效时区：2020-03-03 为 EST（-05:00），继承必须在
+  GDI ADD 之后同日生效。
+- 第五轮三条 SPINOFF 行动批准（approval 333a6c0e…）：Embecta ratio 0.2、
+  Sandisk ratio 1/3、Ralliant ratio 1/3，均免填 cost basis。
+
+### 最终装配 oxalpha_v12（workspace 795dc409…）
+
+- QUARTERLY_ANCHOR_RECONCILIATION_FAILED = **0**（此前 14）
+- 剩余缺口均为既有诚实状态：ISSUER_IDENTITY(652)、
+  ANCHOR_RECONCILIATION_WINDOW_INVALID(1，最新锚点对窗口诊断)、
+  EMPTY_REQUIRED_ARTIFACT(8，prepare-market 阶段)。

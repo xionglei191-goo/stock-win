@@ -544,3 +544,42 @@ class USPITActionReviewTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SpinoffMembershipContextTests(unittest.TestCase):
+    """D2-B: SPINOFF may be approved without cost basis for membership
+    replay, while execution consumers must refuse it."""
+
+    def test_spinoff_without_cost_basis_admits_and_execution_gate_blocks(
+        self,
+    ) -> None:
+        from research_platform.us_pit.action_review import (
+            validate_execution_action_terms,
+        )
+
+        terms = {"ratio": 0.2, "cost_basis": None}
+        # _validate_terms accepts the replay-context row:
+        from research_platform.us_pit.action_review import _validate_terms
+
+        _validate_terms("SPINOFF", terms["ratio"], None, terms["cost_basis"], "us_isin_s", "")
+        with self.assertRaisesRegex(ValueError, "cost basis fraction must lie"):
+            _validate_terms("SPINOFF", 0.2, None, 1.5, "us_isin_s", "")
+
+        with self.assertRaisesRegex(ValueError, "requires cost_basis_fraction"):
+            validate_execution_action_terms(
+                {
+                    "action_id": "a1",
+                    "action_type": "SPINOFF",
+                    "cost_basis_fraction": None,
+                }
+            )
+        validate_execution_action_terms(
+            {
+                "action_id": "a2",
+                "action_type": "SPINOFF",
+                "cost_basis_fraction": 0.05,
+            }
+        )
+        validate_execution_action_terms(
+            {"action_id": "a3", "action_type": "REORGANIZATION"}
+        )

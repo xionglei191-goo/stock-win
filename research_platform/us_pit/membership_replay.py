@@ -268,15 +268,15 @@ def replay_causal_membership(
     snapshots: list[dict[str, Any]] = []
 
     add_effective_days: dict[str, list[pd.Timestamp]] = {}
+    remove_effective_days: dict[str, list[pd.Timestamp]] = {}
     for _, row in prepared_events.iterrows():
-        if str(row.get("event_type", "")).strip().upper() != "ADD":
-            continue
+        kind = str(row.get("event_type", "")).strip().upper()
         effective = row.get("effective_utc")
-        if pd.isna(effective):
+        if kind not in {"ADD", "REMOVE"} or pd.isna(effective):
             continue
-        add_effective_days.setdefault(str(row["security_id"]).strip(), []).append(
-            pd.Timestamp(effective).tz_convert("America/New_York").tz_localize(None).normalize()
-        )
+        day = pd.Timestamp(effective).tz_convert("America/New_York").tz_localize(None).normalize()
+        bucket = add_effective_days if kind == "ADD" else remove_effective_days
+        bucket.setdefault(str(row["security_id"]).strip(), []).append(day)
 
     def _is_spinoff_residual(security_id: str, at_day: pd.Timestamp) -> bool:
         """Frozen rule A' (R1): a spinoff successor with no official ADD by
@@ -289,6 +289,26 @@ def replay_causal_membership(
             return False
         adds = add_effective_days.get(security_id, [])
         return not any(effective <= day for effective in adds)
+
+    def _officially_removed_since_readd(security_id: str, at_day: pd.Timestamp) -> bool:
+        """Frozen rule A' (R5): the security's official REMOVE took effect on
+        or before ``at_day`` and no later ADD restored membership by that day.
+        Any fund-holding presence is a sell-transition residual."""
+        day = pd.Timestamp(at_day)
+        removes = [
+            effective
+            for effective in remove_effective_days.get(security_id, [])
+            if effective <= day
+        ]
+        if not removes:
+            return False
+        latest_remove = max(removes)
+        restores = [
+            effective
+            for effective in add_effective_days.get(security_id, [])
+            if latest_remove < effective <= day
+        ]
+        return not restores
 
     values = holdings.copy()
     values["as_of"] = pd.to_datetime(values.get("as_of_date"), errors="coerce").dt.normalize()
@@ -445,10 +465,16 @@ def replay_causal_membership(
         missing = following["members"] - replayed
         extra = replayed - following["members"]
         explained_missing = sorted(
-            item for item in missing if _is_spinoff_residual(item, following["as_of"])
+            item
+            for item in missing
+            if _is_spinoff_residual(item, following["as_of"])
+            or _officially_removed_since_readd(item, following["as_of"])
         )
         explained_extra = sorted(
-            item for item in extra if _is_spinoff_residual(item, following["as_of"])
+            item
+            for item in extra
+            if _is_spinoff_residual(item, following["as_of"])
+            or _officially_removed_since_readd(item, following["as_of"])
         )
         unexplained_missing = missing - set(explained_missing)
         unexplained_extra = extra - set(explained_extra)
@@ -512,7 +538,10 @@ def replay_causal_membership(
                 }
             )
         residuals = sorted(
-            item for item in state if _is_spinoff_residual(item, decision)
+            item
+            for item in state
+            if _is_spinoff_residual(item, decision)
+            or _officially_removed_since_readd(item, decision)
         )
         if residuals:
             state = frozenset(state - set(residuals))
