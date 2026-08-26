@@ -248,3 +248,18 @@ L Brands、Signature Bank（browse-edgar 对其返回无匹配，
 上述全部清零后 assemble-reviewed 转 READY → prepare-market 执行 TDX 只读
 行情采集（bars_raw/bars_vendor_front/benchmarks SPY+BIL/listing_aliases/
 fee schedule 绑定）→ build → validate → qualify。
+
+## 最终状态（2026-08-26 深夜，oxalpha_v28）
+
+ISSUER_IDENTITY：**652 → 1**（仅剩 SIGNATURE BANK，US82669G1040）。
+Raytheon Co 已定夺绑定：CIK 1047122（前名 HE HOLDINGS INC→RAYTHEON CO，
+申报持续至 2020-04-13 合并时点；候选 82267 因申报止于 2013 被排除），
+binding_id 98f555da…。
+
+### 唯一剩余项
+SIGNATURE BANK 的 EDGAR CIK 待查证（记忆中 1361719 在 data.sec.gov 返回 404，
+需人工在 efts.sec.gov / EDGAR 网站确认）。查证后走标准 binder 流程即可闭合。
+
+### 本会话 SEC 访问已触发限流（503）
+后续任何补采/验证请在间隔 ≥30 分钟后进行。binder 为增量模式
+（输入=oxalpha_final_merged4，自动携带全部既有绑定），重跑无副作用。
