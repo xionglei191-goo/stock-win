@@ -156,3 +156,18 @@
 - 通达信 Lambda 交叉验证、可选本地调度和研究报告导出。
 
 真实交易连接、云部署和多人权限必须经过独立的安全与风控设计，不作为现阶段自然延伸。
+
+## 2026-02 美股 PIT：SIGNATURE BANK 身份闭合（652→0）
+
+- 定位根因：`tmp/exited_cik_proposals.json` 中 SIGNATURE BANK 提议 CIK 长驻不存在的
+  0001361719，被验证器反复 REJECT（fail-closed 生效）。正确 CIK=0001288784
+  （SEC 官方 13G 逐字确认 CUSIP 82669G104 ↔ Signature Bank Corp）。
+- 修正提议 → `bind_us_pit_exited_issuers_by_cik.py` 21 行全绑定 → 合成
+  oxalpha_final_v7 → 装配 **oxalpha_v29**。
+- **ISSUER_IDENTITY_NOT_EXPLICITLY_APPROVED：652 → 0**。
+- 剩余两项结构性缺口（详见 us-pit-spinoff-residual-replay-preregistration.md）：
+  1. ANCHOR_RECONCILIATION_WINDOW_INVALID(1)：2025-Q3 N-PORT 采到修正版 /A
+     （2026-07 接受），原始版未采；需补采 + supersede 规则 v2。
+  2. EMPTY_REQUIRED_ARTIFACT(8)：assemble 与 prepare-market 的 bars 填充死锁；
+     需 EMPTY-PREPARE-EV2 规则。
+- 两项修复均涉及冻结规则变更，处于预注册待批准状态。

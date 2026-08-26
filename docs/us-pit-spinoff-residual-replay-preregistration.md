@@ -263,3 +263,62 @@ SIGNATURE BANK 的 EDGAR CIK 待查证（记忆中 1361719 在 data.sec.gov 返�
 ### 本会话 SEC 访问已触发限流（503）
 后续任何补采/验证请在间隔 ≥30 分钟后进行。binder 为增量模式
 （输入=oxalpha_final_merged4，自动携带全部既有绑定），重跑无副作用。
+
+## 2026-02 SIGNATURE BANK 身份闭合（652 → 0，oxalpha_v29）
+
+根因：`tmp/exited_cik_proposals.json` 中 "SIGNATURE BANK" 提议 CIK 为不存在的
+**0001361719**，被验证器反复 REJECT。正确 CIK 为 **0001288784**：
+- SEC 官方 13G（`/Archives/edgar/data/1288784/0000080255-22-002026/
+  sbny13gdec21.txt`，T. Rowe Price）：`Name of Issuer: Signature Bank Corp`、
+  `CUSIP NUMBER: 82669G104`（逐字吻合 us_isin_us82669g1040）。
+- data.sec.gov/submissions/CIK0001288784.json：name=Signature Bank Corp。
+- Wikidata Q24204571（NY bank）P5531 = 0001288784；Barchart SBNY→1288784。
+  注：该 CIK 的 EDGAR metadata 州/地址字段显示 GREELEY CO，系同名异常，
+  13G 内 CUSIP 为决定性官方证据。
+
+修正提议 cik 后重跑 `bind_us_pit_exited_issuers_by_cik.py`：VERIFIED → 21 行全绑定。
+合成 `oxalpha_final_v7`（v6 + SIGNATURE BANK 增量，merge_id 5856d03b…）。
+
+装配 oxalpha_v29（workspace e1f663b6…）：
+
+| 缺口 | v28 | v29 |
+|---|---|---|
+| ISSUER_IDENTITY_NOT_EXPLICITLY_APPROVED | 1 | **0** |
+| ANCHOR_RECONCILIATION_WINDOW_INVALID | 1 | 1 |
+| EMPTY_REQUIRED_ARTIFACT | 8 | 8 |
+
+**ISSUER_IDENTITY 全部闭合（652→0）**。剩余两项为结构性缺口（见下）。
+
+## 预注册：N-PORT 对账窗口解锁（ANCHOR_RECONCILIATION_WINDOW_INVALID）
+
+根因：IVV 2025-Q3 锚点（accession 0002071691-26-015790）为**修正版 NPORT-P/A**
+（2026-07-13 接受）；`membership_replay` 用 prior.available(2026-07-13) 对账
+following(2025-12-31)，available 晚于报告截止 → 窗口无效。原始 NPORT-P 应于
+2025-11-28 前提交（filer 0001752724）。
+
+现行 `_supersede_sec_amendments` 对同一 report_date 取 published **最新**者，
+因此即使补采原始版，仍会选修正版 /A。**建议规则（待批准）**：
+
+- **N-PORT-SUPERSEDE-v2**：对同一 report_date 的 SEC 锚点，在全部版本中，
+  重放对账基准取"**最后不晚于该报告窗口的可用版本**"（earliest-available
+  绝不因修正版后置而抬升 available）；身份提取可仍取最新版。需对
+  `membership_replay` 的 available 语义与 `_supersede_sec_amendments` 的分组
+  做一致化，并冻结变更测试（test：同 report_date 含原始版+late /A 时，
+  对账窗口以原始版 available 判定）。
+- 补采动作：确认 EDGAR 上 0001752724-25-*（2025-11）存在 report=20250930 的
+  原始 NPORT-P → 冻结为第 20 个 source_batch → 按 v2 规则重做 normalize →
+  重走 review 链 → assemble。
+
+## 预注册：EMPTY_REQUIRED_ARTIFACT 死锁解锁（8 项）
+
+`review_workspace._gap_report` 把 `listing_aliases/bars_raw/bars_vendor_front/
+bars_pit_signal/benchmarks/execution_fee_schedule/bar_coverage/
+lifecycle_reconciliations` 空视为 blocking → assemble 恒为 DATA_BLOCKED；
+而 prepare-market gate 要求 REVIEW_READY（无 blocking）才能启动填这些件——
+**死锁**。**建议规则（待批准）**：
+
+- **EMPTY-PREPARE-EV2**：上述 8 类由 prepare-market 填充的工件，在 assemble
+  阶段不计入 blocking（保留到 prepare-market 阶段由
+  `USPITMarketPreparer` 在其输出完整性校验中强制非空）。assemble 的 gap_report
+  明确标注为 `EMPTY_REQUIRED_ARTIFACT (deferred to prepare-market)`；仅当
+  ANCHOR/身份/对账/冲突类缺口归零时才允许转 REVIEW_READY。
