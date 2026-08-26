@@ -214,3 +214,16 @@ binder 增加"同名组传播"：canon 名称相等且组内身份唯一时，�
 2. 需修正/补充提议：Alliance Data(Bread Financial 改名)、Arconic(=Howmet,
    限流)、People's United(正确 CIK 待查)、LABORATORY CORPORATION 大写变体
    （与已绑定 LabCorp 同 Issuer，需跨 sid 传播或别名）。
+
+### 名称搜索第二轮（2026-08-26 晚，652 → 5）
+
+新增绑定 5 家：Alliance Data→Bread Financial Holdings(1101215)、
+Arconic Inc→Howmet Aerospace(4281)、FLIR→Teledyne FLIR(354908, formerNames)、
+National Oilwell Varco→NOV Inc(1021860)、Laboratory Corp→LabCorp Holdings(920148)。
+binder 另实现"同名组传播"（canon 相等且组内身份唯一时自动继承）。
+
+剩余 5 只证券：
+1. Raytheon Co：两个候选 CIK（82267/1047122）均 canon 匹配，需逐案证据定夺；
+2. First Republic Bank / L Brands / Signature Bank：browse-edgar 对这些
+   退市实体返回"No matching CIK"，需 EDGAR 全档案检索或人工查证 CIK；
+3. People's United Financial / LabCorp 大写变体：查询词形问题，调整后可解。

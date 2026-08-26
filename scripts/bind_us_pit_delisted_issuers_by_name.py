@@ -61,7 +61,14 @@ def compact(value: str) -> str:
     return canon(value).replace(" ", "")
 
 
-def name_matches(conformed: str, targets: set[str]) -> bool:
+def name_matches(conformed_set: set[str], targets: set[str]) -> bool:
+    for conformed in conformed_set:
+        if _name_matches_one(conformed, targets):
+            return True
+    return False
+
+
+def _name_matches_one(conformed: str, targets: set[str]) -> bool:
     c_canon = canon(conformed)
     if not c_canon:
         return False
@@ -92,7 +99,7 @@ def main() -> None:
     user_agent = _require_sec_user_agent(None)
     store = USPITStore("data/us_pit")
     review_dir = Path("data/us_pit/review_inputs/oxalpha_final_cikbound").resolve()
-    output = Path("data/us_pit/review_inputs/oxalpha_final_v2").resolve()
+    output = Path("data/us_pit/review_inputs/oxalpha_final_v3").resolve()
     if output.exists():
         raise SystemExit(f"output dir already exists: {output}")
 
@@ -132,10 +139,18 @@ def main() -> None:
             sub_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
             try:
                 sub_payload = http_get(sub_url, user_agent)
-                official_name = str(json.loads(sub_payload).get("name") or "")
+                sub_json = json.loads(sub_payload)
+                official_name = str(sub_json.get("name") or "")
             except Exception as exc:  # noqa: BLE001
                 continue
-            if name_matches(official_name, {issuer_name}):
+            # official current name OR any official former name (EDGAR
+            # formerNames documents renames after the anchor period)
+            official_names = {official_name}
+            for former in sub_json.get("formerNames", []) or []:
+                former_name = str(former.get("name") or "").strip()
+                if former_name:
+                    official_names.add(former_name)
+            if name_matches(official_names, {issuer_name}):
                 verified.append((cik, official_name, sub_url, sub_payload))
         unique_ciks = {cik for cik, _, _, _ in verified}
         if len(unique_ciks) != 1:
