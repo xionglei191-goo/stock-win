@@ -143,3 +143,26 @@ D1/D2 实施后装配 oxalpha_v14 验证：
 备选：SEC 公司索引提供 CIK（但与 ISIN 的桥接仍需第三方映射）。
 
 在 D3 批准前，DATA_BLOCKED 属实；prepare-market/build 无法诚实推进。
+
+---
+
+## D3 执行记录与 D4 残余（2026-08-26）
+
+### 已实施
+- **SEC 官方索引绑定**（`scripts/build_us_pit_issuer_evidence.py`）：
+  两级规范化名称唯一匹配，同稳定 ID 强制同一发行人；652→93。
+- **身份行批量批准**（`scripts/approve_us_pit_identity_rows.py`）：五项前置条件。
+- **EDGAR 提议-验证绑定**（`scripts/bind_us_pit_exited_issuers_by_cik.py`）：
+  操作员提议 CIK → EDGAR 官方档案注册名机器验证（canon/compact/全字母串/
+  词序无关四重比较，支持 /NEW/ 类州后缀与已批准行动的曾用名链）→ 通过才入库；
+  错误提议自动拒绝。93→35 只证券。
+
+### GLEIF 结论
+GLEIF ISIN→LEI 每日映射文件只覆盖新发行 ISIN，不含存量美股大市值公司，
+不适用于本缺口；数据本身免费开放（CC-BY 4.0），未来若需 LEI 可用其 API。
+
+### D4 残余：35 只证券（全部为已退出指数公司）
+构成：约 12 只为 EDGAR 限流暂时失败（可冷却后重跑 binder 增量补齐，
+机制已支持 .prev 增量）；其余为错误 CIK 提议、无行动关联的改名
+（Fortune Brands→Innovations 等）、以及 FTS 全文检索噪声导致的
+名称匹配未决。需要更精确的官方 name→CIK 工具或逐案文件证据后再闭合。
