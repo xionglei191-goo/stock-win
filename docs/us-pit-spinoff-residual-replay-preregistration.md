@@ -181,3 +181,23 @@ SEC 官方索引绑定（506 家）+ EDGAR 提议-验证绑定（55 家，四重
 注意：绑定器输入已改为全量合并态 `oxalpha_final_merged4`
 （批次批准 + SEC 索引层 + EDGAR 提议层三层绑定齐全），后续任何重建
 不会再发生层级丢失。
+
+## D4 第二轮执行（2026-08-26，ISSUER_IDENTITY 652 → 11）
+
+新增机制：
+- **退市公司名称搜索绑定**（`scripts/bind_us_pit_delisted_issuers_by_name.py`）：
+  名称搜索候选 CIK → data.sec.gov submissions 权威注册名核验，82 名/2648 行。
+- **CIK 提议发现**（`scripts/discover_us_pit_exited_issuer_ciks.py`）：
+  多查询变体 + data.sec.gov 验证，新发现 W R Berkley(11544)、WellCare(1279363)。
+- 绑定器输入固定为全量合并态 `oxalpha_final_merged4`，增量携带不再丢层。
+
+### 剩余 11 只证券及闭合路径
+
+| 类别 | 证券 | 路径 |
+|---|---|---|
+| EDGAR 软限流暂时失败 | Raytheon Co、National Oilwell Varco、L Brands、FLIR、First Republic、Signature Bank、Alliance Data(Bread Financial 改名)、HOLOGIC 大写变体 | 冷却后重跑 binder（纯机械） |
+| 错误提议待修正 | Arconic Inc（=Howmet 428180，曾遇限流）、CERIDIAN（Dayforce）、People's United（701919?） | 修正 CIK 后重跑 |
+| 无行动关联的改名/变体 | ZIONS BANCORPORATION 变体行、LABORATORY CORPORATION 大写变体行 | 与已绑定同Issuer 的 sid 同组即可，需查为何未随组 |
+
+注：Zions/LabCorp/Hologic 变体行的同组绑定逻辑需在 binder 中把
+"canon 相等的已绑定 sid" 视为同组传播——下一轮实现。
