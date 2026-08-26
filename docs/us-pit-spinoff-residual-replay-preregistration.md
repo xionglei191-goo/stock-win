@@ -322,3 +322,29 @@ lifecycle_reconciliations` 空视为 blocking → assemble 恒为 DATA_BLOCKED�
   `USPITMarketPreparer` 在其输出完整性校验中强制非空）。assemble 的 gap_report
   明确标注为 `EMPTY_REQUIRED_ARTIFACT (deferred to prepare-market)`；仅当
   ANCHOR/身份/对账/冲突类缺口归零时才允许转 REVIEW_READY。
+
+## 实施确认（2026-08-26，已批准）
+
+两项规则均已获批并落地：
+
+1. **N-PORT-SUPERSEDE-v2**（`official_normalize._supersede_sec_amendments`）：
+   对同一 report date，若存在 form=NPORT-P 的原始版，取其 **published 最早**者作为
+   对账基准；迟到的 NPORT-P/A 修正版被丢弃、绝不推进锚点窗口。仅有 /A 时回退到
+   最新修正版。冻结测试 `test_earliest_on_time_original_wins_over_later_amendment_for_reconciliation`。
+
+2. **EMPTY-PREPARE-EV2**（`review_workspace._gap_report`）：8 类 prepare-market
+   工件（listing_aliases/bars_raw/bars_vendor_front/bars_pit_signal/benchmarks/
+   execution_fee_schedule/bar_coverage/lifecycle_reconciliations）为空时记为
+   deferred 缺口，不进入 blocking_gaps，从而不阻塞 REVIEW_READY。
+
+### 重放证据：2025-09-30 锚点
+
+重新 normalize（normalization_id `698e3681…`，source batches =
+34670533/5ccf6bcf/655f3b8e）后，2025-09-30 IVV N-PORT 锚点采用**原始版**
+NPORT-P（accession 0002071691-25-007634，published 2025-11-26T17:01:17Z），
+修正版 /A（0002071691-26-015790，published 2026-07-13）不再推进窗口。
+
+### 装配 oxalpha_v30（workspace 5cdca7dd…）
+
+status=**REVIEW_READY**，direct_build_allowed=true，blocking_gaps=0，
+deferred_gaps=8（EMPTY-PREPARE-EV2）。身份、锚点对账窗口、季度对账全部归零。

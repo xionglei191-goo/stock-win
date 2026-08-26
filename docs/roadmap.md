@@ -171,3 +171,16 @@
   2. EMPTY_REQUIRED_ARTIFACT(8)：assemble 与 prepare-market 的 bars 填充死锁；
      需 EMPTY-PREPARE-EV2 规则。
 - 两项修复均涉及冻结规则变更，处于预注册待批准状态。
+
+## 2026-08-26 美股 PIT：workspace 首次 REVIEW_READY（oxalpha_v30）
+
+- 两项冻结规则获批并实施：**N-PORT-SUPERSEDE-v2**（对账窗口取最早可用原始
+  NPORT-P，迟到 /A 不推进窗口）、**EMPTY-PREPARE-EV2**（8 类 prepare-market
+  工件 deferred，不再阻塞 REVIEW_READY）。
+- 重新 normalize（698e3681…），2025-09-30 锚点改采原始版 NPORT-P
+  （0002071691-25-007634, 2025-11-26），修正版 /A 不再推进窗口 →
+  ANCHOR_RECONCILIATION_WINDOW_INVALID 归零。
+- 装配 **oxalpha_v30**：**REVIEW_READY / blocking_gaps=0**；身份、锚点窗口、
+  季度对账全部归零；EMPTY 8 项 deferred 待 prepare-market 填充。
+- 下一步：`us-pit prepare-market`（TDX 只读行情，需长时间）→ build → validate
+  → qualify → us-paper admit-release。

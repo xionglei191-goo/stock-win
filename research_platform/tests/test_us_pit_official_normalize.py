@@ -286,6 +286,74 @@ class OfficialHoldingsNormalizationTests(unittest.TestCase):
             holdings = result.load_frame("fund_holdings_observed_candidate")
             self.assertEqual(list(holdings["ticker"]), ["MSFT"])
 
+    def test_earliest_on_time_original_wins_over_later_amendment_for_reconciliation(self) -> None:
+        # N-PORT-SUPERSEDE-v2 (approved): when both the on-time original
+        # NPORT-P and a later NPORT-P/A exist for one report date, the
+        # earliest-available original is the reconciliation basis.  A late
+        # amendment must never advance the anchor's available window, so
+        # normalization keeps the original (Apple) rather than the later
+        # amendment (Microsoft).
+        with tempfile.TemporaryDirectory() as temporary:
+            store = USPITStore(Path(temporary) / "pit")
+            original_payload = _sec_payload(
+                _investment(
+                    name="Apple Inc",
+                    title="Common Stock",
+                    ticker="AAPL",
+                    cusip="037833100",
+                    isin="US0378331005",
+                )
+            )
+            amendment_accession = "0002071691-26-019999"
+            amendment_payload = _sec_payload(
+                _investment(
+                    name="Microsoft Corp",
+                    title="Common Stock",
+                    ticker="MSFT",
+                    cusip="594918104",
+                    isin="US5949181045",
+                )
+            ).replace(
+                SEC_ACCESSION.encode(), amendment_accession.encode()
+            ).replace(b"CONFORMED SUBMISSION TYPE: NPORT-P", b"CONFORMED SUBMISSION TYPE: NPORT-P/A").replace(
+                b"<DOCUMENT><TYPE>NPORT-P", b"<DOCUMENT><TYPE>NPORT-P/A"
+            )
+            original = _sec_dependency(
+                store,
+                original_payload,
+                as_of_date="2025-03-31",
+                metadata={
+                    **dict(_sec_dependency(store, original_payload).metadata),
+                    "form": "NPORT-P",
+                },
+            )
+            amendment = _sec_dependency(
+                store,
+                amendment_payload,
+                as_of_date="2025-03-31",
+                published_at="2026-07-13T14:48:14+00:00",
+                object_sha256=store.put_bytes(amendment_payload).sha256,
+                url=(
+                    "https://www.sec.gov/Archives/edgar/data/1100663/"
+                    f"{amendment_accession.replace('-', '')}/{amendment_accession}.txt"
+                ),
+                metadata={
+                    **dict(_sec_dependency(store, original_payload).metadata),
+                    "form": "NPORT-P/A",
+                    "accession_number": amendment_accession,
+                    "response_sha256": store.put_bytes(amendment_payload).sha256,
+                },
+            )
+            batch = store.write_source_batch([original, amendment])
+
+            result = OfficialHoldingsNormalizationService(store).normalize(
+                [batch.batch_id]
+            )
+            holdings = result.load_frame("fund_holdings_observed_candidate")
+            # Supersede-v2 must retain the on-time original (Apple), not the
+            # later amendment (Microsoft).
+            self.assertEqual(list(holdings["ticker"]), ["AAPL"])
+
     def test_sec_keeps_distinct_share_classes_and_never_becomes_signal_input(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = USPITStore(Path(temporary) / "pit")

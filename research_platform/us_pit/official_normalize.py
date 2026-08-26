@@ -824,33 +824,59 @@ class OfficialHoldingsNormalizationService:
                 filings.setdefault(dependency.as_of_date, []).append(dependency)
             else:
                 passthrough.append(dependency)
+        # N-PORT-SUPERSEDE-v2 (approved): for each report date, the on-time
+        # original NPORT-P is the reconciliation basis (earliest available).
+        # A later amendment (NPORT-P/A) must never advance the anchor's
+        # available window; it is only a content supersession and is dropped
+        # here whenever an original is present.  If no original was ever
+        # captured (only amendments exist), the latest amendment is kept as a
+        # fallback so late-filed data can still be validated on its own terms.
         for report_date, values in filings.items():
-            ordered = sorted(
+            originals = [
+                item
+                for item in values
+                if str(dict(item.metadata).get("form") or "") == "NPORT-P"
+            ]
+            if originals:
+                ordered = sorted(
+                    originals,
+                    key=lambda item: (
+                        pd.Timestamp(item.published_at),
+                        str(dict(item.metadata).get("accession_number") or ""),
+                    ),
+                )
+                earliest_time = pd.Timestamp(ordered[0].published_at)
+                earliest = [
+                    item
+                    for item in ordered
+                    if pd.Timestamp(item.published_at) == earliest_time
+                ]
+                if len(earliest) != 1:
+                    raise OfficialNormalizationError(
+                        "SEC filings for one report date have an ambiguous "
+                        "earliest original: " + report_date
+                    )
+                passthrough.append(earliest[0])
+                continue
+            amendments = sorted(
                 values,
                 key=lambda item: (
                     pd.Timestamp(item.published_at),
                     str(dict(item.metadata).get("accession_number") or ""),
                 ),
             )
-            latest_time = pd.Timestamp(ordered[-1].published_at)
+            latest_time = pd.Timestamp(amendments[-1].published_at)
             latest = [
                 item
-                for item in ordered
+                for item in amendments
                 if pd.Timestamp(item.published_at) == latest_time
             ]
             if len(latest) != 1:
                 raise OfficialNormalizationError(
-                    "SEC filings for one report date have an ambiguous latest amendment: "
-                    + report_date
+                    "SEC filings for one report date have an ambiguous latest "
+                    "amendment: " + report_date
                 )
-            winner = latest[0]
-            form = str(dict(winner.metadata).get("form") or "")
-            if len(values) > 1 and form != "NPORT-P/A":
-                raise OfficialNormalizationError(
-                    "later SEC filing does not identify itself as NPORT-P/A: "
-                    + report_date
-                )
-            passthrough.append(winner)
+            passthrough.append(latest[0])
         return tuple(passthrough)
 
     @staticmethod

@@ -1080,25 +1080,56 @@ class USPITReviewWorkspaceAssembler:
         )
         if len(decisions) < 60:
             gaps.append({"code": "INSUFFICIENT_DECISION_MONTHS", "actual": len(decisions), "required": 60})
+        # EMPTY-PREPARE-EV2 (approved): the market-bar, benchmark, fee,
+        # listing-alias, coverage and lifecycle artifacts are filled by a later
+        # prepare-market pass, never by assemble-reviewed itself.  An empty
+        # frame for these is a legitimate intermediate state (recorded as
+        # deferred) and does not make this assembler pass fail-open at the
+        # final gate; prepare-market enforces non-empty on its own output.
         allow_empty = {"membership_events", "corporate_actions", "session_exceptions"}
+        prepare_deferred = {
+            "listing_aliases", "bars_raw", "bars_vendor_front", "bars_pit_signal",
+            "benchmarks", "execution_fee_schedule", "bar_coverage",
+            "lifecycle_reconciliations",
+        }
         for dataset, frame in artifacts.items():
             missing = sorted(REQUIRED_ARTIFACT_COLUMNS[dataset] - set(frame.columns))
             if missing:
                 gaps.append({"code": "SCHEMA_MISMATCH", "dataset": dataset, "missing_columns": missing})
             elif frame.empty and dataset not in allow_empty:
-                gaps.append({"code": "EMPTY_REQUIRED_ARTIFACT", "dataset": dataset})
+                if dataset in prepare_deferred:
+                    gaps.append({
+                        "code": "EMPTY_REQUIRED_ARTIFACT",
+                        "dataset": dataset,
+                        "detail": "deferred to prepare-market (EMPTY-PREPARE-EV2)",
+                    })
+                else:
+                    gaps.append({"code": "EMPTY_REQUIRED_ARTIFACT", "dataset": dataset})
         deduplicated = []
+        deferred: list[dict[str, Any]] = []
         seen: set[str] = set()
         for gap in gaps:
             key = sha256_json(gap)
-            if key not in seen:
-                seen.add(key)
+            if key in seen:
+                continue
+            seen.add(key)
+            if (
+                str(gap.get("code") or "") == "EMPTY_REQUIRED_ARTIFACT"
+                and str(gap.get("detail") or "").startswith("deferred to prepare-market")
+            ):
+                deferred.append(gap)
+            else:
                 deduplicated.append(gap)
         counts: dict[str, int] = {}
-        for gap in deduplicated:
+        for gap in deduplicated + deferred:
             code = str(gap.get("code", "UNKNOWN"))
             counts[code] = counts.get(code, 0) + 1
-        return {"status": "DATA_BLOCKED" if deduplicated else "REVIEW_READY", "counts": counts, "blocking_gaps": deduplicated}
+        return {
+            "status": "DATA_BLOCKED" if deduplicated else "REVIEW_READY",
+            "counts": counts,
+            "blocking_gaps": deduplicated,
+            "deferred_gaps": deferred,
+        }
 
     def _freeze_review_inputs(
         self,
