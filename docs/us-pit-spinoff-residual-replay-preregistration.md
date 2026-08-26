@@ -348,3 +348,22 @@ NPORT-P（accession 0002071691-25-007634，published 2025-11-26T17:01:17Z），
 
 status=**REVIEW_READY**，direct_build_allowed=true，blocking_gaps=0，
 deferred_gaps=8（EMPTY-PREPARE-EV2）。身份、锚点对账窗口、季度对账全部归零。
+
+## 预注册：美股 TDX 行情覆盖缺口（prepare-market 数据源决策）
+
+prepare-market 首次执行完成并暴露以下事实（均为本地验证）：
+
+- TDX(通达信) 是项目唯一美股 bars 源；`list_us_stocks()` 返回 **872 只当前存续
+  美股**，`vipdoc/ds/lday/` 含 13838 个 .day 文件。
+- 退市/被收购/更名的历史成员（SBNY、TWTR、ATVI、XLNX、PXD、ABMD 等约 **126 只**）
+  **无任何历史行情**：`fetch_bars('SBNY.US')` 返回 0 行，文件系统无 .day。
+- 持仓 43812 行全部为 VALIDATION_ANCHOR（无 SIGNAL_INPUT），设计上不建立
+  ticker/exchange → listing_aliases 空 → prepare-market 无 vendor code → bars 空。
+- 612/652 证券在官方 identity 数据中有 ticker；526 只可匹配 TDX 当前池。
+
+**待批准方案**（fail-closed 不伪造，需人工决策）：
+- **A. LISTING-ALIASES-TDX-EV1**：listing_aliases 从官方 security identity 的
+  ticker/exchange 派生（vendor_code=TICKER.US），逐条用 TDX 池验证；不纳入身份
+  解析。可采 TDX 现存成分，但 126 只历史成员仍缺 —— 需同时采纳 B。
+- **B. 外部美股历史行情源**：为历史成员引入可验证来源（SHA-256 冻结 + 审查）。
+- **C. 范围调整**：接受仅覆盖 TDX 现存成分，明确记录退出时序缺口并排除其在场段。
