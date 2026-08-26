@@ -227,3 +227,24 @@ binder 另实现"同名组传播"（canon 相等且组内身份唯一时自动�
 2. First Republic Bank / L Brands / Signature Bank：browse-edgar 对这些
    退市实体返回"No matching CIK"，需 EDGAR 全档案检索或人工查证 CIK；
 3. People's United Financial / LabCorp 大写变体：查询词形问题，调整后可解。
+
+## 最终状态记录（2026-08-26，oxalpha_v25）
+
+装配 oxalpha_v25（workspace 7b78b4da…）：
+- 季度锚点对账失败：0（652 起步的全部身份/事件/行动差异已闭合）
+- ISSUER_IDENTITY：5（已接受为当前诚实缺口）
+- ANCHOR_RECONCILIATION_WINDOW_INVALID：1 —— 根因确诊：
+  IVV 2025-Q3 N-PORT（accession 0002071691-26-015790）于 2026 年才被接受，
+  重放正确拒绝以迟到文件对账 2025-12-31。需核查 EDGAR 上该季度是否有
+  按期提交的原始 N-PORT 并补采；属数据捕获层问题。
+- EMPTY_REQUIRED_ARTIFACT：8（prepare-market 阶段，等上游解锁）。
+
+### 剩余 5 只证券的身份闭合路径（已接受暂挂）
+Raytheon Co（候选 CIK 二选一需逐案证据）、First Republic Bank、
+L Brands、Signature Bank（browse-edgar 对其返回无匹配，
+需 EDGAR 全档案检索或人工查证）、People's United Financial（查询词形）。
+
+### prepare-market 解锁条件
+上述全部清零后 assemble-reviewed 转 READY → prepare-market 执行 TDX 只读
+行情采集（bars_raw/bars_vendor_front/benchmarks SPY+BIL/listing_aliases/
+fee schedule 绑定）→ build → validate → qualify。
