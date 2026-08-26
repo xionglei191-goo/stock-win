@@ -492,6 +492,33 @@ class USPITReviewWorkspaceAssembler:
         canonical_ids = _candidate_identity_components(holdings)
         unresolved: list[dict[str, Any]] = []
         rows: list[dict[str, Any]] = []
+        # First pass: issuer identities established by approved SIGNAL_INPUT
+        # rows.  These may legitimately confirm issuer identity for securities
+        # also seen in validation anchors (the anchor itself never backfills
+        # anything - it merely co-observes an already-proven identity).
+        signal_issuer_ids: dict[str, str] = {}
+        for row in candidate.to_dict(orient="records"):
+            if str(row.get("evidence_role")) != SourceRole.SIGNAL_INPUT.value:
+                continue
+            approved = str(row.get("approved", "")).strip().casefold() in {"1", "true", "yes"}
+            identifier_key = _clean_text(row.get("identity_candidate_key"))
+            note = _clean_text(row.get("review_note"))
+            if not approved or not identifier_key or not note:
+                continue
+            try:
+                security_id = canonical_ids[str(row["holding_candidate_id"])]
+            except KeyError:
+                continue
+            issuer_id = _issuer_id(pd.Series(row))
+            if not issuer_id:
+                continue
+            existing = signal_issuer_ids.get(security_id)
+            if existing is not None and existing != issuer_id:
+                raise ReviewWorkspaceError(
+                    "conflicting issuer identities for " + security_id
+                )
+            signal_issuer_ids[security_id] = issuer_id
+
         for row in candidate.to_dict(orient="records"):
             approved = str(row.get("approved", "")).strip().casefold() in {"1", "true", "yes"}
             identifier_key = _clean_text(row.get("identity_candidate_key"))
@@ -512,20 +539,21 @@ class USPITReviewWorkspaceAssembler:
             try:
                 row["security_id"] = canonical_ids[str(row["holding_candidate_id"])]
                 if validation_anchor:
-                    row["issuer_id_resolved"] = (
-                        "us_issuer_security_"
-                        + str(row["security_id"]).removeprefix("us_")
-                    )
-                    unresolved.append(
-                        {
-                            "code": "ISSUER_IDENTITY_NOT_EXPLICITLY_APPROVED",
-                            "security_id": str(row["security_id"]),
-                            "detail": (
-                                "validation anchors cannot backfill an issuer identity; "
-                                "freeze and approve issuer/share-class evidence"
-                            ),
-                        }
-                    )
+                    signal_issuer = signal_issuer_ids.get(str(row["security_id"]))
+                    if signal_issuer is None:
+                        unresolved.append(
+                            {
+                                "code": "ISSUER_IDENTITY_NOT_EXPLICITLY_APPROVED",
+                                "security_id": str(row["security_id"]),
+                                "detail": (
+                                    "validation anchors cannot backfill an issuer identity; "
+                                    "freeze and approve issuer/share-class evidence"
+                                ),
+                            }
+                        )
+                        row["issuer_id_resolved"] = None
+                    else:
+                        row["issuer_id_resolved"] = signal_issuer
                 else:
                     row["issuer_id_resolved"] = _issuer_id(pd.Series(row))
                 # A historical validation response observed today can verify an

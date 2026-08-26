@@ -122,3 +122,24 @@ Ralliant 比例待从 Form 10 精确摘录。
 - 剩余缺口均为既有诚实状态：ISSUER_IDENTITY(652)、
   ANCHOR_RECONCILIATION_WINDOW_INVALID(1，最新锚点对窗口诊断)、
   EMPTY_REQUIRED_ARTIFACT(8，prepare-market 阶段)。
+
+---
+
+## 后续诊断（2026-08-25，prepare-market 阶段）
+
+D1/D2 实施后装配 oxalpha_v14 验证：
+- 季度锚点对账维持 **0 失败**
+- ISSUER_IDENTITY(652) 未变，根因已查明：oxalpha 工作区 43,812 行持仓
+  **全部为 VALIDATION_ANCHOR**，无任何 SIGNAL_INPUT 持仓。协议规定锚点不得
+  回填发行人身份，而工作区内不存在可确立发行人身份的非锚点证据，
+  因此该缺口是当前证据集的结构性诚实状态。
+- prepare-market 正确拒绝在受阻工作区上运行 TDX 采集
+  （REVIEW_WORKSPACE_BLOCKED_BEFORE_TDX），8 个市场工件保持为空。
+
+### D3 待决策：发行人证据源接入
+
+建议路径：引入 GLEIF 官方 ISIN→LEI 映射作为非锚点发行人证据
+（import-evidence 冻结 + 逐行审查批准），使 `_issuer_id` 可经 LEI 解析。
+备选：SEC 公司索引提供 CIK（但与 ISIN 的桥接仍需第三方映射）。
+
+在 D3 批准前，DATA_BLOCKED 属实；prepare-market/build 无法诚实推进。
