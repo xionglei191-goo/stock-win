@@ -179,6 +179,23 @@ def main() -> None:
     dependencies = []
     bindings: dict[str, dict] = {}
     verified: dict[str, dict] = {}
+    # Same-issuer propagation groups (frozen rule): rows sharing a canonical
+    # issuer name share one issuer identity.
+    canon_groups: dict[str, set[str]] = {}
+    propagated_names: set[str] = set()
+    for _, row in frame.iterrows():
+        key = canon(str(row.get("issuer_name") or ""))
+        value = str(row.get("issuer_id") or "").strip()
+        if not key:
+            continue
+        group = canon_groups.setdefault(key, set())
+        if value:
+            group.add(value)
+    propagated_names = {
+        key for key, values in canon_groups.items()
+        if len(values) == 1 and "" not in values
+    }
+
     for issuer_name, proposal in proposals.items():
         if issuer_name in already_verified:
             continue
@@ -301,8 +318,19 @@ def main() -> None:
         new_ids = []
         new_notes = []
         admitted_securities = 0
+        propagated = 0
         for _, row in frame.iterrows():
             current = str(row.get("issuer_id") or "").strip()
+            row_key = canon(str(row.get("issuer_name") or ""))
+            if not current and row_key in propagated_names:
+                value = next(iter(canon_groups[row_key]))
+                new_ids.append(value)
+                new_notes.append(
+                    f"Issuer identity propagated from same-name reviewed rows "
+                    f"(canonical {row_key!r})."
+                )
+                propagated += 1
+                continue
             sid = str(row.get("suggested_security_id") or "").strip()
             binding = bindings.get(sid)
             if current or binding is None:
@@ -325,6 +353,7 @@ def main() -> None:
             "verified_proposals": verified,
             "batch_id": batch_id,
             "admitted_securities": admitted_securities,
+            "propagated_rows": propagated,
             "bound_identity_review_sha256": sha256_file(
                 staging / "identity_review.parquet"
             ),
@@ -334,7 +363,7 @@ def main() -> None:
             json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
         )
         if output.exists():
-            shutil.move(output, previous)
+            shutil.rmtree(output, ignore_errors=True)
         staging.replace(output)
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)

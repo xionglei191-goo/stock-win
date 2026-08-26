@@ -201,3 +201,16 @@ SEC 官方索引绑定（506 家）+ EDGAR 提议-验证绑定（55 家，四重
 
 注：Zions/LabCorp/Hologic 变体行的同组绑定逻辑需在 binder 中把
 "canon 相等的已绑定 sid" 视为同组传播——下一轮实现。
+
+### 同名传播实现（2026-08-26 晚）
+
+binder 增加"同名组传播"：canon 名称相等且组内身份唯一时，空行自动继承。
+装配 oxalpha_v24：ISSUER_IDENTITY **652 → 10**。
+
+剩余 10 只证券分两类：
+1. 提议 CIK 正确、因 EDGAR 软限流暂时失败（FLIR、L Brands、National Oilwell
+   Varco、Raytheon Co、SIGNATURE BANK、First Republic 等）——冷却后重跑
+   binder 即可（增量，无需任何新决策）；
+2. 需修正/补充提议：Alliance Data(Bread Financial 改名)、Arconic(=Howmet,
+   限流)、People's United(正确 CIK 待查)、LABORATORY CORPORATION 大写变体
+   （与已绑定 LabCorp 同 Issuer，需跨 sid 传播或别名）。
