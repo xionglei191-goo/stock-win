@@ -9,7 +9,10 @@ from uuid import uuid4
 
 import pandas as pd
 
+from .action_review import _source_plain_text
 from .hashing import canonical_json_bytes, sha256_file, sha256_json
+from .models import SourceRole
+from .store import USPITStore
 
 
 EVIDENCE_REQUEST_VERSION = "us-pit-evidence-request-v2"
@@ -173,6 +176,59 @@ def build_operator_transition_evidence_requests(
             "ticker": _text(row.get("ticker")),
         }
 
+    def event_anchored_predecessor(
+        transition: dict, index: int, successor_name: str
+    ) -> dict[str, str]:
+        """Frozen rule A' (R3): anchor a predecessor absent from normalization
+        to an approved membership-event stable ID.  The frozen S&P evidence
+        object must contain both the operator-supplied predecessor name and
+        the normalization-resolved successor name verbatim."""
+        digest = _text(transition.get("predecessor_event_evidence_sha256")).lower()
+        predecessor_name = _text(transition.get("predecessor_name"))
+        if len(digest) != 64 or any(
+            character not in "0123456789abcdef" for character in digest
+        ):
+            raise ValueError(
+                f"transition {index} requires a valid predecessor_event_evidence_sha256"
+            )
+        if not predecessor_name:
+            raise ValueError(f"transition {index} requires predecessor_name")
+        dependencies = [
+            item
+            for batch in store.list_source_batches()
+            for item in batch.dependencies
+            if item.object_sha256 == digest
+            and item.dataset == "membership_events"
+            and item.role == SourceRole.SIGNAL_INPUT
+        ]
+        if not dependencies:
+            raise ValueError(
+                f"transition {index} predecessor event evidence is not a frozen "
+                "SIGNAL_INPUT membership_events dependency"
+            )
+        object_path = store.object_path(digest)
+        if not object_path.is_file():
+            raise ValueError(f"transition {index} predecessor event object is missing")
+        text = _source_plain_text(object_path.read_bytes()).upper()
+        if predecessor_name.upper() not in text:
+            raise ValueError(
+                f"transition {index} predecessor name is absent from the frozen event evidence"
+            )
+        if not successor_name or successor_name.upper() not in text:
+            raise ValueError(
+                f"transition {index} successor name is absent from the frozen event evidence"
+            )
+        return {
+            "name": predecessor_name,
+            "isin": "",
+            "cusip": "",
+            "lei": "",
+            "cik": "",
+            "ticker": "",
+            "event_anchored": "true",
+            "event_evidence_sha256": digest,
+        }
+
     rows: list[dict[str, Any]] = []
     for index, transition in enumerate(transitions):
         if not isinstance(transition, dict):
@@ -184,7 +240,15 @@ def build_operator_transition_evidence_requests(
             raise ValueError(f"transition {index} requires anchor_date and both security ids")
         if predecessor == successor:
             raise ValueError(f"transition {index} predecessor equals successor")
-        pre = identity_of(predecessor)
+        suc = identity_of(successor)
+        event_anchored = bool(
+            _text(transition.get("predecessor_event_evidence_sha256"))
+        )
+        pre = (
+            event_anchored_predecessor(transition, index, suc["name"])
+            if event_anchored
+            else identity_of(predecessor)
+        )
         suc = identity_of(successor)
         request_identity = {
             "audit_id": "OPERATOR_PROPOSED",
@@ -208,7 +272,11 @@ def build_operator_transition_evidence_requests(
                 "successor_cik": suc["cik"],
                 "predecessor_ticker": pre["ticker"],
                 "successor_ticker": suc["ticker"],
-                "match_basis": "OPERATOR_PROPOSED_ANCHOR_PAIR",
+                "match_basis": (
+                    "OPERATOR_EVENT_ANCHORED_PAIR"
+                    if event_anchored
+                    else "OPERATOR_PROPOSED_ANCHOR_PAIR"
+                ),
                 "required_authorities": "SEC|EXCHANGE|ISSUER",
                 "required_facts": (
                     "action_type;announced_at;effective_at;terms;successor_identity;"

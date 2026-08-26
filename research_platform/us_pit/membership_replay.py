@@ -14,6 +14,7 @@ class MembershipReplayResult:
     replayed: Mapping[pd.Timestamp, frozenset[str]]
     gaps: tuple[dict[str, Any], ...]
     reconciled_anchor_count: int
+    explanations: tuple[dict[str, Any], ...] = ()
 
 
 def _source_available_at(source: SourceDependency) -> pd.Timestamp:
@@ -98,6 +99,11 @@ def replay_causal_membership(
                 "effective_at", "source_id", "evidence_sha256",
             ]
         )
+    else:
+        add_rows = prepared_events.loc[
+            prepared_events["event_type"].astype(str).str.strip().str.upper().eq("ADD")
+        ]
+        add_event_security_ids = set(add_rows["security_id"].astype(str).str.strip())
     prepared_events["announced_utc"] = pd.to_datetime(
         prepared_events["announced_at"], errors="coerce", utc=True
     )
@@ -155,6 +161,8 @@ def replay_causal_membership(
         "TICKER_CHANGE", "RENAME", "SPLIT", "STOCK_DIVIDEND", "STOCK_MERGER",
         "REORGANIZATION",
     }
+    spinoff_successors: dict[str, list[dict[str, Any]]] = {}
+    add_event_security_ids: set[str] = set()
     identity_actions: list[dict[str, Any]] = []
     if not prepared_actions.empty:
         for raw in prepared_actions.to_dict(orient="records"):
@@ -162,7 +170,7 @@ def replay_causal_membership(
             predecessor = str(raw.get("security_id", "")).strip()
             successor = str(raw.get("successor_security_id", "")).strip()
             if (
-                kind not in identity_action_types
+                (kind not in identity_action_types and kind != "SPINOFF")
                 or not successor
                 or successor == predecessor
             ):
@@ -236,6 +244,15 @@ def replay_causal_membership(
                     }
                 )
                 continue
+            if kind == "SPINOFF":
+                spinoff_successors.setdefault(successor, []).append(
+                    {
+                        "action_id": action_id,
+                        "effective_day": effective_day,
+                        "effective_utc": effective,
+                    }
+                )
+                continue
             identity_actions.append(
                 {
                     "mutation_type": "IDENTITY_SUCCESSION",
@@ -249,6 +266,30 @@ def replay_causal_membership(
             )
 
     snapshots: list[dict[str, Any]] = []
+
+    add_effective_days: dict[str, list[pd.Timestamp]] = {}
+    for _, row in prepared_events.iterrows():
+        if str(row.get("event_type", "")).strip().upper() != "ADD":
+            continue
+        effective = row.get("effective_utc")
+        if pd.isna(effective):
+            continue
+        add_effective_days.setdefault(str(row["security_id"]).strip(), []).append(
+            pd.Timestamp(effective).tz_convert("America/New_York").tz_localize(None).normalize()
+        )
+
+    def _is_spinoff_residual(security_id: str, at_day: pd.Timestamp) -> bool:
+        """Frozen rule A' (R1): a spinoff successor with no official ADD by
+        ``at_day`` is a transient fund residual, never a member."""
+        entries = spinoff_successors.get(security_id)
+        if not entries:
+            return False
+        day = pd.Timestamp(at_day)
+        if not any(entry["effective_day"] <= day for entry in entries):
+            return False
+        adds = add_effective_days.get(security_id, [])
+        return not any(effective <= day for effective in adds)
+
     values = holdings.copy()
     values["as_of"] = pd.to_datetime(values.get("as_of_date"), errors="coerce").dt.normalize()
     for digest, group in values.groupby("content_sha256", dropna=False):
@@ -378,6 +419,7 @@ def replay_causal_membership(
         key=lambda item: (item["as_of"], item["available"], item["digest"]),
     )
     reconciled = 0
+    explanations: list[dict[str, Any]] = []
     for prior, following in zip(sec_anchors, sec_anchors[1:], strict=False):
         if not prior.get("available_members") or prior["validated"] is False and any(
             gap.get("evidence_sha256") == prior["digest"]
@@ -400,19 +442,44 @@ def replay_causal_membership(
         replayed, conflicts = apply_events(
             prior["available_members"], prior["available"], report_cutoff
         )
-        if conflicts or replayed != following["members"]:
+        missing = following["members"] - replayed
+        extra = replayed - following["members"]
+        explained_missing = sorted(
+            item for item in missing if _is_spinoff_residual(item, following["as_of"])
+        )
+        explained_extra = sorted(
+            item for item in extra if _is_spinoff_residual(item, following["as_of"])
+        )
+        unexplained_missing = missing - set(explained_missing)
+        unexplained_extra = extra - set(explained_extra)
+        if conflicts or unexplained_missing or unexplained_extra:
             gaps.append(
                 {
                     "code": "QUARTERLY_ANCHOR_RECONCILIATION_FAILED",
                     "anchor_date": following["as_of"].date().isoformat(),
-                    "missing": sorted(following["members"] - replayed)[:20],
-                    "extra": sorted(replayed - following["members"])[:20],
+                    "missing": sorted(unexplained_missing)[:20],
+                    "extra": sorted(unexplained_extra)[:20],
                     "conflicting_event_ids": conflicts[:20],
                 }
             )
             continue
         prior["validated"] = True
         reconciled += 1
+        if explained_missing or explained_extra:
+            explanations.append(
+                {
+                    "anchor_date": following["as_of"].date().isoformat(),
+                    "explained_missing": explained_missing,
+                    "explained_extra": explained_extra,
+                    "spinoff_action_ids": sorted(
+                        {
+                            entry["action_id"]
+                            for security_id in (*explained_missing, *explained_extra)
+                            for entry in spinoff_successors.get(security_id, [])
+                        }
+                    ),
+                }
+            )
 
     rows: list[dict[str, Any]] = []
     replayed_by_day: dict[pd.Timestamp, frozenset[str]] = {}
@@ -444,6 +511,24 @@ def replay_causal_membership(
                     "event_ids": conflicts[:20],
                 }
             )
+        residuals = sorted(
+            item for item in state if _is_spinoff_residual(item, decision)
+        )
+        if residuals:
+            state = frozenset(state - set(residuals))
+            explanations.append(
+                {
+                    "decision_date": decision.date().isoformat(),
+                    "excluded_spinoff_residuals": residuals,
+                    "spinoff_action_ids": sorted(
+                        {
+                            entry["action_id"]
+                            for security_id in residuals
+                            for entry in spinoff_successors.get(security_id, [])
+                        }
+                    ),
+                }
+            )
         replayed_by_day[decision] = state
         rows.extend(
             {
@@ -458,6 +543,7 @@ def replay_causal_membership(
         replayed_by_day,
         tuple(gaps),
         reconciled,
+        tuple(explanations),
     )
 
 

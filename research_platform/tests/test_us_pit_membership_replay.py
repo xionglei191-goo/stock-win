@@ -336,3 +336,191 @@ class CausalMembershipReplayTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SpinoffResidualReplayTests(unittest.TestCase):
+    """Frozen rule A' (R1/R2): spinoff successors without an official ADD are
+    transient fund residuals - never members, and never reconciliation
+    failures."""
+
+    def setUp(self) -> None:
+        sessions = pd.bdate_range("2021-06-30", "2021-09-30")
+        self.calendar = pd.DataFrame(
+            {
+                "session_date": sessions,
+                "market_close": [f"{day.date()}T16:00:00-04:00" for day in sessions],
+            }
+        )
+        self.first = "a" * 64
+        self.second = "b" * 64
+        self.action_hash = "d" * 64
+        self.sources = [
+            _anchor(self.first, "2021-06-30", "2021-08-27T20:00:00+00:00"),
+            _anchor(self.second, "2021-09-30", "2021-11-26T20:00:00+00:00"),
+            SourceDependency(
+                source_id="sec_reviewed_corporate_action",
+                source_version="sec-reviewed-corporate-action-v1",
+                role=SourceRole.SIGNAL_INPUT,
+                license_class=LicenseClass.OFFICIAL_PUBLIC,
+                object_sha256=self.action_hash,
+                observed_at="2026-08-14T00:00:00+00:00",
+                published_at="2021-07-01T14:30:00+00:00",
+                as_of_date="2021-07-01",
+                url="https://www.sec.gov/Archives/edgar/action.txt",
+                dataset="corporate_actions",
+                metadata={
+                    "publication_time_from_payload": True,
+                    "accepted_at_verified_in_payload": True,
+                    "accepted_at": "2021-07-01T14:30:00+00:00",
+                },
+            ),
+        ]
+        self.actions = pd.DataFrame(
+            [
+                {
+                    "action_id": "action-spin",
+                    "security_id": "us_isin_a",
+                    "successor_security_id": "us_isin_spin",
+                    "action_type": "SPINOFF",
+                    "announced_at": "2021-07-01T09:30:00-04:00",
+                    "effective_at": "2021-07-01T09:30:00-04:00",
+                    "terms_verified": "True",
+                    "source_id": "sec_reviewed_corporate_action",
+                    "evidence_sha256": self.action_hash,
+                }
+            ]
+        )
+
+    def _holdings(self, first_extra: list[str], second_extra: list[str]) -> pd.DataFrame:
+        rows = [
+            {
+                "as_of_date": "2021-06-30",
+                "content_sha256": self.first,
+                "evidence_role": "VALIDATION_ANCHOR",
+                "security_id": "us_isin_a",
+            },
+            {
+                "as_of_date": "2021-09-30",
+                "content_sha256": self.second,
+                "evidence_role": "VALIDATION_ANCHOR",
+                "security_id": "us_isin_a",
+            },
+            {
+                "as_of_date": "2021-09-30",
+                "content_sha256": self.second,
+                "evidence_role": "VALIDATION_ANCHOR",
+                "security_id": "us_isin_b",
+            },
+        ]
+        for security_id in first_extra:
+            rows.append(
+                {
+                    "as_of_date": "2021-06-30",
+                    "content_sha256": self.first,
+                    "evidence_role": "VALIDATION_ANCHOR",
+                    "security_id": security_id,
+                }
+            )
+        for security_id in second_extra:
+            rows.append(
+                {
+                    "as_of_date": "2021-09-30",
+                    "content_sha256": self.second,
+                    "evidence_role": "VALIDATION_ANCHOR",
+                    "security_id": security_id,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def _events(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "event_id": "event-add-b",
+                    "security_id": "us_isin_b",
+                    "event_type": "ADD",
+                    "announced_at": "2021-09-03T19:00:00-04:00",
+                    "effective_at": "2021-09-20T09:30:00-04:00",
+                    "source_id": "spglobal_sp500_membership_events",
+                    "evidence_sha256": "c" * 64,
+                }
+            ]
+        )
+
+    def _sources(self) -> tuple:
+        return tuple(self.sources) + (
+            SourceDependency(
+                source_id="spglobal_sp500_membership_events",
+                source_version="1",
+                role=SourceRole.SIGNAL_INPUT,
+                license_class=LicenseClass.OFFICIAL_PUBLIC,
+                object_sha256="c" * 64,
+                observed_at="2026-08-14T00:00:00+00:00",
+                published_at="2021-09-03T19:00:00-04:00",
+                as_of_date="2021-09-20",
+                url="https://press.spglobal.com/event",
+                dataset="membership_events",
+                metadata={"publication_time_from_payload": True},
+            ),
+        )
+
+    def test_spinoff_residual_in_following_anchor_does_not_fail_reconciliation(
+        self,
+    ) -> None:
+        result = replay_causal_membership(
+            self._holdings(first_extra=[], second_extra=["us_isin_spin"]),
+            self._events(),
+            [pd.Timestamp("2021-08-31"), pd.Timestamp("2021-09-30")],
+            self._sources(),
+            self.calendar,
+            self.actions,
+        )
+        codes = {gap["code"] for gap in result.gaps}
+        self.assertNotIn("QUARTERLY_ANCHOR_RECONCILIATION_FAILED", codes)
+        anchor_explanations = [
+            item for item in result.explanations if "anchor_date" in item
+        ]
+        self.assertEqual(1, len(anchor_explanations))
+        self.assertEqual(["us_isin_spin"], anchor_explanations[0]["explained_missing"])
+        memberships = result.memberships
+        seeded = memberships.loc[
+            memberships["decision_date"].eq(pd.Timestamp("2021-09-30")),
+            "security_id",
+        ]
+        self.assertEqual({"us_isin_a", "us_isin_b"}, set(seeded))
+
+    def test_spinoff_residual_extra_and_decision_exclusion_stay_pure(self) -> None:
+        result = replay_causal_membership(
+            self._holdings(first_extra=["us_isin_spin"], second_extra=[]),
+            self._events(),
+            [pd.Timestamp("2021-08-31"), pd.Timestamp("2021-09-30")],
+            self._sources(),
+            self.calendar,
+            self.actions,
+        )
+        codes = {gap["code"] for gap in result.gaps}
+        self.assertNotIn("QUARTERLY_ANCHOR_RECONCILIATION_FAILED", codes)
+        for decision in (pd.Timestamp("2021-08-31"), pd.Timestamp("2021-09-30")):
+            seeded = set(
+                result.memberships.loc[
+                    result.memberships["decision_date"].eq(decision), "security_id"
+                ]
+            )
+            self.assertNotIn("us_isin_spin", seeded)
+
+    def test_spinoff_residual_without_approved_action_still_fails_closed(self) -> None:
+        result = replay_causal_membership(
+            self._holdings(first_extra=[], second_extra=["us_isin_spin"]),
+            self._events(),
+            [pd.Timestamp("2021-08-31"), pd.Timestamp("2021-09-30")],
+            self._sources(),
+            self.calendar,
+            pd.DataFrame(),
+        )
+        failed = [
+            gap
+            for gap in result.gaps
+            if gap.get("code") == "QUARTERLY_ANCHOR_RECONCILIATION_FAILED"
+        ]
+        self.assertEqual(1, len(failed))
+        self.assertIn("us_isin_spin", failed[0]["missing"])
