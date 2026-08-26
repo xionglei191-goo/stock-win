@@ -101,7 +101,7 @@ def conformed_name_from_atom(payload_text: str) -> str:
 def main() -> None:
     user_agent = _require_sec_user_agent(None)
     store = USPITStore("data/us_pit")
-    review_dir = Path("data/us_pit/review_inputs/oxalpha_final_issuers").resolve()
+    review_dir = Path("data/us_pit/review_inputs/oxalpha_final_merged4").resolve()
     output = Path("data/us_pit/review_inputs/oxalpha_final_cikbound").resolve()
     previous = Path("data/us_pit/review_inputs/oxalpha_final_cikbound.prev")
     carried: dict[str, dict] = {}

@@ -166,3 +166,18 @@ GLEIF ISIN→LEI 每日映射文件只覆盖新发行 ISIN，不含存量美股�
 机制已支持 .prev 增量）；其余为错误 CIK 提议、无行动关联的改名
 （Fortune Brands→Innovations 等）、以及 FTS 全文检索噪声导致的
 名称匹配未决。需要更精确的官方 name→CIK 工具或逐案文件证据后再闭合。
+
+## D4 执行记录（2026-08-26）
+
+SEC 官方索引绑定（506 家）+ EDGAR 提议-验证绑定（55 家，四重名称校验，
+错误提议全部被自动拒绝）后，ISSUER_IDENTITY 缺口 **652 → 13**。
+
+剩余 13 家为 EDGAR 对本机 IP 软限流（"No matching CIK" 页面，连 RTX 等
+活跃公司也返回）导致的暂时失败；其提议 CIK 已在
+`tmp/exited_cik_proposals.json` 中排队。**限流冷却后重跑一次增量绑定器
+（输入已指向 oxalpha_final_merged4，自动携带全部既有绑定并只补缺失项），
+随后以 `oxalpha_final_cikbound` 重新装配即可闭合。**
+
+注意：绑定器输入已改为全量合并态 `oxalpha_final_merged4`
+（批次批准 + SEC 索引层 + EDGAR 提议层三层绑定齐全），后续任何重建
+不会再发生层级丢失。
