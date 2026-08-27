@@ -690,7 +690,10 @@ class USPITMarketPreparer:
                     ),
                 )
             )
-        self._validate_next_session_opens(raw, memberships, calendar, gaps)
+        self._validate_next_session_opens(
+            raw, memberships, calendar, gaps,
+            excluded_security_ids=no_data_security_ids,
+        )
 
         frames = {
             **{name: inputs[name] for name in PASSTHROUGH_ARTIFACTS},
@@ -2480,6 +2483,7 @@ class USPITMarketPreparer:
         memberships: pd.DataFrame,
         calendar: pd.DataFrame,
         gaps: list[MarketPreparationGap],
+        excluded_security_ids: set[str] = frozenset(),
     ) -> None:
         if raw.empty or memberships.empty or calendar.empty:
             return
@@ -2488,34 +2492,45 @@ class USPITMarketPreparer:
         ).normalize()
         raw_value = raw.copy()
         raw_value["date"] = pd.to_datetime(raw_value["date"], errors="coerce").dt.normalize()
+        # Pre-group by security for fast next-session lookup; SCOPE-C excluded
+        # securities have no obtainable TDX bars, so they must not be required
+        # to supply a next execution open.
+        raw_by: dict[str, pd.DataFrame] = {}
+        if not raw_value.empty:
+            for sid, group in raw_value.groupby("security_id", sort=False):
+                raw_by[str(sid)] = group
+        excluded = set(str(x) for x in excluded_security_ids)
         for member in memberships[["decision_date", "security_id"]].itertuples(
             index=False
         ):
             decision = pd.Timestamp(member.decision_date).normalize()
+            security_id = str(member.security_id)
+            if security_id in excluded:
+                continue
             later = sessions[sessions > decision]
             if not len(later):
                 gaps.append(
                     MarketPreparationGap(
                         code="NEXT_EXECUTION_SESSION_UNKNOWN",
                         dataset="xnys_calendar",
-                        security_id=str(member.security_id),
+                        security_id=security_id,
                         session_date=decision.date().isoformat(),
                         detail="frozen calendar cannot identify the next execution session",
                     )
                 )
                 continue
             next_session = later[0]
-            match = raw_value.loc[
-                raw_value["security_id"].astype(str).eq(str(member.security_id))
-                & raw_value["date"].eq(next_session)
-            ]
+            group = raw_by.get(security_id)
+            match = pd.DataFrame()
+            if group is not None and not group.empty:
+                match = group.loc[group["date"].eq(next_session)]
             opens = pd.to_numeric(match.get("Open"), errors="coerce")
             if len(match) != 1 or opens.isna().any() or (opens <= 0).any():
                 gaps.append(
                     MarketPreparationGap(
                         code="NEXT_EXECUTION_OPEN_MISSING",
                         dataset="bars_raw",
-                        security_id=str(member.security_id),
+                        security_id=security_id,
                         session_date=next_session.date().isoformat(),
                         detail="next actual XNYS Open is absent; no value was filled",
                     )
