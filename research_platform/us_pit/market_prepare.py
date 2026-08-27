@@ -2335,14 +2335,6 @@ class USPITMarketPreparer:
         raw_keys = set(
             zip(raw["security_id"].astype(str), pd.to_datetime(raw["date"]).dt.normalize(), strict=True)
         )
-        signal_keys = set(
-            zip(
-                pd.to_datetime(signal["decision_date"]).dt.normalize(),
-                signal["security_id"].astype(str),
-                pd.to_datetime(signal["date"]).dt.normalize(),
-                strict=True,
-            )
-        )
         import numpy as _np
 
         rows: list[dict[str, Any]] = []
@@ -2366,10 +2358,23 @@ class USPITMarketPreparer:
         for sid, day in exception_keys:
             except_dates_by_sid.setdefault(sid, set()).add(day)
         signal_dates_by_member: dict[tuple[str, str], set[pd.Timestamp]] = {}
-        for decision, sid, day in signal_keys:
-            signal_dates_by_member.setdefault(
-                (sid, pd.Timestamp(decision).strftime("%Y-%m-%d")), set()
-            ).add(day)
+        if not signal.empty:
+            signal_view = signal.copy()
+            signal_view["_d"] = pd.to_datetime(
+                signal_view["date"], errors="coerce"
+            ).dt.normalize()
+            signal_view["_k"] = pd.to_datetime(
+                signal_view["decision_date"], errors="coerce"
+            ).dt.normalize().dt.strftime("%Y-%m-%d")
+            signal_view["_key"] = (
+                signal_view["security_id"].astype(str)
+                + "|"
+                + signal_view["_k"]
+            )
+            grouped = signal_view.groupby("_key", sort=False)["_d"].agg(set)
+            for key, dates in grouped.items():
+                sid, day = str(key).split("|", 1)
+                signal_dates_by_member[(sid, day)] = set(dates)
 
         def _cumcounts(dates: set[pd.Timestamp]) -> _np.ndarray:
             mask = _np.zeros(len(sessions), dtype=_np.int64)
@@ -2441,12 +2446,15 @@ class USPITMarketPreparer:
             )
             except_dates = except_dates_by_sid.get(security_id, set())
             raw_dates = raw_dates_by_sid.get(security_id, set())
+            signal_bucket = signal_dates_by_member.get(
+                (security_id, decision.strftime("%Y-%m-%d")), set()
+            )
             explained = sum(
                 1
                 for day in except_dates
                 if start_idx <= session_position.get(day, -1) < end_idx
                 and day not in raw_dates
-                and (decision, security_id, day) not in signal_keys
+                and day not in signal_bucket
             )
             passed = (
                 expected_count > 0
