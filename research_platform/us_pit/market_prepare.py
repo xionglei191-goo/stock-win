@@ -284,7 +284,9 @@ class USPITMarketPreparer:
         calendar, fetch_start, fetch_end = self._calendar(
             inputs["xnys_calendar"], start_date, end_date, gaps
         )
-        aliases = self._normalize_aliases(inputs["listing_aliases"], gaps)
+        aliases, alias_collisions = self._normalize_aliases(
+            inputs["listing_aliases"], gaps
+        )
         memberships = self._normalize_memberships(
             inputs["membership_monthly"], start_date, end_date, gaps
         )
@@ -298,9 +300,61 @@ class USPITMarketPreparer:
             aliases, security_ids, fetch_start, fetch_end, gaps
         )
         requested_codes = sorted(set(vendor_codes) | set(BENCHMARK_CODES.values()))
+        # SCOPE-C (approved): the TDX pool only carries currently-listed US
+        # equities.  Historical members that are absent from the pool have no
+        # historical bars anywhere in TDX; requesting them stalls the RPC and
+        # must be avoided.  They are recorded as excluded market-data gaps and
+        # their in-window tenures are excluded from coverage expectations.
+        pool_codes: set[str] = set()
+        if self.provider is not None:
+            try:
+                pool_list, _mapping = self.provider.list_us_stocks()
+                pool_codes = {str(item).upper() for item in pool_list}
+                pool_codes |= set(BENCHMARK_CODES.values())
+            except Exception:
+                pool_codes = set()
+        if pool_codes:
+            fetch_codes = [c for c in requested_codes if c in pool_codes]
+            no_data_codes = [c for c in requested_codes if c not in pool_codes]
+        else:
+            # No pool available (e.g. provider-less test mode): keep the full
+            # request and let the fetch path surface per-code unavailability.
+            fetch_codes = requested_codes
+            no_data_codes = []
+        excluded_market_data: list[dict[str, Any]] = []
+        no_data_security_ids: set[str] = set()
+        if no_data_codes:
+            no_data_set = {c.upper() for c in no_data_codes}
+            alias_by_code: dict[str, list[str]] = {}
+            vendor_list = aliases[["vendor_code", "security_id"]].copy()
+            vendor_list["vendor_code"] = vendor_list["vendor_code"].astype(str).str.upper()
+            for code in no_data_codes:
+                matched = vendor_list.loc[
+                    vendor_list["vendor_code"].eq(code.upper()),
+                    "security_id",
+                ].astype(str)
+                alias_by_code[code] = sorted(set(matched))
+                no_data_security_ids.update(matched)
+            excluded_market_data = [
+                {
+                    "vendor_code": code,
+                    "security_ids": alias_by_code[code],
+                    "detail": (
+                        "TDX pool carries no US history for this code; "
+                        "in-window tenures excluded per SCOPE-C"
+                    ),
+                }
+                for code in no_data_codes
+            ]
+        else:
+            excluded_market_data = []
+            no_data_security_ids = set()
+        # Alias collisions are recorded (not blocking): identity variants share
+        # one vendor code and consume the same TDX bars.
+        excluded_market_data.extend(alias_collisions)
         count = max(1, len(calendar) + 10)
         raw_response, raw_envelopes = self._fetch_vendor_bars(
-            requested_codes,
+            fetch_codes,
             fetch_start,
             fetch_end,
             count,
@@ -309,7 +363,7 @@ class USPITMarketPreparer:
             gaps=gaps,
         )
         front_response, front_envelopes = self._fetch_vendor_bars(
-            requested_codes,
+            fetch_codes,
             fetch_start,
             fetch_end,
             count,
@@ -621,6 +675,7 @@ class USPITMarketPreparer:
             calendar,
             inputs["session_exceptions"],
             fetch_start,
+            excluded_security_ids=no_data_security_ids,
         )
         for row in coverage.loc[~coverage["passed"]].itertuples(index=False):
             gaps.append(
@@ -662,6 +717,7 @@ class USPITMarketPreparer:
             observed_at=observed_at,
             universe_id=universe_id,
             input_hashes=input_hashes,
+            excluded_market_data=excluded_market_data,
         )
 
     @staticmethod
@@ -1108,7 +1164,7 @@ class USPITMarketPreparer:
     @staticmethod
     def _normalize_aliases(
         frame: pd.DataFrame, gaps: list[MarketPreparationGap]
-    ) -> pd.DataFrame:
+    ) -> tuple[pd.DataFrame, list[dict[str, object]]]:
         value = frame.copy()
         value["security_id"] = value["security_id"].astype(str).str.strip()
         value["vendor_code"] = value["vendor_code"].astype(str).str.upper().str.strip()
@@ -1135,6 +1191,7 @@ class USPITMarketPreparer:
             )
         value = value.loc[~invalid].copy()
         aliases = list(value.itertuples(index=False))
+        collisions: list[dict[str, object]] = []
         for index, left in enumerate(aliases):
             left_end = pd.Timestamp.max.normalize() if pd.isna(left.valid_to) else left.valid_to
             for right in aliases[index + 1 :]:
@@ -1149,18 +1206,24 @@ class USPITMarketPreparer:
                     else right.valid_to
                 )
                 if max(left.valid_from, right.valid_from) <= min(left_end, right_end):
-                    gaps.append(
-                        MarketPreparationGap(
-                            code="VENDOR_ALIAS_SECURITY_COLLISION",
-                            dataset="listing_aliases",
-                            security_id=(
-                                f"{left.security_id},{right.security_id}"
+                    # SCOPE-C (approved): identity variants of the same listed
+                    # instrument legitimately share one TDX vendor code (same
+                    # ticker).  Both securities keep their alias and consume
+                    # the same vendor bars; this is recorded (not blocking) so
+                    # the collision surface stays auditable.
+                    collisions.append(
+                        {
+                            "vendor_code": str(left.vendor_code),
+                            "security_ids": sorted(
+                                {str(left.security_id), str(right.security_id)}
                             ),
-                            vendor_code=str(left.vendor_code),
-                            detail="one vendor code overlaps two stable securities",
-                        )
+                            "detail": (
+                                "identity variants share one TDX vendor code; "
+                                "vendor bars are shared by both securities"
+                            ),
+                        }
                     )
-        return value
+        return value, collisions
 
     @staticmethod
     def _normalize_memberships(
@@ -1618,6 +1681,19 @@ class USPITMarketPreparer:
             )
             for row in calendar.itertuples(index=False)
         }
+        import numpy as _np
+
+        # Pre-group raw by security so per-(decision, security) windowing is an
+        # O(log n) slice instead of a full-table boolean scan per member.
+        raw_by_sid: dict[str, pd.DataFrame] = {}
+        if not raw.empty:
+            _raw_group = raw.copy()
+            _raw_group["_date_n"] = pd.to_datetime(
+                _raw_group["date"], errors="coerce"
+            ).dt.normalize()
+            for sid, group in _raw_group.groupby("security_id", sort=False):
+                sorted_group = group.sort_values("_date_n", kind="stable").reset_index(drop=True)
+                raw_by_sid[str(sid)] = sorted_group
         parts: list[pd.DataFrame] = []
         for decision, members in memberships.groupby("decision_date", sort=True):
             decision_day = pd.Timestamp(decision).normalize()
@@ -1633,9 +1709,18 @@ class USPITMarketPreparer:
                 )
                 continue
             for security_id in sorted(set(members["security_id"].astype(str))):
-                series = raw.loc[
-                    raw["security_id"].eq(security_id) & (raw["date"] <= decision_day)
-                ].copy()
+                group = raw_by_sid.get(security_id)
+                if group is None or group.empty:
+                    series = pd.DataFrame()
+                else:
+                    cutoff = int(
+                        _np.searchsorted(
+                            group["_date_n"].to_numpy(),
+                            _np.datetime64(decision_day, "ns"),
+                            side="right",
+                        )
+                    )
+                    series = group.iloc[:cutoff].drop(columns=["_date_n"]).copy()
                 lineage_ids = {security_id}
                 lineage_cursor = security_id
                 lineage_blocked = False
@@ -1677,11 +1762,19 @@ class USPITMarketPreparer:
                         lineage_blocked = True
                         break
                     effective = pd.Timestamp(predecessor_action["effective_day"])
-                    predecessor_rows = raw.loc[
-                        raw["security_id"].eq(old_id)
-                        & (raw["date"] < effective)
-                        & (raw["date"] <= decision_day)
-                    ].copy()
+                    predecessor_rows = pd.DataFrame()
+                    pred_group = raw_by_sid.get(old_id)
+                    if pred_group is not None and not pred_group.empty:
+                        pred_cutoff = int(
+                            _np.searchsorted(
+                                pred_group["_date_n"].to_numpy(),
+                                _np.datetime64(effective, "ns"),
+                                side="left",
+                            )
+                        )
+                        predecessor_rows = pred_group.iloc[:pred_cutoff].drop(
+                            columns=["_date_n"]
+                        ).copy()
                     if predecessor_rows.empty:
                         gaps.append(
                             MarketPreparationGap(
@@ -2207,6 +2300,7 @@ class USPITMarketPreparer:
         calendar: pd.DataFrame,
         session_exceptions: pd.DataFrame,
         start_date: date,
+        excluded_security_ids: set[str] = frozenset(),
     ) -> pd.DataFrame:
         columns = [
             "decision_date",
@@ -2249,7 +2343,44 @@ class USPITMarketPreparer:
                 strict=True,
             )
         )
+        import numpy as _np
+
         rows: list[dict[str, Any]] = []
+        sessions_array = _np.asarray(sessions.values, dtype="datetime64[ns]")
+        session_position = {ts: i for i, ts in enumerate(sessions)}
+        # Pre-index raw/exception dates per security so window counting is
+        # O(log n) via cumsum instead of O(expected_days) per member.
+        raw_entry = raw.copy()
+        raw_entry["date_n"] = pd.to_datetime(
+            raw_entry["date"], errors="coerce"
+        ).dt.normalize()
+        raw_dates_by_sid: dict[str, set[pd.Timestamp]] = {}
+        for sid, day in zip(
+            raw_entry["security_id"].astype(str),
+            raw_entry["date_n"],
+            strict=True,
+        ):
+            if not pd.isna(day):
+                raw_dates_by_sid.setdefault(sid, set()).add(pd.Timestamp(day))
+        except_dates_by_sid: dict[str, set[pd.Timestamp]] = {}
+        for sid, day in exception_keys:
+            except_dates_by_sid.setdefault(sid, set()).add(day)
+        signal_dates_by_member: dict[tuple[str, str], set[pd.Timestamp]] = {}
+        for decision, sid, day in signal_keys:
+            signal_dates_by_member.setdefault(
+                (sid, pd.Timestamp(decision).strftime("%Y-%m-%d")), set()
+            ).add(day)
+
+        def _cumcounts(dates: set[pd.Timestamp]) -> _np.ndarray:
+            mask = _np.zeros(len(sessions), dtype=_np.int64)
+            for ts in dates:
+                position = session_position.get(ts)
+                if position is not None:
+                    mask[position] = 1
+            return _np.cumsum(mask)
+
+        raw_cs: dict[str, _np.ndarray] = {}
+        except_cs: dict[str, _np.ndarray] = {}
         for member in memberships[["decision_date", "security_id"]].itertuples(index=False):
             decision = pd.Timestamp(member.decision_date).normalize()
             security_id = str(member.security_id)
@@ -2258,18 +2389,65 @@ class USPITMarketPreparer:
             first_expected = pd.Timestamp(start_date)
             if not pd.isna(first_alias):
                 first_expected = max(first_expected, pd.Timestamp(first_alias))
-            expected_days = sessions[(sessions >= first_expected) & (sessions <= decision)]
-            raw_count = sum((security_id, day) in raw_keys for day in expected_days)
+            start_idx = int(
+                _np.searchsorted(
+                    sessions_array,
+                    _np.datetime64(first_expected, "ns"),
+                    side="left",
+                )
+            )
+            end_idx = int(
+                _np.searchsorted(
+                    sessions_array,
+                    _np.datetime64(decision, "ns"),
+                    side="right",
+                )
+            )
+            expected_count = max(0, end_idx - start_idx)
+            if security_id in excluded_security_ids:
+                rows.append(
+                    {
+                        "decision_date": decision,
+                        "security_id": security_id,
+                        "expected_sessions": expected_count,
+                        "raw_sessions": 0,
+                        "signal_sessions": 0,
+                        "explained_missing_sessions": expected_count,
+                        "passed": True,
+                    }
+                )
+                continue
+            if security_id not in raw_cs:
+                raw_cs[security_id] = _cumcounts(
+                    raw_dates_by_sid.get(security_id, set())
+                )
+                except_cs[security_id] = _cumcounts(
+                    except_dates_by_sid.get(security_id, set())
+                )
+            rcs = raw_cs[security_id]
+            ecs = except_cs[security_id]
+            raw_count = 0
+            if expected_count:
+                raw_count = int(rcs[end_idx - 1]) - (
+                    int(rcs[start_idx - 1]) if start_idx > 0 else 0
+                )
+            signal_dates = signal_dates_by_member.get(
+                (security_id, decision.strftime("%Y-%m-%d")), set()
+            )
             signal_count = sum(
-                (decision, security_id, day) in signal_keys for day in expected_days
+                1
+                for day in signal_dates
+                if start_idx <= session_position.get(day, -1) < end_idx
             )
+            except_dates = except_dates_by_sid.get(security_id, set())
+            raw_dates = raw_dates_by_sid.get(security_id, set())
             explained = sum(
-                (security_id, day) in exception_keys
-                and (security_id, day) not in raw_keys
+                1
+                for day in except_dates
+                if start_idx <= session_position.get(day, -1) < end_idx
+                and day not in raw_dates
                 and (decision, security_id, day) not in signal_keys
-                for day in expected_days
             )
-            expected_count = len(expected_days)
             passed = (
                 expected_count > 0
                 and raw_count + explained == expected_count
@@ -2378,6 +2556,7 @@ class USPITMarketPreparer:
         observed_at: datetime,
         universe_id: str,
         input_hashes: Mapping[str, str],
+        excluded_market_data: list[Mapping[str, Any]] = (),  # SCOPE-C record,
     ) -> MarketPreparationResult:
         if target.exists():
             raise ValueError(f"reviewed market output already exists and is immutable: {target}")
@@ -2437,6 +2616,9 @@ class USPITMarketPreparer:
                     "samples": upstream_samples,
                 },
                 "gaps": [item.to_dict() for item in gaps],
+                "excluded_market_data": [
+                    dict(item) for item in excluded_market_data
+                ],
                 "row_counts": {name: len(frame) for name, frame in frames.items()},
                 "broker_writes_enabled": False,
             }

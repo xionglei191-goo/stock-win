@@ -721,20 +721,108 @@ class USPITReviewWorkspaceAssembler:
 
     @staticmethod
     def _listing_aliases(resolved: pd.DataFrame) -> pd.DataFrame:
+        # LISTING-ALIASES-TDX-EV1 (approved): TDX vendor aliases are derived from
+        # the official security identity (ticker + exchange vetted from iShares/
+        # SEC candidates), not from whether a holding row was a validation anchor.
+        # An anchor proves identity; the reviewed ticker/exchange is the market
+        # access handle used later to request .US bars.  Unresolvable historical
+        # members are handled downstream (prepare-market) as known gaps.
+        # Consecutive same-ticker candidate rows merge into one interval per
+        # (security, ticker) so a security only ever has one live alias at a
+        # time (e.g. FB.US then META.US, never both), which keeps prepare-market
+        # alias checks unambiguous.
         columns = sorted(REQUIRED_ARTIFACT_COLUMNS["listing_aliases"])
-        rows = [
-            {
-                "security_id": row["security_id"],
-                "ticker": row["ticker_resolved"],
-                "vendor_code": f"{row['ticker_resolved']}.US",
-                "exchange": row["exchange_resolved"],
-                "valid_from": row["valid_from_resolved"],
-                "valid_to": row["valid_to_resolved"],
-            }
-            for row in resolved.to_dict(orient="records")
-            if _clean_text(row.get("ticker_resolved")) is not None
-            and _clean_text(row.get("exchange_resolved")) is not None
-        ]
+        exchange_map = {
+            "NYSE": "XNYS",
+            "NASDAQ": "XNAS",
+            "NYSE ARCA": "XNYS",
+            "CBOE BZX": "XNAS",
+        }
+
+        def _ts(value: object) -> pd.Timestamp | None:
+            if value is None:
+                return None
+            try:
+                ts = pd.Timestamp(value)
+                if pd.isna(ts):
+                    return None
+                return ts.normalize()
+            except (ValueError, TypeError):
+                return None
+
+        by_security: dict[str, list[tuple[str, str, object, object]]] = {}
+        for row in resolved.to_dict(orient="records"):
+            ticker = _clean_text(row.get("ticker") or row.get("ticker_resolved"))
+            if ticker is None:
+                continue
+            exchange = _clean_text(
+                row.get("exchange") or row.get("exchange_resolved")
+            )
+            exchange_handle = exchange_map.get(
+                "".join(str(exchange or "").upper().split())
+            )
+            if exchange_handle is None:
+                continue
+            sid = str(row["security_id"])
+            valid_from = row.get("valid_from_resolved") or row.get("valid_from")
+            valid_to = row.get("valid_to_resolved") or row.get("valid_to")
+            by_security.setdefault(sid, []).append(
+                (ticker, exchange_handle, valid_from, valid_to)
+            )
+
+        rows: list[dict[str, object]] = []
+        for sid, entries in by_security.items():
+            ordered = sorted(
+                entries, key=lambda item: (_ts(item[2]) or pd.Timestamp.min)
+            )
+            segments: list[list[tuple[str, str, object, object]]] = []
+            for entry in ordered:
+                ticker = entry[0]
+                if segments and segments[-1][0][0] == ticker:
+                    segments[-1].append(entry)
+                else:
+                    segments.append([entry])
+            for index, segment in enumerate(segments):
+                ticker = segment[0][0]
+                exchange_handle = segment[0][1]
+                from_values = [_ts(item[2]) for item in segment]
+                to_values = [_ts(item[3]) for item in segment]
+                present_from = [v for v in from_values if v is not None]
+                present_to = [v for v in to_values if v is not None]
+                valid_from = min(present_from) if present_from else None
+                # Interval ends just before the next ticker segment starts so a
+                # security never holds two live aliases at once; the last
+                # segment stays open-ended (None).
+                if index + 1 < len(segments):
+                    next_from_values = [
+                        _ts(item[2]) for item in segments[index + 1]
+                    ]
+                    present_next = [
+                        v for v in next_from_values if v is not None
+                    ]
+                    next_from = min(present_next) if present_next else None
+                    if next_from is not None:
+                        valid_to = next_from - pd.Timedelta(days=1)
+                        if valid_from is not None and valid_to < valid_from:
+                            valid_to = valid_from
+                    else:
+                        valid_to = max(present_to) if present_to else None
+                else:
+                    valid_to = max(present_to) if present_to else None
+                rows.append(
+                    {
+                        "security_id": sid,
+                        "ticker": ticker,
+                        "vendor_code": f"{ticker}.US",
+                        "exchange": exchange_handle,
+                        "valid_from": (
+                            valid_from.date().isoformat() if valid_from is not None else None
+                        ),
+                        "valid_to": (
+                            valid_to.date().isoformat() if valid_to is not None else None
+                        ),
+                    }
+                )
         frame = pd.DataFrame(rows, columns=columns).drop_duplicates()
         if frame.empty:
             return frame

@@ -166,7 +166,11 @@ class TdxProvider(AbstractContextManager["TdxProvider"]):
         client = TQReadOnlyClient(timeout_seconds=120.0)
         envelopes: list[TQRawRPCEnvelope] = []
         result: dict[str, pd.DataFrame] = {}
-        batch_size = max(1, min(50, self.config.performance.bar_batch_size))
+        # TDX batch RPC empirically returns usable rows for only the first
+        # ~12 codes per request; cap the batch at 10 (verified all-ok) so no
+        # valid vendor series is silently dropped.
+        configured = int(self.config.performance.bar_batch_size or 10)
+        batch_size = max(1, min(10, configured))
         for batch in _chunks(normalized, batch_size):
             envelope = client.call_raw(
                 "get_market_data",
