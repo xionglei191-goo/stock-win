@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import json
 import math
+import re
+from collections import Counter
 import os
 import shutil
 import stat
@@ -16,6 +18,7 @@ from zoneinfo import ZoneInfo
 import exchange_calendars as xcals
 import pandas as pd
 
+from .evidence_time import source_available_at
 from .hashing import canonical_json_bytes, sha256_bytes, sha256_file, sha256_json
 from .models import LicenseClass, SourceDependency, SourceRole, UNIVERSE_ID
 from .quality import REQUIRED_ARTIFACT_COLUMNS
@@ -296,9 +299,44 @@ class USPITMarketPreparer:
         security_ids = sorted(set(memberships["security_id"].astype(str)))
         self._validate_security_master(inputs["security_master"], security_ids, gaps)
 
-        vendor_codes = self._required_vendor_codes(
-            aliases, security_ids, fetch_start, fetch_end, gaps
+        corporate_actions = inputs["corporate_actions"]
+        spinoff_successor_ids: list[str] = []
+        if "successor_security_id" in corporate_actions.columns:
+            spinoff_successor_ids = sorted(
+                {
+                    str(item).strip()
+                    for item in corporate_actions.loc[
+                        corporate_actions["action_type"]
+                        .astype(str)
+                        .str.strip()
+                        .str.upper()
+                        .eq("SPINOFF")
+                        & corporate_actions["security_id"]
+                        .astype(str)
+                        .isin(security_ids),
+                        "successor_security_id",
+                    ]
+                    if str(item).strip().startswith("us_")
+                }
+            )
+        market_input_security_ids = sorted(
+            set(security_ids) | set(spinoff_successor_ids)
         )
+        self._validate_security_master(
+            inputs["security_master"], market_input_security_ids, gaps
+        )
+
+        vendor_codes = self._required_vendor_codes(
+            aliases, market_input_security_ids, fetch_start, fetch_end, gaps
+        )
+        spinoff_vendor_codes = {
+            str(item).strip().upper()
+            for item in aliases.loc[
+                aliases["security_id"].astype(str).isin(spinoff_successor_ids),
+                "vendor_code",
+            ]
+            if str(item).strip()
+        }
         requested_codes = sorted(set(vendor_codes) | set(BENCHMARK_CODES.values()))
         # SCOPE-C (approved): the TDX pool only carries currently-listed US
         # equities.  Historical members that are absent from the pool have no
@@ -306,23 +344,56 @@ class USPITMarketPreparer:
         # must be avoided.  They are recorded as excluded market-data gaps and
         # their in-window tenures are excluded from coverage expectations.
         pool_codes: set[str] = set()
+        pool_mapping: dict[str, str] = {}
+        pool_capture_ref = None
         if self.provider is not None:
             try:
-                pool_list, _mapping = self.provider.list_us_stocks()
+                pool_list, raw_pool_mapping = self.provider.list_us_stocks()
+                pool_mapping = {
+                    str(key).upper(): str(value)
+                    for key, value in raw_pool_mapping.items()
+                }
                 pool_codes = {str(item).upper() for item in pool_list}
+                pool_capture_ref = self.store.put_bytes(
+                    canonical_json_bytes(
+                        {
+                            "format_version": "tdx-us-stock-pool-capture-v1",
+                            "codes": sorted(pool_codes),
+                            "names": {
+                                str(key).upper(): str(value)
+                                for key, value in sorted(pool_mapping.items())
+                            },
+                        }
+                    ),
+                    media_type="application/json",
+                )
                 pool_codes |= set(BENCHMARK_CODES.values())
             except Exception:
                 pool_codes = set()
+                pool_mapping = {}
+                pool_capture_ref = None
         if pool_codes:
-            fetch_codes = [c for c in requested_codes if c in pool_codes]
-            no_data_codes = [c for c in requested_codes if c not in pool_codes]
+            # Reviewed spinoff successors are required causal valuation inputs.
+            # TDX can serve their bars even when its current-stock discovery
+            # pool omits the child listing, so fetch those exact reviewed codes
+            # without treating them as Scope-C membership securities.
+            fetch_codes = [
+                c
+                for c in requested_codes
+                if c in pool_codes or c in spinoff_vendor_codes
+            ]
+            no_data_codes = [
+                c
+                for c in requested_codes
+                if c not in pool_codes and c not in spinoff_vendor_codes
+            ]
         else:
             # No pool available (e.g. provider-less test mode): keep the full
             # request and let the fetch path surface per-code unavailability.
             fetch_codes = requested_codes
             no_data_codes = []
         excluded_market_data: list[dict[str, Any]] = []
-        no_data_security_ids: set[str] = set()
+        excluded_security_ids: set[str] = set()
         if no_data_codes:
             no_data_set = {c.upper() for c in no_data_codes}
             alias_by_code: dict[str, list[str]] = {}
@@ -334,7 +405,7 @@ class USPITMarketPreparer:
                     "security_id",
                 ].astype(str)
                 alias_by_code[code] = sorted(set(matched))
-                no_data_security_ids.update(matched)
+                excluded_security_ids.update(matched)
             excluded_market_data = [
                 {
                     "vendor_code": code,
@@ -343,16 +414,19 @@ class USPITMarketPreparer:
                         "TDX pool carries no US history for this code; "
                         "in-window tenures excluded per SCOPE-C"
                     ),
+                    "rule_version": "SCOPE-C-QUALITY-v1",
+                    "reason_counts": {"TDX_POOL_ABSENT": 1},
                 }
                 for code in no_data_codes
             ]
         else:
             excluded_market_data = []
-            no_data_security_ids = set()
+            excluded_security_ids = set()
         # Alias collisions are recorded (not blocking): identity variants share
         # one vendor code and consume the same TDX bars.
         excluded_market_data.extend(alias_collisions)
         count = max(1, len(calendar) + 10)
+        vendor_gap_start = len(gaps)
         raw_response, raw_envelopes = self._fetch_vendor_bars(
             fetch_codes,
             fetch_start,
@@ -394,6 +468,62 @@ class USPITMarketPreparer:
             )
             capture_boundary = "TEST_PROVIDER_FETCH_BARS_RETURN"
 
+        if excluded_market_data:
+            sessions = pd.DatetimeIndex(
+                pd.to_datetime(calendar["session_date"], errors="raise")
+            ).normalize()
+            sessions = sessions[
+                (sessions >= pd.Timestamp(fetch_start))
+                & (sessions <= pd.Timestamp(fetch_end))
+            ]
+            alias_dates = aliases.copy()
+            alias_dates["vendor_code"] = (
+                alias_dates["vendor_code"].astype(str).str.upper()
+            )
+            alias_dates["valid_from"] = pd.to_datetime(
+                alias_dates["valid_from"], errors="raise"
+            ).dt.normalize()
+            alias_dates["valid_to"] = pd.to_datetime(
+                alias_dates["valid_to"], errors="coerce"
+            ).dt.normalize()
+            for record in excluded_market_data:
+                if record.get("rule_version") != "SCOPE-C-QUALITY-v1":
+                    continue
+                code = str(record["vendor_code"]).upper()
+                tenures = alias_dates.loc[alias_dates["vendor_code"].eq(code)]
+                required: set[pd.Timestamp] = set()
+                for tenure in tenures.itertuples(index=False):
+                    lower = max(pd.Timestamp(fetch_start), pd.Timestamp(tenure.valid_from))
+                    upper = (
+                        pd.Timestamp(fetch_end)
+                        if pd.isna(tenure.valid_to)
+                        else min(pd.Timestamp(fetch_end), pd.Timestamp(tenure.valid_to))
+                    )
+                    if lower <= upper:
+                        required.update(
+                            sessions[(sessions >= lower) & (sessions <= upper)]
+                        )
+                record.update(
+                    {
+                        "first_problem_session": (
+                            min(required).date().isoformat() if required else None
+                        ),
+                        "last_problem_session": (
+                            max(required).date().isoformat() if required else None
+                        ),
+                        "reason_counts": {
+                            "TDX_POOL_ABSENT": len(required)
+                        },
+                        "raw_capture_sha256": raw_capture_ref.sha256,
+                        "front_capture_sha256": front_capture_ref.sha256,
+                        "pool_capture_sha256": (
+                            None
+                            if pool_capture_ref is None
+                            else pool_capture_ref.sha256
+                        ),
+                    }
+                )
+
         raw_vendor = self._normalize_vendor_frames(raw_response, "bars_raw", gaps)
         front_vendor = self._normalize_vendor_frames(
             front_response, "bars_vendor_front", gaps
@@ -405,24 +535,137 @@ class USPITMarketPreparer:
             front_vendor, calendar, "bars_vendor_front", gaps
         )
 
+        quality_codes, quality_security_ids, quality_records = (
+            self._scope_c_quality_exclusions(
+                raw_vendor,
+                front_vendor,
+                aliases,
+                security_ids,
+                calendar,
+                inputs["session_exceptions"],
+                fetch_start,
+                fetch_end,
+                raw_capture_ref.sha256,
+                front_capture_ref.sha256,
+                gaps[vendor_gap_start:],
+            )
+        )
+        excluded_security_ids.update(quality_security_ids)
+        if pool_capture_ref is not None:
+            for record in quality_records:
+                record["pool_capture_sha256"] = pool_capture_ref.sha256
+        excluded_market_data.extend(quality_records)
+        if quality_codes:
+            gaps = [
+                gap
+                for gap in gaps
+                if not (
+                    gap.vendor_code is not None
+                    and gap.vendor_code.upper() in quality_codes
+                    and gap.dataset in {"bars_raw", "bars_vendor_front"}
+                )
+            ]
+        # R4.2: TDX validity gaps outside alias-tenure intersection are not
+        # required history and must not block MARKET_READY for the required set.
+        required_by_code: dict[str, set[str]] = {}
+        try:
+            _sessions_idx = pd.DatetimeIndex(
+                pd.to_datetime(calendar["session_date"], errors="coerce")
+            ).normalize()
+            _fetch_lo = pd.Timestamp(fetch_start)
+            _fetch_hi = pd.Timestamp(fetch_end)
+            _sessions_req = _sessions_idx[
+                (_sessions_idx >= _fetch_lo) & (_sessions_idx <= _fetch_hi)
+            ]
+            for _code, _g in aliases.groupby("vendor_code", sort=False):
+                _code_u = str(_code).upper()
+                if _code_u in set(BENCHMARK_CODES.values()):
+                    continue
+                _required: set[pd.Timestamp] = set()
+                for _alias in _g.itertuples(index=False):
+                    _lo = max(_fetch_lo, pd.Timestamp(_alias.valid_from))
+                    _hi = (
+                        _fetch_hi
+                        if pd.isna(_alias.valid_to)
+                        else min(_fetch_hi, pd.Timestamp(_alias.valid_to))
+                    )
+                    if _lo <= _hi:
+                        _required.update(_sessions_req[(_sessions_req >= _lo) & (_sessions_req <= _hi)])
+                required_by_code[_code_u] = {d.date().isoformat() for d in _required}
+        except Exception:
+            required_by_code = {}
+        if required_by_code:
+            _drop_codes = {"TDX_INVALID_OHLCV", "TDX_DUPLICATE_DAILY_BAR", "TDX_NON_XNYS_SESSION", "TDX_BAR_COLUMNS_MISSING"}
+            gaps = [
+                gap
+                for gap in gaps
+                if not (
+                    gap.code in _drop_codes
+                    and gap.vendor_code is not None
+                    and gap.session_date is not None
+                    and gap.vendor_code.upper() not in set(BENCHMARK_CODES.values())
+                    and gap.session_date not in required_by_code.get(gap.vendor_code.upper(), {gap.session_date})
+                )
+            ]
+        included_security_ids = sorted(
+            set(security_ids) - excluded_security_ids
+        )
+        included_memberships = memberships.loc[
+            ~memberships["security_id"].astype(str).isin(excluded_security_ids)
+        ].copy()
+        lineage_security_ids: set[str] = set(included_security_ids)
+        lineage_security_ids.update(spinoff_successor_ids)
+        try:
+            _ca_for_lineage = inputs["corporate_actions"]
+            if not _ca_for_lineage.empty and "action_type" in _ca_for_lineage.columns:
+                _succ_col = _ca_for_lineage.get("successor_security_id", pd.Series(dtype="object")).astype(str)
+                _mask_lineage = _ca_for_lineage["action_type"].astype(str).str.upper().isin({"SPLIT", "STOCK_DIVIDEND"})
+                for _sid, _succ in zip(_ca_for_lineage.loc[_mask_lineage, "security_id"].astype(str), _succ_col[_mask_lineage], strict=False):
+                    if str(_succ).startswith("us_") and str(_succ) in set(included_security_ids):
+                        lineage_security_ids.add(str(_sid))
+        except Exception:
+            pass
+        mapping_security_ids = sorted(lineage_security_ids)
         raw = self._map_to_stable_ids(
-            raw_vendor, aliases, security_ids, fetch_start, fetch_end, "bars_raw", gaps
+            raw_vendor,
+            aliases,
+            mapping_security_ids,
+            fetch_start,
+            fetch_end,
+            "bars_raw",
+            gaps,
         )
         front = self._map_to_stable_ids(
             front_vendor,
             aliases,
-            security_ids,
+            mapping_security_ids,
             fetch_start,
             fetch_end,
             "bars_vendor_front",
             gaps,
         )
+        prepared_actions, spinoff_basis_dependency = self._derive_spinoff_basis(
+            inputs["corporate_actions"],
+            raw,
+            aliases,
+            calendar,
+            included_security_ids,
+            raw_capture_ref.sha256,
+            observed_at,
+            fetch_end,
+            gaps,
+        )
+        signal_sources = (
+            inherited_sources
+            if spinoff_basis_dependency is None
+            else (*inherited_sources, spinoff_basis_dependency)
+        )
         signal = self._build_pit_signal_bars(
             raw,
-            memberships,
-            inputs["corporate_actions"],
+            included_memberships,
+            prepared_actions,
             calendar,
-            inherited_sources,
+            signal_sources,
             gaps,
         )
         benchmark_base, benchmark_evidence = self._build_benchmarks(
@@ -576,6 +819,10 @@ class USPITMarketPreparer:
                     "capture_boundary": capture_boundary,
                     "http_response_bytes_frozen": bool(raw_envelopes),
                     "requested_codes": requested_codes,
+                    "scope_c_rule_version": "SCOPE-C-QUALITY-v1",
+                    "scope_c_exclusions": [
+                        dict(item) for item in excluded_market_data
+                    ],
                     "normalized_artifact_sha256": sha256_json(_json_records(raw)),
                 },
             ),
@@ -660,7 +907,50 @@ class USPITMarketPreparer:
                 },
             ),
         )
+        pool_dependency: SourceDependency | None = None
+        if pool_capture_ref is not None:
+            pool_dependency = self._dependency(
+                source_id="tdx_us_stock_pool_v1",
+                dataset="tdx_us_stock_pool",
+                object_sha256=pool_capture_ref.sha256,
+                observed_at=observed_at,
+                published_at=observed_at,
+                as_of_date=fetch_end,
+                url="tdx-adapter://list_us_stocks",
+                license_class=LicenseClass.LOCAL_VENDOR,
+                metadata={
+                    "read_only": True,
+                    "capture_boundary": "TdxProvider.list_us_stocks",
+                    "listed_code_count": len(
+                        pool_codes - set(BENCHMARK_CODES.values())
+                    ),
+                },
+                role=SourceRole.VALIDATION_ANCHOR,
+            )
+            dependencies = (
+                *dependencies,
+                pool_dependency,
+            )
         dependencies = (*dependencies, *sec_fee_sources, *finra_fee_sources)
+        if spinoff_basis_dependency is not None:
+            dependencies = (*dependencies, spinoff_basis_dependency)
+        lifecycle_reconciliations: pd.DataFrame | None = None
+        if pool_dependency is not None:
+            lifecycle_reconciliations, lifecycle_dependency = (
+                self._build_lifecycle_reconciliations(
+                    included_memberships,
+                    prepared_actions,
+                    aliases,
+                    pool_codes,
+                    pool_mapping,
+                    pool_dependency,
+                    observed_at,
+                    fetch_end,
+                    gaps,
+                )
+            )
+            if lifecycle_dependency is not None:
+                dependencies = (*dependencies, lifecycle_dependency)
         combined_dependencies: dict[tuple[str, str, str | None, str], SourceDependency] = {
             (item.source_id, item.dataset, item.as_of_date, item.object_sha256): item
             for item in (*inherited_sources, *dependencies)
@@ -668,14 +958,13 @@ class USPITMarketPreparer:
         source_batch = self.store.write_source_batch(combined_dependencies.values())
 
         coverage = self._bar_coverage(
-            memberships,
+            included_memberships,
             aliases,
             raw,
             signal,
             calendar,
             inputs["session_exceptions"],
             fetch_start,
-            excluded_security_ids=no_data_security_ids,
         )
         for row in coverage.loc[~coverage["passed"]].itertuples(index=False):
             gaps.append(
@@ -691,12 +980,19 @@ class USPITMarketPreparer:
                 )
             )
         self._validate_next_session_opens(
-            raw, memberships, calendar, gaps,
-            excluded_security_ids=no_data_security_ids,
+            raw, included_memberships, calendar, prepared_actions, gaps,
         )
 
+        prepared_inputs = {**inputs, "corporate_actions": prepared_actions}
+        passthrough = self._scope_c_filtered_passthrough(
+            prepared_inputs,
+            included_memberships,
+            excluded_security_ids,
+        )
+        if lifecycle_reconciliations is not None:
+            passthrough["lifecycle_reconciliations"] = lifecycle_reconciliations
         frames = {
-            **{name: inputs[name] for name in PASSTHROUGH_ARTIFACTS},
+            **{name: passthrough[name] for name in PASSTHROUGH_ARTIFACTS},
             "bars_raw": raw,
             "bars_vendor_front": front,
             "bars_pit_signal": signal,
@@ -1177,7 +1473,7 @@ class USPITMarketPreparer:
         invalid = (
             value["security_id"].eq("")
             | value["vendor_code"].eq("")
-            | ~value["exchange"].isin({"XNYS", "XNAS"})
+            | ~value["exchange"].isin({"XNYS", "XNAS", "ARCX", "BATS"})
             | value["valid_from"].isna()
         ) | (
             value["valid_to"].notna() & (value["valid_to"] < value["valid_from"])
@@ -1504,6 +1800,314 @@ class USPITMarketPreparer:
         return result
 
     @staticmethod
+    def _scope_c_quality_exclusions(
+        raw_values: Mapping[str, pd.DataFrame],
+        front_values: Mapping[str, pd.DataFrame],
+        aliases: pd.DataFrame,
+        security_ids: list[str],
+        calendar: pd.DataFrame,
+        session_exceptions: pd.DataFrame,
+        fetch_start: date,
+        fetch_end: date,
+        raw_capture_sha256: str,
+        front_capture_sha256: str,
+        vendor_gaps: list[MarketPreparationGap],
+    ) -> tuple[set[str], set[str], list[dict[str, Any]]]:
+        """Exclude incomplete TDX instruments as an auditable SCOPE-C subset.
+
+        The exclusion is code-wide and never repairs data.  Benchmark codes are
+        intentionally outside this mechanism and remain fail-closed.
+        """
+
+        member_ids = set(str(item) for item in security_ids)
+        alias_value = aliases.loc[
+            aliases["security_id"].astype(str).isin(member_ids)
+        ].copy()
+        if alias_value.empty:
+            return set(), set(), []
+        alias_value["vendor_code"] = (
+            alias_value["vendor_code"].astype(str).str.upper()
+        )
+        alias_value["valid_from"] = pd.to_datetime(
+            alias_value["valid_from"], errors="coerce"
+        ).dt.normalize()
+        alias_value["valid_to"] = pd.to_datetime(
+            alias_value["valid_to"], errors="coerce"
+        ).dt.normalize()
+        sessions = pd.DatetimeIndex(
+            pd.to_datetime(calendar["session_date"], errors="coerce")
+        ).normalize()
+        sessions = sessions[
+            (sessions >= pd.Timestamp(fetch_start))
+            & (sessions <= pd.Timestamp(fetch_end))
+        ]
+        exception_keys: set[tuple[str, pd.Timestamp]] = set()
+        if not session_exceptions.empty:
+            exception_days = pd.to_datetime(
+                session_exceptions.get("session_date"), errors="coerce"
+            ).dt.normalize()
+            verified = session_exceptions.get(
+                "verified", pd.Series(False, index=session_exceptions.index)
+            ).map(_truthy)
+            supported = session_exceptions.get(
+                "exception_type", pd.Series("", index=session_exceptions.index)
+            ).astype(str).str.upper().isin({"HALTED", "NO_TRADE"})
+            for sid, day in zip(
+                session_exceptions.loc[verified & supported, "security_id"].astype(str),
+                exception_days.loc[verified & supported],
+                strict=True,
+            ):
+                if not pd.isna(day):
+                    exception_keys.add((sid, pd.Timestamp(day)))
+        benchmark_codes = set(BENCHMARK_CODES.values())
+        excluded_codes: set[str] = set()
+        excluded_ids: set[str] = set()
+        records: list[dict[str, Any]] = []
+        for code, group in alias_value.groupby("vendor_code", sort=True):
+            code = str(code).upper()
+            if code in benchmark_codes:
+                continue
+            required: set[pd.Timestamp] = set()
+            for alias in group.itertuples(index=False):
+                lower = max(pd.Timestamp(fetch_start), pd.Timestamp(alias.valid_from))
+                upper = (
+                    pd.Timestamp(fetch_end)
+                    if pd.isna(alias.valid_to)
+                    else min(pd.Timestamp(fetch_end), pd.Timestamp(alias.valid_to))
+                )
+                if lower <= upper:
+                    required.update(sessions[(sessions >= lower) & (sessions <= upper)])
+            if not required:
+                continue
+            raw_dates = set(
+                pd.to_datetime(
+                    raw_values.get(code, pd.DataFrame()).get(
+                        "date", pd.Series(dtype="datetime64[ns]")
+                    ),
+                    errors="coerce",
+                ).dropna().dt.normalize()
+            )
+            front_dates = set(
+                pd.to_datetime(
+                    front_values.get(code, pd.DataFrame()).get(
+                        "date", pd.Series(dtype="datetime64[ns]")
+                    ),
+                    errors="coerce",
+                ).dropna().dt.normalize()
+            )
+            def _explained(day: pd.Timestamp) -> bool:
+                active = group.loc[
+                    (group["valid_from"] <= day)
+                    & (group["valid_to"].isna() | (group["valid_to"] >= day)),
+                    "security_id",
+                ].astype(str)
+                return bool(len(active)) and all(
+                    (sid, day) in exception_keys for sid in set(active)
+                )
+
+            missing_raw = {
+                day for day in required - raw_dates if not _explained(day)
+            }
+            missing_front = {
+                day for day in required - front_dates if not _explained(day)
+            }
+            issues: list[MarketPreparationGap] = []
+            for gap in vendor_gaps:
+                if (
+                    gap.vendor_code is None
+                    or gap.vendor_code.upper() != code
+                    or gap.dataset not in {"bars_raw", "bars_vendor_front"}
+                ):
+                    continue
+                if gap.session_date is None:
+                    issues.append(gap)
+                    continue
+                day = pd.to_datetime(gap.session_date, errors="coerce")
+                normalized_day = (
+                    None if pd.isna(day) else pd.Timestamp(day).normalize()
+                )
+                if (
+                    normalized_day is not None
+                    and normalized_day in required
+                    and not _explained(normalized_day)
+                ):
+                    issues.append(gap)
+            if not missing_raw and not missing_front and not issues:
+                continue
+            reason_counts = Counter(item.code for item in issues)
+            if missing_raw:
+                reason_counts["RAW_REQUIRED_SESSION_MISSING"] += len(missing_raw)
+            if missing_front:
+                reason_counts["FRONT_REQUIRED_SESSION_MISSING"] += len(missing_front)
+            problem_days = set(missing_raw) | set(missing_front)
+            for item in issues:
+                if item.session_date is not None:
+                    day = pd.to_datetime(item.session_date, errors="coerce")
+                    if not pd.isna(day):
+                        problem_days.add(pd.Timestamp(day).normalize())
+            security_values = sorted(set(group["security_id"].astype(str)))
+            excluded_codes.add(code)
+            excluded_ids.update(security_values)
+            records.append(
+                {
+                    "vendor_code": code,
+                    "security_ids": security_values,
+                    "detail": (
+                        "TDX required history is incomplete or invalid; all mapped "
+                        "securities excluded without filling per SCOPE-C-QUALITY-v1"
+                    ),
+                    "rule_version": "SCOPE-C-QUALITY-v1",
+                    "reason_counts": dict(sorted(reason_counts.items())),
+                    "first_problem_session": (
+                        min(problem_days).date().isoformat() if problem_days else None
+                    ),
+                    "last_problem_session": (
+                        max(problem_days).date().isoformat() if problem_days else None
+                    ),
+                    "raw_capture_sha256": raw_capture_sha256,
+                    "front_capture_sha256": front_capture_sha256,
+                }
+            )
+        return excluded_codes, excluded_ids, records
+
+    @staticmethod
+    def _scope_c_filtered_passthrough(
+        inputs: Mapping[str, pd.DataFrame],
+        memberships: pd.DataFrame,
+        excluded_security_ids: set[str],
+    ) -> dict[str, pd.DataFrame]:
+        """Build the final tradable subset without weakening downstream gates."""
+
+        excluded = {str(item) for item in excluded_security_ids}
+        result = {name: frame.copy() for name, frame in inputs.items()}
+        result["membership_monthly"] = memberships.copy()
+        # Keep the complete evidence graph for causal replay.  Removing one
+        # side of an historical ADD/REMOVE or identity-succession pair changes
+        # the replay itself.  Scope-C is a projection of the replayed state,
+        # not a mutation of source evidence.  Only per-security exceptions and
+        # the replaced lifecycle output are safe to filter here.
+        for dataset in ("session_exceptions", "lifecycle_reconciliations"):
+            frame = result.get(dataset)
+            if frame is None or frame.empty or "security_id" not in frame.columns:
+                continue
+            result[dataset] = frame.loc[
+                ~frame["security_id"].astype(str).isin(excluded)
+            ].copy()
+
+        holdings = result.get("fund_holdings_observed", pd.DataFrame())
+        anchors = result.get("anchor_reconciliations", pd.DataFrame())
+        if not holdings.empty and not anchors.empty and not memberships.empty:
+            scope_security_ids = set(memberships["security_id"].astype(str))
+            events = result.get("membership_events", pd.DataFrame()).copy()
+            if not events.empty:
+                events["effective_day"] = pd.to_datetime(
+                    events["effective_at"], errors="coerce", utc=True
+                ).map(
+                    lambda value: (
+                        pd.NaT
+                        if pd.isna(value)
+                        else pd.Timestamp(value)
+                        .tz_convert(NEW_YORK)
+                        .tz_localize(None)
+                        .normalize()
+                    )
+                )
+            actions = result.get("corporate_actions", pd.DataFrame())
+            spinoff_successors = (
+                set(
+                    actions.loc[
+                        actions["action_type"]
+                        .astype(str)
+                        .str.strip()
+                        .str.upper()
+                        .eq("SPINOFF"),
+                        "successor_security_id",
+                    ].dropna().astype(str)
+                )
+                if not actions.empty and "successor_security_id" in actions.columns
+                else set()
+            )
+
+            def explained_residual(security_id: str, anchor_day: pd.Timestamp) -> bool:
+                if events.empty:
+                    return False
+                matching = events.loc[
+                    events["security_id"].astype(str).eq(security_id)
+                    & events["effective_day"].notna()
+                    & events["effective_day"].le(anchor_day)
+                ].sort_values(["effective_day", "event_id"], kind="stable")
+                latest_kind = (
+                    ""
+                    if matching.empty
+                    else str(matching.iloc[-1]["event_type"]).strip().upper()
+                )
+                if latest_kind == "REMOVE":
+                    return True
+                if security_id in spinoff_successors:
+                    return not matching["event_type"].astype(str).str.upper().eq(
+                        "ADD"
+                    ).any()
+                return False
+            decisions = pd.to_datetime(
+                memberships["decision_date"], errors="raise"
+            ).dt.normalize()
+            rebuilt: list[dict[str, Any]] = []
+            validation = holdings.loc[
+                holdings["evidence_role"].astype(str).eq(
+                    SourceRole.VALIDATION_ANCHOR.value
+                )
+                & holdings["source_id"].astype(str).eq("sec_nport_ivv")
+            ]
+            for digest, group in validation.groupby(
+                "content_sha256", sort=True
+            ):
+                anchor_date = pd.to_datetime(
+                    group["as_of_date"].iloc[0], errors="raise"
+                ).normalize()
+                same_month = sorted(
+                    set(
+                        decisions[
+                            decisions.dt.to_period("M").eq(
+                                anchor_date.to_period("M")
+                            )
+                        ]
+                    )
+                )
+                if not same_month:
+                    continue
+                replay = set(
+                    memberships.loc[
+                        decisions.eq(same_month[-1]), "security_id"
+                    ].astype(str)
+                )
+                observed = set(group["security_id"].astype(str)) & scope_security_ids
+                unexplained_additions = {
+                    security_id
+                    for security_id in observed - replay
+                    if not explained_residual(security_id, anchor_date)
+                }
+                unexplained_removals = replay - observed
+                rebuilt.append(
+                    {
+                        "anchor_date": anchor_date,
+                        "evidence_sha256": str(digest),
+                        "source_id": str(group["source_id"].iloc[0]),
+                        "status": (
+                            "RECONCILED"
+                            if not unexplained_additions and not unexplained_removals
+                            else "UNRESOLVED"
+                        ),
+                        "unexplained_additions": len(unexplained_additions),
+                        "unexplained_removals": len(unexplained_removals),
+                    }
+                )
+            result["anchor_reconciliations"] = pd.DataFrame(
+                rebuilt,
+                columns=list(anchors.columns),
+            ).drop_duplicates(["anchor_date", "evidence_sha256"])
+        return result
+
+    @staticmethod
     def _normalize_bar_frame(
         frame: pd.DataFrame,
         code: str,
@@ -1636,6 +2240,540 @@ class USPITMarketPreparer:
         value = value.loc[~duplicate, columns]
         return value.sort_values(["security_id", "date"], kind="stable").reset_index(drop=True)
 
+    def _build_lifecycle_reconciliations(
+        self,
+        memberships: pd.DataFrame,
+        corporate_actions: pd.DataFrame,
+        aliases: pd.DataFrame,
+        pool_codes: set[str],
+        pool_mapping: Mapping[str, str],
+        pool_dependency: SourceDependency,
+        observed_at: datetime,
+        as_of_date: date,
+        gaps: list[MarketPreparationGap],
+    ) -> tuple[pd.DataFrame, SourceDependency | None]:
+        """Bind final-scope lifecycle surveillance to the frozen TDX pool.
+
+        The pool proves only that a vendor listing is present at capture time.
+        Historical terminal states continue to require their reviewed corporate
+        action; a spinoff is deliberately not treated as termination of the
+        parent security.
+        """
+
+        columns = sorted(REQUIRED_ARTIFACT_COLUMNS["lifecycle_reconciliations"])
+        members = sorted(
+            set(
+                memberships.get("security_id", pd.Series(dtype="object"))
+                .dropna()
+                .astype(str)
+                .str.strip()
+            )
+        )
+        if not members:
+            return pd.DataFrame(columns=columns), None
+
+        terminal_types = {
+            "CASH_MERGER",
+            "STOCK_MERGER",
+            "DELISTING",
+            "BANKRUPTCY",
+        }
+        actions = corporate_actions.copy()
+        if actions.empty:
+            terminal = actions
+        else:
+            terminal = actions.loc[
+                actions["security_id"].astype(str).isin(members)
+                & actions["action_type"]
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .isin(terminal_types)
+            ].copy()
+        terminal_by_security = {
+            str(security_id): group.copy()
+            for security_id, group in terminal.groupby("security_id", sort=False)
+        }
+        identity_types = {
+            "TICKER_CHANGE",
+            "RENAME",
+            "SPLIT",
+            "STOCK_DIVIDEND",
+            "REORGANIZATION",
+        }
+        identity = (
+            actions.loc[
+                actions["security_id"].astype(str).isin(members)
+                & actions["action_type"]
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .isin(identity_types)
+            ].copy()
+            if not actions.empty
+            else actions
+        )
+        identity_by_security = {
+            str(security_id): group.copy()
+            for security_id, group in identity.groupby("security_id", sort=False)
+        }
+
+        cutoff = pd.Timestamp(as_of_date).normalize()
+        alias_value = aliases.copy()
+        alias_value["valid_from"] = pd.to_datetime(
+            alias_value["valid_from"], errors="coerce"
+        ).dt.normalize()
+        alias_value["valid_to"] = pd.to_datetime(
+            alias_value["valid_to"], errors="coerce"
+        ).dt.normalize()
+        alias_value["vendor_code"] = (
+            alias_value["vendor_code"].astype(str).str.strip().str.upper()
+        )
+
+        observations: list[dict[str, str]] = []
+        terminal_rows: list[dict[str, Any]] = []
+        nonterminal_members: list[str] = []
+        for security_id in members:
+            terminal_rows_for_security = terminal_by_security.get(security_id)
+            if terminal_rows_for_security is not None:
+                if len(terminal_rows_for_security) != 1:
+                    gaps.append(
+                        MarketPreparationGap(
+                            code="LIFECYCLE_TERMINAL_ACTION_AMBIGUOUS",
+                            dataset="lifecycle_reconciliations",
+                            security_id=security_id,
+                            detail=(
+                                "one final-scope security has multiple terminal "
+                                "actions and cannot be represented by one reconciliation"
+                            ),
+                        )
+                    )
+                    continue
+                action = terminal_rows_for_security.iloc[0]
+                effective = pd.to_datetime(action.get("effective_at"), errors="coerce")
+                if pd.isna(effective):
+                    gaps.append(
+                        MarketPreparationGap(
+                            code="LIFECYCLE_TERMINAL_ACTION_TIME_INVALID",
+                            dataset="lifecycle_reconciliations",
+                            security_id=security_id,
+                            detail="terminal action has no parseable effective timestamp",
+                        )
+                    )
+                    continue
+                if effective.tzinfo is not None:
+                    effective = effective.tz_convert(NEW_YORK).tz_localize(None)
+                terminal_rows.append(
+                    {
+                        "scope": "SECURITY",
+                        "coverage_kind": "TERMINAL_ACTION",
+                        "current_through": effective.normalize(),
+                        "action_id": str(action.get("action_id", "")).strip(),
+                        "security_id": security_id,
+                        "status": "RECONCILED",
+                        "includes_delisted": True,
+                        "source_id": str(action.get("source_id", "")).strip(),
+                        "evidence_sha256": str(
+                            action.get("evidence_sha256", "")
+                        ).strip(),
+                    }
+                )
+                continue
+
+            active = alias_value.loc[
+                alias_value["security_id"].astype(str).eq(security_id)
+                & alias_value["valid_from"].notna()
+                & alias_value["valid_from"].le(cutoff)
+                & (alias_value["valid_to"].isna() | alias_value["valid_to"].ge(cutoff))
+                & alias_value["vendor_code"].isin(pool_codes)
+            ]
+            if len(active) != 1:
+                lineage = identity_by_security.get(security_id)
+                if lineage is not None and len(lineage) == 1:
+                    action = lineage.iloc[0]
+                    successor = str(
+                        action.get("successor_security_id", "")
+                    ).strip()
+                    successor_active = alias_value.loc[
+                        alias_value["security_id"].astype(str).eq(successor)
+                        & alias_value["valid_from"].notna()
+                        & alias_value["valid_from"].le(cutoff)
+                        & (
+                            alias_value["valid_to"].isna()
+                            | alias_value["valid_to"].ge(cutoff)
+                        )
+                        & alias_value["vendor_code"].isin(pool_codes)
+                    ]
+                    if successor.startswith("us_") and len(successor_active) == 1:
+                        terminal_rows.append(
+                            {
+                                "scope": "SECURITY",
+                                "coverage_kind": "IDENTITY_SUCCESSION",
+                                "current_through": cutoff,
+                                "action_id": str(
+                                    action.get("action_id", "")
+                                ).strip(),
+                                "security_id": security_id,
+                                "status": "RECONCILED",
+                                "includes_delisted": True,
+                                "source_id": str(
+                                    action.get("source_id", "")
+                                ).strip(),
+                                "evidence_sha256": str(
+                                    action.get("evidence_sha256", "")
+                                ).strip(),
+                            }
+                        )
+                        continue
+                gaps.append(
+                    MarketPreparationGap(
+                        code="LIFECYCLE_CURRENT_LISTING_UNPROVEN",
+                        dataset="lifecycle_reconciliations",
+                        security_id=security_id,
+                        detail=(
+                            "TDX pool capture requires exactly one final-date active "
+                            f"reviewed alias; found {len(active)}"
+                        ),
+                    )
+                )
+                continue
+            alias = active.iloc[0]
+            vendor_code = str(alias["vendor_code"]).strip().upper()
+            excerpt = f"{vendor_code}|{pool_mapping.get(vendor_code, '')}"[:500]
+            observations.append(
+                {
+                    "security_id": security_id,
+                    "identifier_type": "VENDOR_CODE",
+                    "identifier_value": re.sub(r"[^A-Z0-9]", "", vendor_code),
+                    "observed_status": "LISTED",
+                    "evidence_locator": f"codes:{vendor_code}",
+                    "observed_through": as_of_date.isoformat(),
+                    "status_effective_at": "",
+                    "evidence_excerpt": excerpt,
+                }
+            )
+            nonterminal_members.append(security_id)
+
+        lifecycle_dependency: SourceDependency | None = None
+        status_rows: list[dict[str, Any]] = []
+        if observations:
+            observations.sort(
+                key=lambda item: (
+                    item["security_id"],
+                    item["identifier_type"],
+                    item["identifier_value"],
+                )
+            )
+            published_at = str(pool_dependency.published_at or "")
+            source_records = [
+                {
+                    "source_id": pool_dependency.source_id,
+                    "dataset": pool_dependency.dataset,
+                    "evidence_sha256": pool_dependency.object_sha256,
+                    "published_at": published_at,
+                    "url": pool_dependency.url,
+                    "observations": observations,
+                }
+            ]
+            evidence_payload = {
+                "format_version": "tdx-lifecycle-status-v2",
+                "current_through": as_of_date.isoformat(),
+                "source_records": source_records,
+            }
+            evidence_ref = self.store.put_bytes(
+                canonical_json_bytes(evidence_payload), media_type="application/json"
+            )
+            covered = sorted(nonterminal_members)
+            lifecycle_dependency = self._dependency(
+                source_id="tdx_lifecycle_status_v2",
+                dataset="lifecycle_status",
+                object_sha256=evidence_ref.sha256,
+                observed_at=observed_at,
+                published_at=observed_at,
+                as_of_date=as_of_date,
+                url="tdx://derived/lifecycle-status-v2",
+                license_class=LicenseClass.LOCAL_VENDOR,
+                source_version="TDX-LIFECYCLE-v2",
+                metadata={
+                    "coverage_contract_version": 4,
+                    "coverage_kind": "TERMINATION_SURVEILLANCE",
+                    "current_through": as_of_date.isoformat(),
+                    "covered_security_ids": covered,
+                    "covered_security_ids_sha256": sha256_json(covered),
+                    "covered_security_count": len(covered),
+                    "source_records": source_records,
+                    "source_records_sha256": sha256_json(source_records),
+                    "source_record_count": len(source_records),
+                    "source_dependency_object_sha256s": [
+                        pool_dependency.object_sha256
+                    ],
+                    "coverage_derived_from_payload": True,
+                    "source_records_bound_to_cas": True,
+                    "observation_identifiers_verified_in_payload": True,
+                    "spinoff_is_not_terminal": True,
+                },
+                role=SourceRole.VALIDATION_ANCHOR,
+            )
+            status_rows = [
+                {
+                    "scope": "SECURITY",
+                    "coverage_kind": "STATUS_SURVEILLANCE",
+                    "current_through": cutoff,
+                    "action_id": "",
+                    "security_id": security_id,
+                    "status": "RECONCILED",
+                    "includes_delisted": True,
+                    "source_id": lifecycle_dependency.source_id,
+                    "evidence_sha256": lifecycle_dependency.object_sha256,
+                }
+                for security_id in covered
+            ]
+
+        result = pd.DataFrame([*terminal_rows, *status_rows], columns=columns)
+        return result, lifecycle_dependency
+
+    def _derive_spinoff_basis(
+        self,
+        corporate_actions: pd.DataFrame,
+        raw: pd.DataFrame,
+        aliases: pd.DataFrame,
+        calendar: pd.DataFrame,
+        included_security_ids: list[str],
+        raw_capture_sha256: str,
+        observed_at: datetime,
+        as_of_date: date,
+        gaps: list[MarketPreparationGap],
+    ) -> tuple[pd.DataFrame, SourceDependency | None]:
+        """Derive causal spinoff basis from the first joint raw trading session."""
+
+        actions = corporate_actions.copy()
+        for column in (
+            "cost_basis_derivation_method",
+            "cost_basis_available_at",
+            "cost_basis_evidence_source_id",
+            "cost_basis_evidence_sha256",
+            "cost_basis_parent_vendor_code",
+            "cost_basis_successor_vendor_code",
+            "cost_basis_parent_vwap",
+            "cost_basis_successor_vwap",
+            "cost_basis_raw_capture_sha256",
+        ):
+            if column not in actions.columns:
+                actions[column] = None
+        if actions.empty or raw.empty:
+            return actions, None
+
+        included = set(str(item) for item in included_security_ids)
+        raw_value = raw.copy()
+        raw_value["date"] = pd.to_datetime(
+            raw_value["date"], errors="coerce"
+        ).dt.normalize()
+        alias_value = aliases.copy()
+        alias_value["valid_from"] = pd.to_datetime(
+            alias_value["valid_from"], errors="coerce"
+        ).dt.normalize()
+        alias_value["valid_to"] = pd.to_datetime(
+            alias_value["valid_to"], errors="coerce"
+        ).dt.normalize()
+        close_by_day = {
+            pd.Timestamp(row.session_date).normalize(): pd.Timestamp(
+                row.market_close
+            ).tz_convert(timezone.utc)
+            for row in calendar.itertuples(index=False)
+        }
+
+        def active_vendor_code(security_id: str, day: pd.Timestamp) -> str | None:
+            matched = alias_value.loc[
+                alias_value["security_id"].astype(str).eq(security_id)
+                & alias_value["valid_from"].le(day)
+                & (
+                    alias_value["valid_to"].isna()
+                    | alias_value["valid_to"].ge(day)
+                ),
+                "vendor_code",
+            ].astype(str)
+            values = sorted(set(matched))
+            return values[0] if len(values) == 1 else None
+
+        records: list[dict[str, Any]] = []
+        row_indexes: list[int] = []
+        spinoff_mask = actions["action_type"].astype(str).str.strip().str.upper().eq(
+            "SPINOFF"
+        )
+        for index, action in actions.loc[spinoff_mask].iterrows():
+            parent = str(action.get("security_id", "")).strip()
+            if parent not in included:
+                continue
+            existing = _nonnegative_term(action, ("cost_basis_fraction",))
+            if existing is not None:
+                continue
+            successor = str(action.get("successor_security_id", "")).strip()
+            ratio = _positive_term(action, ("share_ratio", "ratio"))
+            effective = pd.to_datetime(
+                action.get("effective_at"), errors="coerce", utc=True
+            )
+            if pd.isna(effective):
+                continue
+            effective_day = (
+                pd.Timestamp(effective)
+                .tz_convert(NEW_YORK)
+                .tz_localize(None)
+                .normalize()
+            )
+            parent_rows = raw_value.loc[
+                raw_value["security_id"].astype(str).eq(parent)
+                & raw_value["date"].ge(effective_day)
+            ]
+            successor_rows = raw_value.loc[
+                raw_value["security_id"].astype(str).eq(successor)
+                & raw_value["date"].ge(effective_day)
+            ]
+            common = sorted(
+                set(parent_rows["date"].dropna())
+                & set(successor_rows["date"].dropna())
+            )
+            if ratio is None or not successor.startswith("us_") or not common:
+                continue
+            joint_day = pd.Timestamp(common[0]).normalize()
+            parent_row = parent_rows.loc[parent_rows["date"].eq(joint_day)]
+            successor_row = successor_rows.loc[successor_rows["date"].eq(joint_day)]
+            parent_code = active_vendor_code(parent, joint_day)
+            successor_code = active_vendor_code(successor, joint_day)
+            market_close = close_by_day.get(joint_day)
+            if (
+                len(parent_row) != 1
+                or len(successor_row) != 1
+                or parent_code is None
+                or successor_code is None
+                or market_close is None
+            ):
+                continue
+            parent_record = parent_row.iloc[0]
+            successor_record = successor_row.iloc[0]
+            parent_amount = pd.to_numeric(
+                parent_record.get("Amount"), errors="coerce"
+            )
+            parent_volume = pd.to_numeric(
+                parent_record.get("Volume"), errors="coerce"
+            )
+            successor_amount = pd.to_numeric(
+                successor_record.get("Amount"), errors="coerce"
+            )
+            successor_volume = pd.to_numeric(
+                successor_record.get("Volume"), errors="coerce"
+            )
+            values = (
+                parent_amount,
+                parent_volume,
+                successor_amount,
+                successor_volume,
+            )
+            if any(not math.isfinite(float(value)) or float(value) <= 0 for value in values):
+                continue
+            parent_vwap = float(parent_amount) * 10_000.0 / float(parent_volume)
+            successor_vwap = (
+                float(successor_amount) * 10_000.0 / float(successor_volume)
+            )
+            denominator = parent_vwap + ratio * successor_vwap
+            fraction = ratio * successor_vwap / denominator
+            if (
+                not math.isfinite(parent_vwap)
+                or not math.isfinite(successor_vwap)
+                or not math.isfinite(fraction)
+                or not 0 < fraction < 1
+            ):
+                continue
+
+            def row_identity(row: pd.Series) -> dict[str, Any]:
+                return {
+                    "security_id": str(row.get("security_id", "")),
+                    "date": pd.Timestamp(row["date"]).date().isoformat(),
+                    **{
+                        column: float(row[column])
+                        for column in (*PRICE_COLUMNS, "Volume", "Amount")
+                    },
+                }
+
+            parent_identity = row_identity(parent_record)
+            successor_identity = row_identity(successor_record)
+            records.append(
+                {
+                    "action_id": str(action.get("action_id", "")),
+                    "security_id": parent,
+                    "successor_security_id": successor,
+                    "share_ratio": ratio,
+                    "joint_session": joint_day.date().isoformat(),
+                    "available_at": market_close.isoformat(),
+                    "parent_vendor_code": parent_code,
+                    "successor_vendor_code": successor_code,
+                    "parent_vwap": parent_vwap,
+                    "successor_vwap": successor_vwap,
+                    "cost_basis_fraction": fraction,
+                    "parent_raw_row_sha256": sha256_json(parent_identity),
+                    "successor_raw_row_sha256": sha256_json(successor_identity),
+                    "raw_capture_sha256": raw_capture_sha256,
+                    "method": "TDX_JOINT_SESSION_VWAP_RELATIVE_FMV-v2",
+                }
+            )
+            row_indexes.append(int(index))
+
+        if not records:
+            return actions, None
+        payload = {
+            "format_version": "us-pit-causal-spinoff-basis-v2",
+            "preregistration": "docs/us-pit-market-readiness-preregistration-v2.md",
+            "amount_unit_multiplier": 10_000,
+            "records": sorted(records, key=lambda item: item["action_id"]),
+        }
+        reference = self.store.put_bytes(
+            canonical_json_bytes(payload), media_type="application/json"
+        )
+        by_action = {item["action_id"]: item for item in records}
+        for index in row_indexes:
+            action_id = str(actions.at[index, "action_id"])
+            record = by_action[action_id]
+            actions.at[index, "cost_basis_fraction"] = record[
+                "cost_basis_fraction"
+            ]
+            actions.at[index, "cost_basis_derivation_method"] = record["method"]
+            actions.at[index, "cost_basis_available_at"] = record["available_at"]
+            actions.at[index, "cost_basis_evidence_source_id"] = (
+                "tdx_spinoff_basis_v2"
+            )
+            actions.at[index, "cost_basis_evidence_sha256"] = reference.sha256
+            actions.at[index, "cost_basis_parent_vendor_code"] = record[
+                "parent_vendor_code"
+            ]
+            actions.at[index, "cost_basis_successor_vendor_code"] = record[
+                "successor_vendor_code"
+            ]
+            actions.at[index, "cost_basis_parent_vwap"] = record["parent_vwap"]
+            actions.at[index, "cost_basis_successor_vwap"] = record[
+                "successor_vwap"
+            ]
+            actions.at[index, "cost_basis_raw_capture_sha256"] = raw_capture_sha256
+        dependency = self._dependency(
+            source_id="tdx_spinoff_basis_v2",
+            dataset="spinoff_basis",
+            object_sha256=reference.sha256,
+            observed_at=observed_at,
+            as_of_date=as_of_date,
+            url="tdx://derived/causal-spinoff-basis-v2",
+            license_class=LicenseClass.LOCAL_VENDOR,
+            source_version="CAUSAL-SPINOFF-BASIS-v2",
+            metadata={
+                "read_only": True,
+                "fill_data": False,
+                "raw_capture_sha256": raw_capture_sha256,
+                "record_count": len(records),
+                "action_ids": sorted(by_action),
+                "method": "TDX_JOINT_SESSION_VWAP_RELATIVE_FMV-v2",
+                "normalized_payload_sha256": sha256_json(payload),
+            },
+            role=SourceRole.SIGNAL_INPUT,
+        )
+        return actions, dependency
+
     @staticmethod
     def _build_pit_signal_bars(
         raw: pd.DataFrame,
@@ -1673,9 +2811,16 @@ class USPITMarketPreparer:
             pd.Series("", index=actions.index, dtype="object"),
         ).fillna("").astype(str)
         dependency_by_key: dict[tuple[str, str], list[SourceDependency]] = {}
+        basis_dependency_by_key: dict[
+            tuple[str, str], list[SourceDependency]
+        ] = {}
         for source in sources:
             if source.dataset == "corporate_actions":
                 dependency_by_key.setdefault(
+                    (source.source_id, source.object_sha256), []
+                ).append(source)
+            elif source.dataset == "spinoff_basis":
+                basis_dependency_by_key.setdefault(
                     (source.source_id, source.object_sha256), []
                 ).append(source)
         close_by_day = {
@@ -1842,21 +2987,34 @@ class USPITMarketPreparer:
                         blocked = True
                         break
                     evidence_item = evidence[0]
-                    available_at = pd.to_datetime(
-                        evidence_item.observed_at, errors="coerce", utc=True
-                    )
-                    published_at = (
-                        pd.NaT
-                        if evidence_item.published_at is None
-                        else pd.to_datetime(
-                            evidence_item.published_at, errors="coerce", utc=True
-                        )
-                    )
+                    available_at = source_available_at(evidence_item)
                     announced = action.get("announced_utc")
-                    if (
-                        pd.isna(announced)
-                        or pd.Timestamp(announced) > decision_close
-                    ):
+                    effective_at = pd.Timestamp(action["effective_utc"])
+                    if pd.isna(announced) or pd.Timestamp(announced) > effective_at:
+                        gaps.append(
+                            MarketPreparationGap(
+                                code="CORPORATE_ACTION_TIMING_INVALID",
+                                dataset="bars_pit_signal",
+                                security_id=security_id,
+                                session_date=decision_day.date().isoformat(),
+                                detail="announcement is missing or occurs after effective date",
+                            )
+                        )
+                        blocked = True
+                        break
+                    if not _truthy(action.get("terms_verified")):
+                        gaps.append(
+                            MarketPreparationGap(
+                                code="UNVERIFIED_SIGNAL_CORPORATE_ACTION",
+                                dataset="bars_pit_signal",
+                                security_id=security_id,
+                                session_date=decision_day.date().isoformat(),
+                                detail=f"{kind} terms are not verified",
+                            )
+                        )
+                        blocked = True
+                        break
+                    if pd.Timestamp(announced) > decision_close:
                         gaps.append(
                             MarketPreparationGap(
                                 code="CORPORATE_ACTION_NOT_KNOWN_AT_DECISION",
@@ -1868,37 +3026,19 @@ class USPITMarketPreparer:
                         )
                         blocked = True
                         break
-                    effective_at = pd.Timestamp(action["effective_utc"])
-                    if pd.Timestamp(announced) > effective_at:
-                        gaps.append(
-                            MarketPreparationGap(
-                                code="CORPORATE_ACTION_TIMING_INVALID",
-                                dataset="bars_pit_signal",
-                                security_id=security_id,
-                                session_date=decision_day.date().isoformat(),
-                                detail="announcement occurs after effective date",
-                            )
-                        )
-                        blocked = True
-                        break
-                    if (
-                        pd.isna(available_at)
-                        or available_at > decision_close
-                        or pd.isna(published_at)
-                        or published_at > decision_close
-                    ):
+                    if pd.isna(available_at) or available_at > decision_close:
                         gaps.append(
                             MarketPreparationGap(
                                 code="CORPORATE_ACTION_EVIDENCE_LATE",
                                 dataset="bars_pit_signal",
                                 security_id=security_id,
                                 session_date=decision_day.date().isoformat(),
-                                detail="captured action evidence was unavailable at decision close",
+                                detail="action evidence was unavailable at decision close",
                             )
                         )
                         blocked = True
                         break
-                    if kind in {"TICKER_CHANGE", "RENAME"}:
+                    if kind in {"TICKER_CHANGE", "RENAME", "REORGANIZATION", "STOCK_MERGER"}:
                         continue
                     if kind not in {
                         "SPLIT",
@@ -1913,18 +3053,6 @@ class USPITMarketPreparer:
                                 security_id=security_id,
                                 session_date=decision_day.date().isoformat(),
                                 detail=f"unsupported action_type={kind or 'BLANK'}",
-                            )
-                        )
-                        blocked = True
-                        break
-                    if not _truthy(action.get("terms_verified")):
-                        gaps.append(
-                            MarketPreparationGap(
-                                code="UNVERIFIED_SIGNAL_CORPORATE_ACTION",
-                                dataset="bars_pit_signal",
-                                security_id=security_id,
-                                session_date=decision_day.date().isoformat(),
-                                detail=f"{kind} terms are not verified",
                             )
                         )
                         blocked = True
@@ -1956,11 +3084,7 @@ class USPITMarketPreparer:
                         successor = str(
                             action.get("successor_security_id") or ""
                         ).strip()
-                        if (
-                            allocation is None
-                            or not 0 <= allocation < 1
-                            or not successor.startswith("us_")
-                        ):
+                        if not successor.startswith("us_"):
                             gaps.append(
                                 MarketPreparationGap(
                                     code="CORPORATE_ACTION_TERMS_MISSING",
@@ -1972,6 +3096,69 @@ class USPITMarketPreparer:
                             )
                             blocked = True
                             break
+                        if allocation is None or not 0 <= allocation < 1:
+                            gaps.append(
+                                MarketPreparationGap(
+                                    code="CORPORATE_ACTION_TERMS_MISSING",
+                                    dataset="bars_pit_signal",
+                                    security_id=security_id,
+                                    session_date=decision_day.date().isoformat(),
+                                    detail="SPINOFF requires a stable successor and cost_basis_fraction in [0,1)",
+                                )
+                            )
+                            blocked = True
+                            break
+                        method = str(
+                            action.get("cost_basis_derivation_method") or ""
+                        ).strip()
+                        if method:
+                            basis_key = (
+                                str(
+                                    action.get("cost_basis_evidence_source_id")
+                                    or ""
+                                ),
+                                str(
+                                    action.get("cost_basis_evidence_sha256") or ""
+                                ).lower(),
+                            )
+                            basis_candidates = basis_dependency_by_key.get(
+                                basis_key, []
+                            )
+                            basis_available = pd.to_datetime(
+                                action.get("cost_basis_available_at"),
+                                errors="coerce",
+                                utc=True,
+                            )
+                            if (
+                                method
+                                != "TDX_JOINT_SESSION_VWAP_RELATIVE_FMV-v2"
+                                or len(basis_candidates) != 1
+                                or pd.isna(basis_available)
+                                or basis_available > decision_close
+                                or str(
+                                    action.get("cost_basis_raw_capture_sha256")
+                                    or ""
+                                )
+                                != str(
+                                    basis_candidates[0].metadata.get(
+                                        "raw_capture_sha256", ""
+                                    )
+                                )
+                            ):
+                                gaps.append(
+                                    MarketPreparationGap(
+                                        code="SPINOFF_BASIS_EVIDENCE_INVALID",
+                                        dataset="bars_pit_signal",
+                                        security_id=security_id,
+                                        session_date=decision_day.date().isoformat(),
+                                        detail=(
+                                            "derived spinoff basis is missing exact "
+                                            "causal TDX evidence"
+                                        ),
+                                    )
+                                )
+                                blocked = True
+                                break
                         retained = 1.0 - allocation
                         if retained <= 0:
                             blocked = True
@@ -2275,10 +3462,11 @@ class USPITMarketPreparer:
                 bindings.append("")
                 continue
             latest = max(item[0] for item in candidates)
-            exact = {
-                item.object_sha256 for effective, item in candidates if effective == latest
-            }
-            if len(exact) != 1:
+            exact_candidates = [
+                item for effective, item in candidates if effective == latest
+            ]
+            exact_shas = {item.object_sha256 for item in exact_candidates}
+            if len(exact_shas) != 1:
                 gaps.append(
                     MarketPreparationGap(
                         code="REGULATORY_FEE_RAW_EVIDENCE_AMBIGUOUS",
@@ -2291,7 +3479,7 @@ class USPITMarketPreparer:
                 )
                 bindings.append("")
                 continue
-            bindings.append(next(iter(exact)))
+            bindings.append(next(iter(exact_shas)))
         return bindings
 
     @staticmethod
@@ -2482,6 +3670,7 @@ class USPITMarketPreparer:
         raw: pd.DataFrame,
         memberships: pd.DataFrame,
         calendar: pd.DataFrame,
+        corporate_actions: pd.DataFrame,
         gaps: list[MarketPreparationGap],
         excluded_security_ids: set[str] = frozenset(),
     ) -> None:
@@ -2499,6 +3688,40 @@ class USPITMarketPreparer:
         if not raw_value.empty:
             for sid, group in raw_value.groupby("security_id", sort=False):
                 raw_by[str(sid)] = group
+        identity_actions = corporate_actions.copy()
+        if not identity_actions.empty:
+            identity_actions = identity_actions.loc[
+                identity_actions["action_type"]
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .isin(
+                    {
+                        "TICKER_CHANGE",
+                        "RENAME",
+                        "SPLIT",
+                        "STOCK_DIVIDEND",
+                        "REORGANIZATION",
+                    }
+                )
+                & identity_actions["terms_verified"]
+                .astype(str)
+                .str.strip()
+                .str.casefold()
+                .isin({"true", "1"})
+            ].copy()
+            identity_actions["effective_day"] = pd.to_datetime(
+                identity_actions["effective_at"], errors="coerce", utc=True
+            ).map(
+                lambda value: (
+                    pd.NaT
+                    if pd.isna(value)
+                    else pd.Timestamp(value)
+                    .tz_convert(NEW_YORK)
+                    .tz_localize(None)
+                    .normalize()
+                )
+            )
         excluded = set(str(x) for x in excluded_security_ids)
         for member in memberships[["decision_date", "security_id"]].itertuples(
             index=False
@@ -2526,6 +3749,21 @@ class USPITMarketPreparer:
                 match = group.loc[group["date"].eq(next_session)]
             opens = pd.to_numeric(match.get("Open"), errors="coerce")
             if len(match) != 1 or opens.isna().any() or (opens <= 0).any():
+                lineage = identity_actions.loc[
+                    identity_actions["security_id"].astype(str).eq(security_id)
+                    & identity_actions["effective_day"].eq(next_session)
+                ]
+                if len(lineage) == 1:
+                    successor = str(
+                        lineage.iloc[0].get("successor_security_id", "")
+                    ).strip()
+                    successor_group = raw_by.get(successor)
+                    if successor_group is not None and not successor_group.empty:
+                        match = successor_group.loc[
+                            successor_group["date"].eq(next_session)
+                        ]
+                        opens = pd.to_numeric(match.get("Open"), errors="coerce")
+            if len(match) != 1 or opens.isna().any() or (opens <= 0).any():
                 gaps.append(
                     MarketPreparationGap(
                         code="NEXT_EXECUTION_OPEN_MISSING",
@@ -2543,6 +3781,7 @@ class USPITMarketPreparer:
         dataset: str,
         object_sha256: str,
         observed_at: datetime,
+        published_at: datetime | str | None = None,
         as_of_date: date,
         url: str,
         license_class: LicenseClass,
@@ -2550,6 +3789,15 @@ class USPITMarketPreparer:
         source_version: str | None = None,
         role: SourceRole = SourceRole.SIGNAL_INPUT,
     ) -> SourceDependency:
+        published_value: str | None
+        if isinstance(published_at, datetime):
+            if published_at.tzinfo is None:
+                raise ValueError("published_at must be timezone-aware")
+            published_value = published_at.astimezone(timezone.utc).isoformat()
+        elif published_at is None:
+            published_value = None
+        else:
+            published_value = str(published_at)
         return SourceDependency(
             source_id=source_id,
             source_version=source_version or self.tdx_source_version,
@@ -2560,6 +3808,7 @@ class USPITMarketPreparer:
             url=url,
             dataset=dataset,
             as_of_date=as_of_date.isoformat(),
+            published_at=published_value,
             metadata=dict(metadata),
         )
 
@@ -2791,10 +4040,14 @@ def _json_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
     for row in frame.to_dict(orient="records"):
         value: dict[str, Any] = {}
         for key, item in row.items():
-            if isinstance(item, (pd.Timestamp, datetime, date)):
-                value[str(key)] = item.isoformat()
-            elif pd.isna(item):
+            try:
+                missing = bool(pd.isna(item))
+            except (TypeError, ValueError):
+                missing = False
+            if item is None or missing:
                 value[str(key)] = None
+            elif isinstance(item, (pd.Timestamp, datetime, date)):
+                value[str(key)] = item.isoformat()
             elif hasattr(item, "item"):
                 value[str(key)] = item.item()
             else:

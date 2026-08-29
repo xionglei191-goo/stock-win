@@ -1323,9 +1323,13 @@ class USMomentumProgram:
                 connection.commit()
                 return result
             current = self._row_state(row)
-            if current != USProgramState.DATA_BLOCKED:
+            if current not in {
+                USProgramState.DATA_BLOCKED,
+                USProgramState.HISTORICAL_FAILED,
+            }:
                 raise USProgramStateError(
-                    f"data release can only be registered from DATA_BLOCKED, not {current.value}"
+                    "data release can only be registered from DATA_BLOCKED or "
+                    f"HISTORICAL_FAILED, not {current.value}"
                 )
             target = (
                 USProgramState.DATA_READY

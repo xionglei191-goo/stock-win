@@ -1108,10 +1108,12 @@ class USPITQualityValidator:
     def _lifecycle_status_contract_valid(
         source: SourceDependency,
         sources: tuple[SourceDependency, ...],
+        artifacts: Mapping[str, pd.DataFrame],
     ) -> bool:
         metadata = dict(source.metadata)
         try:
-            if int(metadata.get("coverage_contract_version", 0)) != 3:
+            contract_version = int(metadata.get("coverage_contract_version", 0))
+            if contract_version not in {3, 4}:
                 return False
             if metadata.get("coverage_kind") != "TERMINATION_SURVEILLANCE":
                 return False
@@ -1187,7 +1189,11 @@ class USPITQualityValidator:
                     key = (security_id, identifier_type, identifier_value)
                     if (
                         not security_id.startswith("us_")
-                        or identifier_type not in {"ISIN", "CUSIP"}
+                        or identifier_type not in (
+                            {"ISIN", "CUSIP"}
+                            if contract_version == 3
+                            else {"VENDOR_CODE"}
+                        )
                         or not identifier_value
                         or observed_status not in {
                             "LISTED", "ACTIVE_HOLDING", "TERMINATED", "DELISTED",
@@ -1205,6 +1211,41 @@ class USPITQualityValidator:
                         return False
                     observation_keys.add(key)
                     ids_set.add(security_id)
+                    if contract_version == 4:
+                        aliases = artifacts.get("listing_aliases")
+                        current_through = pd.to_datetime(
+                            metadata.get("current_through"), errors="coerce"
+                        )
+                        if (
+                            aliases is None
+                            or aliases.empty
+                            or pd.isna(current_through)
+                        ):
+                            return False
+                        alias_codes = aliases["vendor_code"].astype(str).map(
+                            lambda value: re.sub(r"[^A-Z0-9]", "", value.upper())
+                        )
+                        alias_from = pd.to_datetime(
+                            aliases["valid_from"], errors="coerce"
+                        ).dt.normalize()
+                        alias_to = pd.to_datetime(
+                            aliases["valid_to"], errors="coerce"
+                        ).dt.normalize()
+                        active_alias = aliases.loc[
+                            aliases["security_id"]
+                            .astype(str)
+                            .str.strip()
+                            .str.lower()
+                            .eq(security_id)
+                            & alias_codes.eq(identifier_value)
+                            & alias_from.le(current_through.normalize())
+                            & (
+                                alias_to.isna()
+                                | alias_to.ge(current_through.normalize())
+                            )
+                        ]
+                        if len(active_alias) != 1:
+                            return False
                     normalized_observations.append(
                         {
                             "security_id": security_id,
@@ -1322,6 +1363,24 @@ class USPITQualityValidator:
                 calendar,
                 artifacts.get("corporate_actions"),
             )
+            scope_security_ids = frozenset(
+                memberships["security_id"].dropna().astype(str).str.strip()
+            )
+            scope_c_projection = any(
+                item.dataset == "bars_raw"
+                and item.metadata.get("scope_c_rule_version")
+                == "SCOPE-C-QUALITY-v1"
+                and isinstance(item.metadata.get("scope_c_exclusions"), list)
+                for item in sources
+            )
+            projected_replay = {
+                day: (
+                    frozenset(state & scope_security_ids)
+                    if scope_c_projection
+                    else frozenset(state)
+                )
+                for day, state in result.replayed.items()
+            }
             grouped: dict[str, list[dict[str, Any]]] = {}
             for gap in result.gaps:
                 grouped.setdefault(
@@ -1352,7 +1411,7 @@ class USPITQualityValidator:
             mismatches = [
                 day.date().isoformat()
                 for day in decisions
-                if result.replayed.get(day, frozenset())
+                if projected_replay.get(day, frozenset())
                 != reported.get(day, frozenset())
             ]
             if mismatches:
@@ -1376,7 +1435,7 @@ class USPITQualityValidator:
             metrics["reconciled_sec_anchor_intervals"] = (
                 result.reconciled_anchor_count
             )
-            return dict(result.replayed)
+            return projected_replay
 
         calendar_value = calendar.copy()
         calendar_value["session_date"] = pd.to_datetime(
@@ -1798,6 +1857,9 @@ class USPITQualityValidator:
         issues: list[QualityIssue],
         metrics: dict[str, Any],
     ) -> None:
+        excluded_security_ids = self._scope_c_excluded_security_ids(
+            sources, memberships, issues, metrics
+        )
         for dataset, key in (
             ("bars_raw", ["security_id", "date"]),
             ("bars_vendor_front", ["security_id", "date"]),
@@ -1909,7 +1971,12 @@ class USPITQualityValidator:
                 "coverage grain is not unique",
                 {"duplicate_rows": int(duplicates.sum())},
             )
-        recomputed = self._recompute_bar_coverage(artifacts, memberships, calendar)
+        recomputed = self._recompute_bar_coverage(
+            artifacts,
+            memberships,
+            calendar,
+            excluded_security_ids=excluded_security_ids,
+        )
         membership_keys = set(
             zip(
                 pd.to_datetime(memberships.get("decision_date"), errors="coerce").dt.normalize(),
@@ -1976,8 +2043,122 @@ class USPITQualityValidator:
                 },
             )
         self._validate_decision_and_next_open(
-            artifacts, memberships, calendar, issues
+            artifacts,
+            memberships,
+            calendar,
+            issues,
+            excluded_security_ids=excluded_security_ids,
         )
+
+    def _scope_c_excluded_security_ids(
+        self,
+        sources: tuple[SourceDependency, ...],
+        memberships: pd.DataFrame,
+        issues: list[QualityIssue],
+        metrics: dict[str, Any],
+    ) -> set[str]:
+        raw_sources = [item for item in sources if item.dataset == "bars_raw"]
+        front_sources = [
+            item for item in sources if item.dataset == "bars_vendor_front"
+        ]
+        if len(raw_sources) != 1:
+            return set()
+        raw_source = raw_sources[0]
+        if raw_source.metadata.get("scope_c_rule_version") != "SCOPE-C-QUALITY-v1":
+            return set()
+        records = raw_source.metadata.get("scope_c_exclusions", [])
+        if not isinstance(records, list):
+            self._issue(
+                issues,
+                "SCOPE_C_EXCLUSION_EVIDENCE_INVALID",
+                QualitySeverity.CRITICAL,
+                "bars_raw",
+                "SCOPE-C exclusion metadata must be a list",
+            )
+            return set()
+        included_membership_ids = set(
+            memberships.get("security_id", pd.Series(dtype=str)).astype(str)
+        )
+        front_hash = front_sources[0].object_sha256 if len(front_sources) == 1 else None
+        pool_hashes = {
+            item.object_sha256
+            for item in sources
+            if item.dataset == "tdx_us_stock_pool"
+            and item.role == SourceRole.VALIDATION_ANCHOR
+        }
+        excluded: set[str] = set()
+        invalid = 0
+        accepted_records = 0
+        for item in records:
+            if not isinstance(item, Mapping):
+                invalid += 1
+                continue
+            if item.get("rule_version") != "SCOPE-C-QUALITY-v1":
+                # Alias-collision observations share the manifest list but are
+                # not scope exclusions.
+                continue
+            code = str(item.get("vendor_code", "")).strip().upper()
+            ids = item.get("security_ids")
+            reasons = item.get("reason_counts")
+            first_problem = pd.to_datetime(
+                item.get("first_problem_session"), errors="coerce"
+            )
+            last_problem = pd.to_datetime(
+                item.get("last_problem_session"), errors="coerce"
+            )
+            if (
+                not code
+                or code in {"SPY.US", "BIL.US"}
+                or not isinstance(ids, list)
+                or not ids
+                or not isinstance(reasons, Mapping)
+                or not reasons
+                or any(
+                    not isinstance(value, int) or isinstance(value, bool) or value <= 0
+                    for value in reasons.values()
+                )
+                or pd.isna(first_problem)
+                or pd.isna(last_problem)
+                or first_problem > last_problem
+            ):
+                invalid += 1
+                continue
+            normalized_ids = {str(value) for value in ids}
+            if (
+                any(not value.startswith("us_") for value in normalized_ids)
+                or normalized_ids & included_membership_ids
+            ):
+                invalid += 1
+                continue
+            pool_absent = "TDX_POOL_ABSENT" in reasons
+            if (
+                item.get("raw_capture_sha256") != raw_source.object_sha256
+                or item.get("front_capture_sha256") != front_hash
+            ):
+                invalid += 1
+                continue
+            pool_digest = str(item.get("pool_capture_sha256", ""))
+            if pool_absent and pool_digest not in pool_hashes:
+                invalid += 1
+                continue
+            excluded.update(normalized_ids)
+            accepted_records += 1
+        if invalid:
+            self._issue(
+                issues,
+                "SCOPE_C_EXCLUSION_EVIDENCE_INVALID",
+                QualitySeverity.CRITICAL,
+                "bars_raw",
+                "one or more SCOPE-C exclusions are incomplete or unbound",
+                {"invalid_records": invalid},
+            )
+        metrics["scope_c_exclusion_records"] = accepted_records
+        metrics["scope_c_excluded_security_count"] = len(excluded)
+        if accepted_records and not invalid:
+            metrics["scope_c_exclusion_set_sha256"] = sha256_json(
+                sorted(excluded)
+            )
+        return excluded
 
     def _validate_market_artifact_lineage(
         self,
@@ -2013,6 +2194,8 @@ class USPITQualityValidator:
         artifacts: Mapping[str, pd.DataFrame],
         memberships: pd.DataFrame,
         calendar: pd.DatetimeIndex,
+        *,
+        excluded_security_ids: set[str] = frozenset(),
     ) -> pd.DataFrame:
         columns = [
             "decision_date",
@@ -2078,6 +2261,19 @@ class USPITQualityValidator:
             ].dropna()
             start = max(calendar_start, listed.min()) if not listed.empty else calendar_start
             expected_days = calendar[(calendar >= start) & (calendar <= decision)]
+            if security_id in excluded_security_ids:
+                rows.append(
+                    {
+                        "decision_date": decision,
+                        "security_id": security_id,
+                        "expected_sessions": len(expected_days),
+                        "raw_sessions": 0,
+                        "signal_sessions": 0,
+                        "explained_missing_sessions": len(expected_days),
+                        "passed": bool(len(expected_days)),
+                    }
+                )
+                continue
             raw_count = sum((security_id, day) in raw_keys for day in expected_days)
             signal_count = sum(
                 (decision, security_id, day) in signal_keys for day in expected_days
@@ -2112,6 +2308,8 @@ class USPITQualityValidator:
         memberships: pd.DataFrame,
         calendar: pd.DatetimeIndex,
         issues: list[QualityIssue],
+        *,
+        excluded_security_ids: set[str] = frozenset(),
     ) -> None:
         raw = artifacts.get("bars_raw")
         signal = artifacts.get("bars_pit_signal")
@@ -2124,11 +2322,17 @@ class USPITQualityValidator:
                 strict=True,
             )
         )
-        signal_keys = set(
+        signal_decisions = pd.to_datetime(
+            signal["decision_date"], errors="coerce"
+        ).dt.normalize()
+        signal_dates = pd.to_datetime(
+            signal["date"], errors="coerce"
+        ).dt.normalize()
+        signal_close_mask = signal_dates.eq(signal_decisions)
+        signal_close_keys = set(
             zip(
-                pd.to_datetime(signal["decision_date"], errors="coerce").dt.normalize(),
-                signal["security_id"].astype(str),
-                pd.to_datetime(signal["date"], errors="coerce").dt.normalize(),
+                signal_decisions.loc[signal_close_mask],
+                signal.loc[signal_close_mask, "security_id"].astype(str),
                 strict=True,
             )
         )
@@ -2149,10 +2353,52 @@ class USPITQualityValidator:
         missing_raw = 0
         missing_next_open = 0
         calendar_values = set(calendar)
+        identity_successors: dict[tuple[str, pd.Timestamp], str] = {}
+        actions = artifacts.get("corporate_actions")
+        if actions is not None and not actions.empty:
+            identity = actions.loc[
+                actions["action_type"]
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .isin(
+                    {
+                        "TICKER_CHANGE",
+                        "RENAME",
+                        "SPLIT",
+                        "STOCK_DIVIDEND",
+                        "REORGANIZATION",
+                    }
+                )
+                & self._bool_series(actions["terms_verified"])
+            ].copy()
+            def safe_effective_day(value: Any) -> pd.Timestamp:
+                try:
+                    return ny_session_date(value)
+                except (TypeError, ValueError):
+                    return pd.NaT
+
+            identity["effective_day"] = identity["effective_at"].map(
+                safe_effective_day
+            )
+            for key, group in identity.groupby(
+                ["security_id", "effective_day"], dropna=False, sort=False
+            ):
+                if len(group) != 1 or pd.isna(key[1]):
+                    continue
+                successor = str(
+                    group.iloc[0].get("successor_security_id", "")
+                ).strip()
+                if successor.startswith("us_"):
+                    identity_successors[(str(key[0]), pd.Timestamp(key[1]))] = (
+                        successor
+                    )
         for row in memberships[["decision_date", "security_id"]].itertuples(index=False):
             decision = pd.Timestamp(row.decision_date).normalize()
             security_id = str(row.security_id)
-            if (decision, security_id, decision) not in signal_keys and (
+            if security_id in excluded_security_ids:
+                continue
+            if (decision, security_id) not in signal_close_keys and (
                 security_id,
                 decision,
             ) not in exception_keys:
@@ -2169,7 +2415,14 @@ class USPITQualityValidator:
                     security_id,
                     next_session,
                 ) not in exception_keys:
-                    missing_next_open += 1
+                    next_security_id = identity_successors.get(
+                        (security_id, next_session), security_id
+                    )
+                    if (next_security_id, next_session) not in raw_keys and (
+                        next_security_id,
+                        next_session,
+                    ) not in exception_keys:
+                        missing_next_open += 1
             elif decision in calendar_values:
                 self._issue(
                     issues,
@@ -2209,12 +2462,70 @@ class USPITQualityValidator:
         anchors = artifacts.get("anchor_reconciliations")
         if self._usable(anchors, "anchor_reconciliations") and anchors is not None:
             metrics["anchor_reconciliations"] = len(anchors)
+            scope_security_ids = frozenset(
+                memberships["security_id"].dropna().astype(str).str.strip()
+            )
+            scope_c_projection = any(
+                item.dataset == "bars_raw"
+                and item.metadata.get("scope_c_rule_version")
+                == "SCOPE-C-QUALITY-v1"
+                and isinstance(item.metadata.get("scope_c_exclusions"), list)
+                for item in sources
+            )
             holdings = artifacts.get("fund_holdings_observed")
             actual_failures = 0
             attestation_mismatches = 0
             valid_anchor_count = 0
             anchor_samples: list[dict[str, Any]] = []
             duplicate_anchors = anchors.duplicated(["anchor_date", "evidence_sha256"])
+            events = artifacts.get("membership_events")
+            event_value = pd.DataFrame()
+            if events is not None and not events.empty:
+                event_value = events.copy()
+                event_value["effective_day"] = ny_session_dates(
+                    event_value["effective_at"]
+                )
+            actions = artifacts.get("corporate_actions")
+            spinoff_successors = (
+                set(
+                    actions.loc[
+                        actions["action_type"]
+                        .astype(str)
+                        .str.strip()
+                        .str.upper()
+                        .eq("SPINOFF"),
+                        "successor_security_id",
+                    ].dropna().astype(str)
+                )
+                if actions is not None
+                and not actions.empty
+                and "successor_security_id" in actions.columns
+                else set()
+            )
+
+            def explained_residual(
+                security_id: str, anchor_day: pd.Timestamp
+            ) -> bool:
+                if event_value.empty:
+                    return False
+                matching = event_value.loc[
+                    event_value["security_id"].astype(str).eq(security_id)
+                    & event_value["effective_day"].notna()
+                    & event_value["effective_day"].le(anchor_day)
+                ].sort_values(["effective_day", "event_id"], kind="stable")
+                latest_kind = (
+                    ""
+                    if matching.empty
+                    else str(matching.iloc[-1]["event_type"]).strip().upper()
+                )
+                if latest_kind == "REMOVE":
+                    return True
+                if security_id in spinoff_successors:
+                    return not matching["event_type"].astype(str).str.upper().eq(
+                        "ADD"
+                    ).any()
+                return False
+
             for _, anchor in anchors.iterrows():
                 anchor_date = pd.to_datetime(
                     anchor.get("anchor_date"), errors="coerce"
@@ -2261,10 +2572,20 @@ class USPITQualityValidator:
                 anchor_set = frozenset(
                     anchor_rows["security_id"].astype(str).str.strip()
                 )
+                if scope_c_projection:
+                    anchor_set &= scope_security_ids
                 replay_set = replayed_memberships[decision]
                 additions = anchor_set - replay_set
                 removals = replay_set - anchor_set
-                actual_reconciled = not additions and not removals
+                unexplained_additions = frozenset(
+                    security_id
+                    for security_id in additions
+                    if not explained_residual(security_id, anchor_date)
+                )
+                unexplained_removals = removals
+                actual_reconciled = (
+                    not unexplained_additions and not unexplained_removals
+                )
                 actual_failures += int(not actual_reconciled)
                 valid_anchor_count += 1
                 claimed_additions = pd.to_numeric(
@@ -2277,8 +2598,10 @@ class USPITQualityValidator:
                 if (
                     pd.isna(claimed_additions)
                     or pd.isna(claimed_removals)
-                    or float(claimed_additions) != float(len(additions))
-                    or float(claimed_removals) != float(len(removals))
+                    or float(claimed_additions)
+                    != float(len(unexplained_additions))
+                    or float(claimed_removals)
+                    != float(len(unexplained_removals))
                     or claimed_reconciled != actual_reconciled
                 ):
                     attestation_mismatches += 1
@@ -2286,8 +2609,8 @@ class USPITQualityValidator:
                     anchor_samples.append(
                         {
                             "anchor_date": anchor_date.date().isoformat(),
-                            "actual_additions": sorted(additions)[:20],
-                            "actual_removals": sorted(removals)[:20],
+                            "actual_additions": sorted(unexplained_additions)[:20],
+                            "actual_removals": sorted(unexplained_removals)[:20],
                         }
                     )
             metrics["anchor_reconciliations_recomputed"] = valid_anchor_count
@@ -2333,6 +2656,28 @@ class USPITQualityValidator:
                 .astype(str)
                 .str.strip()
             )
+            terminal_types = {
+                "CASH_MERGER",
+                "STOCK_MERGER",
+                "DELISTING",
+                "BANKRUPTCY",
+            }
+            actions = artifacts.get("corporate_actions")
+            terminal = pd.DataFrame()
+            terminal_member_ids: set[str] = set()
+            if actions is not None and self._usable(actions, "corporate_actions"):
+                terminal = actions.loc[
+                    actions["action_type"]
+                    .astype(str)
+                    .str.strip()
+                    .str.upper()
+                    .isin(terminal_types)
+                    & actions["security_id"].astype(str).str.strip().isin(members)
+                ]
+                terminal_member_ids = set(
+                    terminal["security_id"].dropna().astype(str).str.strip()
+                ) & members
+            nonterminal_members = members - terminal_member_ids
             valid_rows = lifecycle.loc[
                 lifecycle["scope"].astype(str).eq("SECURITY")
                 & lifecycle["status"].astype(str).eq("RECONCILED")
@@ -2340,11 +2685,22 @@ class USPITQualityValidator:
                 & lifecycle["security_id"].astype(str).str.strip().ne("")
             ].copy()
             duplicate_security = valid_rows["security_id"].astype(str).duplicated()
+            action_reconciled_member_ids = set(
+                valid_rows.loc[
+                    valid_rows["action_id"]
+                    .astype(str)
+                    .str.strip()
+                    .str.lower()
+                    .map(lambda value: value not in {"", "nan", "none"}),
+                    "security_id",
+                ].astype(str)
+            )
             evidenced_ids: set[str] = set()
             latest_decision = pd.to_datetime(
                 memberships.get("decision_date"), errors="coerce"
             ).max()
             coverage_contract_failures = 0
+            lifecycle_contract_cache: dict[str, bool] = {}
             for _, row in valid_rows.iterrows():
                 digest = str(row.get("evidence_sha256", "")).strip().lower()
                 source_id = str(row.get("source_id", "")).strip()
@@ -2368,34 +2724,76 @@ class USPITQualityValidator:
                 current_through = pd.to_datetime(
                     row.get("current_through"), errors="coerce"
                 )
-                expected_kind = "TERMINAL_ACTION" if has_action else "STATUS_SURVEILLANCE"
+                actions_for_row = artifacts.get("corporate_actions")
+                matching_action = (
+                    pd.DataFrame()
+                    if not has_action or actions_for_row is None
+                    else actions_for_row.loc[
+                        actions_for_row["action_id"].astype(str).eq(action_id)
+                        & actions_for_row["security_id"].astype(str).eq(
+                            str(row["security_id"]).strip()
+                        )
+                    ]
+                )
+                action_type = (
+                    ""
+                    if len(matching_action) != 1
+                    else str(matching_action.iloc[0].get("action_type", ""))
+                    .strip()
+                    .upper()
+                )
+                identity_types = {
+                    "TICKER_CHANGE",
+                    "RENAME",
+                    "SPLIT",
+                    "STOCK_DIVIDEND",
+                    "REORGANIZATION",
+                }
+                expected_kind = (
+                    "STATUS_SURVEILLANCE"
+                    if not has_action
+                    else (
+                        "IDENTITY_SUCCESSION"
+                        if action_type in identity_types
+                        else "TERMINAL_ACTION"
+                    )
+                )
                 contract_valid = coverage_kind == expected_kind and not pd.isna(current_through)
                 if not has_action:
+                    contract_version = (
+                        int(candidates[0].metadata.get("coverage_contract_version", 0))
+                        if len(candidates) == 1
+                        else 0
+                    )
+                    expected_covered = (
+                        members - action_reconciled_member_ids
+                        if contract_version == 4
+                        else members
+                    )
+                    lifecycle_contract_valid = False
+                    if len(candidates) == 1:
+                        cache_key = candidates[0].object_sha256
+                        if cache_key not in lifecycle_contract_cache:
+                            lifecycle_contract_cache[cache_key] = (
+                                self._lifecycle_status_contract_valid(
+                                    candidates[0], sources, artifacts
+                                )
+                            )
+                        lifecycle_contract_valid = lifecycle_contract_cache[
+                            cache_key
+                        ]
                     contract_valid = bool(
                         contract_valid
                         and not pd.isna(latest_decision)
                         and current_through.normalize() >= latest_decision.normalize()
                         and len(candidates) == 1
-                        and self._lifecycle_status_contract_valid(
-                            candidates[0], sources
-                        )
+                        and lifecycle_contract_valid
                         and str(
                             candidates[0].metadata.get("covered_security_ids_sha256", "")
                         )
-                        == sha256_json(sorted(members))
+                        == sha256_json(sorted(expected_covered))
                     )
                 elif len(candidates) == 1:
-                    actions_for_row = artifacts.get("corporate_actions")
-                    matching_action = (
-                        pd.DataFrame()
-                        if actions_for_row is None
-                        else actions_for_row.loc[
-                            actions_for_row["action_id"].astype(str).eq(action_id)
-                            & actions_for_row["security_id"].astype(str).eq(
-                                str(row["security_id"]).strip()
-                            )
-                        ]
-                    )
                     effective = (
                         ny_session_dates(matching_action["effective_at"]).min()
                         if not matching_action.empty
@@ -2413,23 +2811,8 @@ class USPITQualityValidator:
                 if len(candidates) == 1 and contract_valid:
                     evidenced_ids.add(str(row["security_id"]).strip())
 
-            actions = artifacts.get("corporate_actions")
             terminal_missing: list[str] = []
-            if actions is not None and self._usable(actions, "corporate_actions"):
-                terminal_types = {
-                    "CASH_MERGER",
-                    "STOCK_MERGER",
-                    "DELISTING",
-                    "BANKRUPTCY",
-                    "SPINOFF",
-                }
-                terminal = actions.loc[
-                    actions["action_type"]
-                    .astype(str)
-                    .str.strip()
-                    .str.upper()
-                    .isin(terminal_types)
-                ]
+            if not terminal.empty:
                 reconciled_pairs = {
                     (str(row.security_id).strip(), str(row.action_id).strip())
                     for row in valid_rows.itertuples(index=False)
@@ -2542,6 +2925,12 @@ class USPITQualityValidator:
         successor_identity_failures = 0
         security_master = artifacts.get("security_master")
         aliases = artifacts.get("listing_aliases")
+        memberships = artifacts.get("membership_monthly")
+        member_ids = (
+            set(memberships["security_id"].dropna().astype(str).str.strip())
+            if memberships is not None and not memberships.empty
+            else set()
+        )
         known_security_ids = (
             set(security_master["security_id"].dropna().astype(str))
             if self._usable(security_master, "security_master")
@@ -2551,6 +2940,8 @@ class USPITQualityValidator:
         for _, action in actions.iterrows():
             action_type = str(action.get("action_type", "")).strip().upper()
             if action_type in {"TICKER_CHANGE", "RENAME"}:
+                continue
+            if str(action.get("security_id", "")).strip() not in member_ids:
                 continue
             if action_type in {"SPLIT", "STOCK_DIVIDEND"}:
                 term_failures += not self._has_positive_term(
@@ -2617,6 +3008,13 @@ class USPITQualityValidator:
                     action, ("share_ratio", "exchange_ratio", "ratio")
                 )
                 term_failures += not self._valid_successor(action.get("successor_security_id"))
+            elif action_type == "REORGANIZATION":
+                term_failures += not self._has_positive_term(
+                    action, ("share_ratio", "exchange_ratio", "ratio")
+                )
+                term_failures += not self._valid_successor(
+                    action.get("successor_security_id")
+                )
             elif action_type == "SPINOFF":
                 term_failures += not self._has_positive_term(
                     action, ("share_ratio", "ratio")
@@ -2644,10 +3042,12 @@ class USPITQualityValidator:
                 "share-ratio successor IDs require a security-master row and one active alias on the effective XNYS session",
                 {"failed_actions": int(successor_identity_failures)},
             )
-        terminal_types = {"CASH_MERGER", "STOCK_MERGER", "DELISTING", "BANKRUPTCY", "SPINOFF"}
+        terminal_types = {"CASH_MERGER", "STOCK_MERGER", "DELISTING", "BANKRUPTCY"}
         terminal_ids = set(
             actions.loc[
-                actions["action_type"].astype(str).str.upper().isin(terminal_types), "action_id"
+                actions["action_type"].astype(str).str.upper().isin(terminal_types)
+                & actions["security_id"].astype(str).str.strip().isin(member_ids),
+                "action_id",
             ].dropna().astype(str)
         )
         lifecycle = artifacts.get("lifecycle_reconciliations")

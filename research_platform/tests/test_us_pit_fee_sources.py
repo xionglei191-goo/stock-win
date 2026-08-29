@@ -24,6 +24,7 @@ class _FeeTransport:
     @staticmethod
     def _sec_payload(url: str) -> bytes:
         values = {
+            "2018-67": ("May 22, 2018", "13.00"),
             "2019-30": ("April 16, 2019", "20.70"),
             "2020-7": ("February 18, 2020", "22.10"),
             "2021-8": ("February 25, 2021", "5.10"),
@@ -93,6 +94,27 @@ class RegulatoryFeeEvidenceTests(unittest.TestCase):
         self.assertEqual(3, sum(item.dataset == "regulatory_fee_finra" for item in artifacts))
         self.assertTrue(all(item.metadata["fee_evidence_contract_version"] == 2 for item in artifacts))
         self.assertEqual(11, len(set(transport.calls)))
+
+    def test_warmup_range_captures_the_active_2018_sec_rate(self) -> None:
+        transport = _FeeTransport()
+        artifacts = self._adapter(transport).fetch(
+            SyncRequest(
+                start_date=date(2018, 8, 17),
+                end_date=date(2026, 7, 31),
+                observed_at=OBSERVED_AT,
+            )
+        )
+        sec = [item for item in artifacts if item.dataset == "regulatory_fee_sec"]
+        self.assertEqual(9, len(sec))
+        first = next(
+            item
+            for item in sec
+            if item.metadata["rate_entries"][0]["effective_from"] == "2018-05-22"
+        )
+        self.assertAlmostEqual(
+            13.0 / 1_000_000,
+            first.metadata["rate_entries"][0]["sec_sell_fee_rate"],
+        )
 
     def test_declared_rate_must_be_present_in_the_frozen_object(self) -> None:
         transport = _FeeTransport(

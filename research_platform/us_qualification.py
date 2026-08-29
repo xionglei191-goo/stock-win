@@ -233,9 +233,12 @@ def _quality_is_ready(dataset: USBacktestDataset) -> bool:
     status = getattr(report, "status", None)
     status_value = getattr(status, "value", status)
     hard_failures = tuple(getattr(report, "hard_failures", ()))
+    scope_c_bound = bool(
+        getattr(report, "metrics", {}).get("scope_c_exclusion_set_sha256")
+    )
     return (
         status_value == ReleaseStatus.DATA_READY.value
-        and bool(getattr(report, "includes_delisted", False))
+        and (bool(getattr(report, "includes_delisted", False)) or scope_c_bound)
         and not hard_failures
         and getattr(report, "metrics", {}).get("quality_contract_revision")
         == QUALITY_CONTRACT_REVISION

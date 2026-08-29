@@ -505,10 +505,12 @@ def build_parser() -> argparse.ArgumentParser:
         "doctor",
         help="Check SEC contact configuration, local PIT catalog, and read-only TDX runtime",
     )
-    us_pit_sub.add_parser(
+    us_pit_fees = us_pit_sub.add_parser(
         "sync-fees",
         help="Freeze the official SEC and FINRA regulatory-fee source objects",
     )
+    us_pit_fees.add_argument("--start", default="2018-05-22")
+    us_pit_fees.add_argument("--end")
     us_pit_sub.add_parser(
         "sync-sec-company-index",
         help="Freeze SEC's current company index as a review-only CIK search aid",
@@ -1024,8 +1026,12 @@ def main() -> int:
             batch = pit.sync(
                 RegulatoryFeeEvidenceAdapter(),
                 SyncRequest(
-                    start_date=date(2019, 10, 1),
-                    end_date=observed_at.date(),
+                    start_date=date.fromisoformat(args.start),
+                    end_date=(
+                        observed_at.date()
+                        if args.end is None
+                        else date.fromisoformat(args.end)
+                    ),
                     observed_at=observed_at,
                 ),
             )

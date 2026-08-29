@@ -309,6 +309,9 @@ class USPITMarketPreparerTests(unittest.TestCase):
     def _action_dependency(
         self,
         observed_at: str = "2022-12-15T12:00:00+00:00",
+        *,
+        published_at: str | None = None,
+        publication_verified: bool = False,
     ) -> SourceDependency:
         evidence = self.store.put_bytes(b"fixture-corporate-action-evidence")
         return SourceDependency(
@@ -318,10 +321,19 @@ class USPITMarketPreparerTests(unittest.TestCase):
             license_class=LicenseClass.OFFICIAL_PUBLIC,
             object_sha256=evidence.sha256,
             observed_at=observed_at,
-            published_at=observed_at,
+            published_at=published_at or observed_at,
             url="https://example.test/actions",
             dataset="corporate_actions",
             as_of_date="2022-12-15",
+            metadata=(
+                {
+                    "publication_time_from_payload": True,
+                    "accepted_at_verified_in_payload": True,
+                    "accepted_at": published_at or observed_at,
+                }
+                if publication_verified
+                else {}
+            ),
         )
 
     def _prepare(
@@ -413,22 +425,63 @@ class USPITMarketPreparerTests(unittest.TestCase):
         )
         self.assertIsNotNone(release.release_id)
 
-    def test_missing_next_open_and_non_session_row_block_without_fill(self) -> None:
+    def test_incomplete_stock_history_is_scope_c_excluded_without_fill(self) -> None:
         provider = self._provider()
         next_session = pd.Timestamp(self.calendar["session_date"].max())
         provider.values["AAPL.US"] = provider.values["AAPL.US"].drop(next_session)
         saturday = pd.Timestamp("2024-12-28")
         provider.values["AAPL.US"].loc[saturday] = provider.values["AAPL.US"].iloc[-1]
 
-        result = self._prepare(self._workspace("reviewed-gaps"), "blocked-gaps", provider)
+        result = self._prepare(self._workspace("reviewed-gaps"), "scope-excluded", provider)
+
+        self.assertTrue(result.ready, [item.to_dict() for item in result.gaps])
+        raw = pd.read_parquet(result.output_dir / "bars_raw.parquet")
+        self.assertNotIn(SECURITY_ID, set(raw["security_id"].astype(str)))
+        membership = pd.read_parquet(
+            result.output_dir / "membership_monthly.parquet"
+        )
+        self.assertNotIn(
+            SECURITY_ID, set(membership["security_id"].astype(str))
+        )
+        report = json.loads(
+            (result.output_dir / "market_prepare_report.json").read_text("utf-8")
+        )
+        exclusion = next(
+            item
+            for item in report["excluded_market_data"]
+            if item.get("vendor_code") == "AAPL.US"
+        )
+        self.assertEqual("SCOPE-C-QUALITY-v1", exclusion["rule_version"])
+        self.assertIn("RAW_REQUIRED_SESSION_MISSING", exclusion["reason_counts"])
+        release = USPITService(self.store).build_from_directory(
+            result.output_dir,
+            source_batch_ids=[result.source_batch.batch_id],
+        )
+        self.assertEqual(
+            1, release.quality_report.metrics["scope_c_excluded_security_count"]
+        )
+        self.assertEqual(
+            sha256_json([SECURITY_ID]),
+            release.quality_report.metrics["scope_c_exclusion_set_sha256"],
+        )
+        self.assertNotIn(
+            "INCOMPLETE_BAR_COVERAGE",
+            {item.code for item in release.quality_report.issues},
+        )
+
+    def test_benchmark_history_cannot_be_scope_c_excluded(self) -> None:
+        provider = self._provider()
+        next_session = pd.Timestamp(self.calendar["session_date"].max())
+        provider.values["SPY.US"] = provider.values["SPY.US"].drop(next_session)
+
+        result = self._prepare(
+            self._workspace("reviewed-benchmark-gap"),
+            "blocked-benchmark-gap",
+            provider,
+        )
 
         self.assertEqual("DATA_BLOCKED", result.status)
-        codes = {item.code for item in result.gaps}
-        self.assertIn("NEXT_EXECUTION_OPEN_MISSING", codes)
-        self.assertIn("TDX_NON_XNYS_SESSION", codes)
-        raw = pd.read_parquet(result.output_dir / "bars_raw.parquet")
-        self.assertNotIn(saturday, set(pd.to_datetime(raw["date"])))
-        self.assertNotIn(next_session, set(pd.to_datetime(raw["date"])))
+        self.assertIn("BENCHMARK_SESSION_MISSING", {item.code for item in result.gaps})
 
     def test_split_is_causal_and_unverified_terms_block(self) -> None:
         dependency = self._action_dependency("2023-01-03T12:00:00+00:00")
@@ -566,6 +619,68 @@ class USPITMarketPreparerTests(unittest.TestCase):
         inherited = signal.loc[signal["date"].eq(predecessor_day), "Close"].iloc[0]
         self.assertAlmostEqual(float(old_rows.loc[predecessor_day, "Close"]) / 10, inherited)
         self.assertTrue(set(new_rows.index).issubset(set(signal["date"])))
+
+    def test_verified_publication_time_survives_later_local_capture(self) -> None:
+        dependency = self._action_dependency(
+            "2025-01-03T12:00:00+00:00",
+            published_at="2023-01-03T12:00:00+00:00",
+            publication_verified=True,
+        )
+        action = {
+            "action_id": "verified-publication-split",
+            "security_id": SECURITY_ID,
+            "action_type": "SPLIT",
+            "announced_at": "2023-01-03T12:00:00+00:00",
+            "effective_at": "2023-01-04T09:30:00-05:00",
+            "pay_date": None,
+            "terms_verified": True,
+            "source_id": dependency.source_id,
+            "evidence_sha256": dependency.object_sha256,
+            "split_ratio": 2.0,
+        }
+        result = self._prepare(
+            self._workspace(
+                "verified-publication",
+                action=action,
+                action_dependency=dependency,
+            ),
+            "verified-publication-output",
+            self._provider(),
+        )
+        self.assertTrue(result.ready, [item.to_dict() for item in result.gaps])
+
+    def test_unverified_late_capture_remains_blocking(self) -> None:
+        dependency = self._action_dependency(
+            "2025-01-03T12:00:00+00:00",
+            published_at="2023-01-03T12:00:00+00:00",
+            publication_verified=False,
+        )
+        action = {
+            "action_id": "unverified-publication-split",
+            "security_id": SECURITY_ID,
+            "action_type": "SPLIT",
+            "announced_at": "2023-01-03T12:00:00+00:00",
+            "effective_at": "2023-01-04T09:30:00-05:00",
+            "pay_date": None,
+            "terms_verified": True,
+            "source_id": dependency.source_id,
+            "evidence_sha256": dependency.object_sha256,
+            "split_ratio": 2.0,
+        }
+        result = self._prepare(
+            self._workspace(
+                "unverified-publication",
+                action=action,
+                action_dependency=dependency,
+            ),
+            "unverified-publication-output",
+            self._provider(),
+        )
+        self.assertEqual("DATA_BLOCKED", result.status)
+        self.assertIn(
+            "CORPORATE_ACTION_EVIDENCE_LATE",
+            {item.code for item in result.gaps},
+        )
 
     def test_future_split_does_not_change_any_historical_signal(self) -> None:
         dependency = self._action_dependency()

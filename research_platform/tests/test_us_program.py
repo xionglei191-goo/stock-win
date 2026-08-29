@@ -476,6 +476,25 @@ class USMomentumProgramTests(unittest.TestCase):
                 manifest_sha256=MANIFEST_SHA256,
             )
 
+    def test_historical_failure_can_restart_with_a_new_immutable_release(self) -> None:
+        self._register_ready()
+        failed = self.program.register_historical(
+            _historical(False),
+            HISTORICAL_SHA256,
+            release_id=RELEASE_ID,
+            manifest_sha256=MANIFEST_SHA256,
+        )
+        self.assertEqual("HISTORICAL_FAILED", failed["state"])
+
+        replacement = dict(_release())
+        replacement["release_id"] = "9" * 64
+        replacement["manifest_sha256"] = "8" * 64
+        restarted = self.program.register_data_release(replacement)
+
+        self.assertEqual("DATA_READY", restarted["state"])
+        self.assertEqual("9" * 64, restarted["release_id"])
+        self.assertFalse(restarted["historical_qualified"])
+
     def test_tdx_failure_blocks_paper(self) -> None:
         self._register_ready()
         self._register_historical()

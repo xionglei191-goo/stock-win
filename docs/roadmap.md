@@ -157,6 +157,16 @@
 
 真实交易连接、云部署和多人权限必须经过独立的安全与风控设计，不作为现阶段自然延伸。
 
+## 2026-08-30 美股 PIT：数据发布完成，历史资格未通过
+
+- 最终人工审查工作区为 `oxalpha_v41/d698d86ada90b0000438629d5f837ca8c5f5989ecbf87a7820f44ac651f39345`，状态 `REVIEW_READY`、blocking gaps 0；最终市场工作区为 `oxalpha_v41_market3`，状态 `MARKET_READY`、blocking gaps 0。
+- listing alias 审查输入由清单和内容哈希绑定：CBOE 在 60 个决策月唯一映射为 `CBOE.US/BATS`；GE reverse split 前身截至 2021-07-30、后继自 2021-08-02 起生效；COO、ANET、LRCX、SMCI、AMCR 同样采用不重叠的 action-lineage alias；EMBC 自 2022-04-01 使用 `XNAS`。
+- 公司行动因果时间统一使用共享 evidence-availability 规则。BDX→EMBC 和 FTV→RAL 的成本基础按预注册 `TDX_JOINT_SESSION_VWAP_RELATIVE_FMV-v2` 从首个联合原始交易会话推导，分别为 0.0229283272 和 0.2384657310，并绑定原始捕获哈希；未验证或晚到证据仍阻断。
+- SCOPE-C 质量范围排除最终为 197 个稳定证券、295 条逐 vendor-code 记录，集合哈希 `a42fdf45de42d65cdc6d73d9bd7c3d262fad16023c260ba560b9ac7729f7577a`；没有填充坏行，也没有对 SPY/BIL、日历、费用或无法归属数据做排除。
+- 最终不可变发布 `62fb61d44c727f588c753a99a3811ebd6f16ec7c89692e0ad7df27945942d983`，manifest SHA-256 `bbfdc027b07e4ad0510275aea91483d43b3e60c20d8c5ff9ee2205af4c9a5abe`。`us-pit build` 与独立 `us-pit validate` 均为 `DATA_READY`，Critical/High 均为 0。
+- 冻结资格运行 `freeze_sha256=11636d236c362c9725d560a976f36576b2b9e05aac5b7b0019f45e20b7b72c00` 诚实结束于 `HISTORICAL_FAILED`。未通过 OOS CAGR/Sharpe/回撤、去除最大贡献发行人、sealed drawdown、双倍成本 CAGR/Sharpe 和邻域通过数门槛；没有调参或放宽门禁。
+- 因未达到 `BACKTEST_QUALIFIED`，没有执行 `us-paper admit-release`；paper admission count 保持 0，broker writes 关闭，真实订单入口关闭，执行模式保持 `PAPER_ONLY`。
+
 ## 2026-02 美股 PIT：SIGNATURE BANK 身份闭合（652→0）
 
 - 定位根因：`tmp/exited_cik_proposals.json` 中 SIGNATURE BANK 提议 CIK 长驻不存在的

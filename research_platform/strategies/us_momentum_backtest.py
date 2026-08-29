@@ -769,7 +769,9 @@ def _build_data_view(
         if quality_status != "DATA_READY" or hard_failures:
             raise ValueError("USBacktestDataset quality is not DATA_READY")
         if not bool(getattr(dataset, "includes_delisted", False)):
-            raise ValueError("PIT release quality did not derive includes_delisted=True")
+            metrics = getattr(quality, "metrics", {})
+            if not bool(metrics.get("scope_c_exclusion_set_sha256")):
+                raise ValueError("PIT release quality did not derive includes_delisted=True")
         release_id = str(getattr(dataset, "release_id", ""))
         universe_id = str(getattr(dataset, "universe_id", ""))
         if len(release_id) != 64 or any(

@@ -25,6 +25,9 @@ WORKSPACE_FORMAT_VERSION = "us-pit-reviewed-workspace-v1"
 _IDENTITY_REVIEW_FILE = "identity_review.parquet"
 _EVENT_REVIEW_FILE = "membership_events.parquet"
 _ACTION_REVIEW_FILE = "corporate_actions.parquet"
+_ALIAS_REVIEW_FILE = "listing_alias_review.parquet"
+_ALIAS_REVIEW_MANIFEST = "listing_alias_review_manifest.json"
+_ACTION_AMENDMENT_MANIFEST = "corporate_action_review_amendment_manifest.json"
 _EXCEPTION_REVIEW_FILE = "session_exceptions.parquet"
 
 
@@ -243,19 +246,32 @@ class USPITReviewWorkspaceAssembler:
         )
 
         artifacts: dict[str, pd.DataFrame] = {}
-        artifacts["fund_holdings_observed"] = self._holdings(resolved, source_keys)
+        artifacts["fund_holdings_observed"] = self._holdings(resolved, sources)
         artifacts["security_master"] = self._security_master(resolved)
         artifacts["identifiers"] = self._identifiers(resolved)
-        artifacts["listing_aliases"] = self._listing_aliases(resolved)
         artifacts["membership_events"] = self._reviewed_evidence_table(
             review_root / _EVENT_REVIEW_FILE,
             "membership_events",
             source_keys,
         )
+        self._validate_action_amendment_manifest(
+            review_root / _ACTION_REVIEW_FILE,
+            review_root / _ACTION_AMENDMENT_MANIFEST,
+            sources,
+        )
         artifacts["corporate_actions"] = self._reviewed_evidence_table(
             review_root / _ACTION_REVIEW_FILE,
             "corporate_actions",
             source_keys,
+        )
+        alias_review = self._read_listing_alias_review(
+            review_root / _ALIAS_REVIEW_FILE,
+            review_root / _ALIAS_REVIEW_MANIFEST,
+            sources,
+            artifacts["corporate_actions"],
+        )
+        artifacts["listing_aliases"] = self._listing_aliases(
+            resolved, alias_review
         )
         artifacts["session_exceptions"] = self._reviewed_evidence_table(
             review_root / _EXCEPTION_REVIEW_FILE,
@@ -446,6 +462,326 @@ class USPITReviewWorkspaceAssembler:
         if frame["holding_candidate_id"].isna().any() or frame["holding_candidate_id"].duplicated().any():
             raise ReviewWorkspaceError("identity review candidate key must be unique and non-null")
         return frame
+
+    def _read_listing_alias_review(
+        self,
+        path: Path,
+        manifest_path: Path,
+        sources: tuple[SourceDependency, ...],
+        actions: pd.DataFrame,
+    ) -> pd.DataFrame:
+        columns = [
+            "alias_review_id",
+            "binding_type",
+            "security_id",
+            "ticker",
+            "vendor_code",
+            "exchange_mic",
+            "valid_from",
+            "valid_to",
+            "action_id",
+            "evidence_source_id",
+            "evidence_sha256",
+            "approved",
+            "review_note",
+            "approved_by",
+            "approved_at",
+            "approval_id",
+        ]
+        if not path.is_file():
+            if manifest_path.exists():
+                raise ReviewWorkspaceError(
+                    "listing alias review manifest exists without its parquet"
+                )
+            return pd.DataFrame(columns=columns)
+        if not manifest_path.is_file():
+            raise ReviewWorkspaceError(
+                "listing alias review requires a hash-bound package manifest"
+            )
+        try:
+            package = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ReviewWorkspaceError(
+                "listing alias review package manifest is unreadable"
+            ) from exc
+        if not isinstance(package, dict):
+            raise ReviewWorkspaceError(
+                "listing alias review package manifest must be an object"
+            )
+        package_identity = dict(package)
+        package_id = str(package_identity.pop("package_id", "")).strip().lower()
+        if (
+            package.get("format_version")
+            != "us-pit-listing-alias-review-package-v1"
+            or package_id != sha256_json(package_identity)
+            or str(package.get("listing_alias_review_sha256", "")).lower()
+            != sha256_file(path)
+        ):
+            raise ReviewWorkspaceError(
+                "listing alias review package identity or parquet hash is invalid"
+            )
+        frame = pd.read_parquet(path)
+        try:
+            expected_count = int(package.get("row_count", -1))
+        except (TypeError, ValueError) as exc:
+            raise ReviewWorkspaceError(
+                "listing alias review package row count is invalid"
+            ) from exc
+        package_reviewer = str(package.get("approved_by", "")).strip()
+        package_approved_at = pd.to_datetime(
+            package.get("approved_at"), errors="coerce", utc=True
+        )
+        if (
+            expected_count != len(frame)
+            or not package_reviewer
+            or pd.isna(package_approved_at)
+        ):
+            raise ReviewWorkspaceError(
+                "listing alias review package approval metadata is invalid"
+            )
+        missing = set(columns) - set(frame.columns)
+        if missing:
+            raise ReviewWorkspaceError(
+                "listing alias review is missing columns: "
+                + ", ".join(sorted(missing))
+            )
+        if frame["alias_review_id"].isna().any() or frame[
+            "alias_review_id"
+        ].duplicated().any():
+            raise ReviewWorkspaceError(
+                "listing alias review IDs must be unique and non-null"
+            )
+        source_pairs = {
+            (item.source_id, item.object_sha256.lower()) for item in sources
+        }
+        action_by_id = {
+            str(row.action_id): row
+            for row in actions.itertuples(index=False)
+            if str(row.action_id).strip()
+        }
+        normalized: list[dict[str, Any]] = []
+        for raw in frame[columns].to_dict(orient="records"):
+            approved = str(raw.get("approved", "")).strip().casefold() in {
+                "true",
+                "1",
+            }
+            note = str(raw.get("review_note", "")).strip()
+            approved_by = str(raw.get("approved_by", "")).strip()
+            if not approved or not note or not approved_by:
+                raise ReviewWorkspaceError(
+                    "listing alias rows require explicit approval, reviewer, and note"
+                )
+            approved_at = pd.to_datetime(
+                raw.get("approved_at"), errors="coerce", utc=True
+            )
+            if pd.isna(approved_at):
+                raise ReviewWorkspaceError(
+                    "listing alias approval time must be timezone-aware"
+                )
+            if (
+                approved_by != package_reviewer
+                or approved_at != package_approved_at
+            ):
+                raise ReviewWorkspaceError(
+                    "listing alias row approval does not match its package approval"
+                )
+            sid = str(raw.get("security_id", "")).strip()
+            ticker = _normalize_ticker(raw.get("ticker"))
+            vendor_code = str(raw.get("vendor_code", "")).strip().upper()
+            exchange_mic = str(raw.get("exchange_mic", "")).strip().upper()
+            binding_type = str(raw.get("binding_type", "")).strip().upper()
+            action_id = _clean_text(raw.get("action_id")) or ""
+            source_id = str(raw.get("evidence_source_id", "")).strip()
+            digest = str(raw.get("evidence_sha256", "")).strip().lower()
+            valid_from = _date_string(raw.get("valid_from"), field="alias valid_from")
+            valid_to = (
+                None
+                if raw.get("valid_to") is None or pd.isna(raw.get("valid_to"))
+                else _date_string(raw.get("valid_to"), field="alias valid_to")
+            )
+            if (
+                not sid.startswith("us_")
+                or vendor_code != f"{ticker}.US"
+                or exchange_mic not in {"XNYS", "XNAS", "ARCX", "BATS"}
+                or binding_type not in {"IDENTITY_ALIAS", "ACTION_LINEAGE_ALIAS"}
+                or len(digest) != 64
+                or (source_id, digest) not in source_pairs
+            ):
+                raise ReviewWorkspaceError(
+                    f"invalid or unproven listing alias review: {raw.get('alias_review_id')}"
+                )
+            object_path = self.store.object_path(digest)
+            if not object_path.is_file() or sha256_file(object_path) != digest:
+                raise ReviewWorkspaceError(
+                    "listing alias evidence object is missing or corrupt"
+                )
+            if binding_type == "ACTION_LINEAGE_ALIAS":
+                action = action_by_id.get(action_id)
+                if action is None:
+                    raise ReviewWorkspaceError(
+                        "action-lineage alias references an unknown approved action"
+                    )
+                action_ids = {
+                    str(action.security_id),
+                    str(getattr(action, "successor_security_id", "")),
+                }
+                if (
+                    sid not in action_ids
+                    or str(action.source_id) != source_id
+                    or str(action.evidence_sha256).lower() != digest
+                    or str(action.terms_verified).strip().casefold()
+                    not in {"true", "1"}
+                ):
+                    raise ReviewWorkspaceError(
+                        "action-lineage alias does not match its approved action"
+                    )
+            elif action_id:
+                raise ReviewWorkspaceError(
+                    "identity alias review cannot carry an action ID"
+                )
+            identity = {
+                "format_version": "us-pit-listing-alias-review-v1",
+                "alias_review_id": str(raw.get("alias_review_id", "")).strip(),
+                "binding_type": binding_type,
+                "security_id": sid,
+                "ticker": ticker,
+                "vendor_code": vendor_code,
+                "exchange_mic": exchange_mic,
+                "valid_from": valid_from,
+                "valid_to": valid_to,
+                "action_id": action_id,
+                "evidence_source_id": source_id,
+                "evidence_sha256": digest,
+                "approved": True,
+                "review_note": note,
+                "approved_by": approved_by,
+                "approved_at": approved_at.isoformat(),
+            }
+            if str(raw.get("approval_id", "")).strip().lower() != sha256_json(
+                identity
+            ):
+                raise ReviewWorkspaceError(
+                    "listing alias approval ID does not bind the reviewed row"
+                )
+            normalized.append({**identity, "approval_id": sha256_json(identity)})
+        result = pd.DataFrame(normalized, columns=columns)
+        for action_id, group in result.loc[
+            result["binding_type"].eq("ACTION_LINEAGE_ALIAS")
+        ].groupby("action_id"):
+            action = action_by_id[action_id]
+            predecessor = str(action.security_id)
+            successor = str(action.successor_security_id)
+            if set(group["security_id"]) != {predecessor, successor}:
+                raise ReviewWorkspaceError(
+                    "action-lineage alias must review both predecessor and successor"
+                )
+            if any(group[column].nunique(dropna=False) != 1 for column in (
+                "ticker", "vendor_code", "exchange_mic"
+            )):
+                raise ReviewWorkspaceError(
+                    "action-lineage aliases must share one vendor listing"
+                )
+            effective = pd.to_datetime(
+                action.effective_at, errors="coerce", utc=True
+            )
+            if pd.isna(effective):
+                raise ReviewWorkspaceError("action-lineage effective time is invalid")
+            effective_day = effective.tz_convert("America/New_York").tz_localize(None).normalize()
+            calendar = xcals.get_calendar("XNYS")
+            if not calendar.is_session(effective_day):
+                raise ReviewWorkspaceError(
+                    "action-lineage effective date must be an XNYS session"
+                )
+            previous = pd.Timestamp(calendar.previous_session(effective_day)).tz_localize(None)
+            predecessor_row = group.loc[group["security_id"].eq(predecessor)].iloc[0]
+            successor_row = group.loc[group["security_id"].eq(successor)].iloc[0]
+            if (
+                predecessor_row["valid_to"] != previous.date().isoformat()
+                or successor_row["valid_from"] != effective_day.date().isoformat()
+            ):
+                raise ReviewWorkspaceError(
+                    "action-lineage alias boundary does not match the action session"
+                )
+        return result
+
+    def _validate_action_amendment_manifest(
+        self,
+        action_path: Path,
+        manifest_path: Path,
+        sources: tuple[SourceDependency, ...],
+    ) -> None:
+        """Verify optional action-evidence promotions as one immutable approval package."""
+
+        if not manifest_path.is_file():
+            return
+        if not action_path.is_file():
+            raise ReviewWorkspaceError(
+                "action amendment manifest exists without corporate_actions.parquet"
+            )
+        try:
+            package = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ReviewWorkspaceError("action amendment manifest is unreadable") from exc
+        if not isinstance(package, dict):
+            raise ReviewWorkspaceError("action amendment manifest must be an object")
+        identity = dict(package)
+        package_id = str(identity.pop("package_id", "")).strip().lower()
+        changes = package.get("changes")
+        approved_by = str(package.get("approved_by", "")).strip()
+        approved_at = pd.to_datetime(package.get("approved_at"), errors="coerce", utc=True)
+        if (
+            package.get("format_version") != "us-pit-action-evidence-amendment-v1"
+            or package_id != sha256_json(identity)
+            or str(package.get("corporate_actions_sha256", "")).lower()
+            != sha256_file(action_path)
+            or not isinstance(changes, list)
+            or not changes
+            or not approved_by
+            or pd.isna(approved_at)
+        ):
+            raise ReviewWorkspaceError("action amendment package identity is invalid")
+        actions = pd.read_parquet(action_path)
+        source_by_pair = {
+            (item.source_id, item.object_sha256.lower()): item for item in sources
+            if item.dataset == "corporate_actions"
+        }
+        seen: set[str] = set()
+        for change in changes:
+            if not isinstance(change, dict):
+                raise ReviewWorkspaceError("action amendment change must be an object")
+            action_id = str(change.get("action_id", "")).strip()
+            source_id = str(change.get("source_id", "")).strip()
+            digest = str(change.get("evidence_sha256", "")).strip().lower()
+            if not action_id or action_id in seen:
+                raise ReviewWorkspaceError("action amendment IDs must be unique")
+            seen.add(action_id)
+            rows = actions.loc[actions["action_id"].astype(str).eq(action_id)]
+            if len(rows) != 1:
+                raise ReviewWorkspaceError("amended action is missing or ambiguous")
+            row = rows.iloc[0]
+            source = source_by_pair.get((source_id, digest))
+            metadata = {} if source is None else dict(source.metadata)
+            source_approved_at = pd.to_datetime(
+                metadata.get("approved_at"), errors="coerce", utc=True
+            )
+            if (
+                str(row.get("source_id", "")) != source_id
+                or str(row.get("evidence_sha256", "")).lower() != digest
+                or str(change.get("review_note_sha256", ""))
+                != sha256_json(str(row.get("review_note", "")))
+                or source is None
+                or source.role != SourceRole.SIGNAL_INPUT
+                or metadata.get("action_id") != action_id
+                or metadata.get("human_terms_reviewed") is not True
+                or metadata.get("publication_time_from_payload") is not True
+                or metadata.get("accepted_at_verified_in_payload") is not True
+                or metadata.get("approved_by") != approved_by
+                or pd.isna(source_approved_at)
+                or source_approved_at != approved_at
+            ):
+                raise ReviewWorkspaceError(
+                    f"action amendment is not hash-bound to reviewed evidence: {action_id}"
+                )
 
     @staticmethod
     def _resolve_identities(
@@ -648,23 +984,33 @@ class USPITReviewWorkspaceAssembler:
     @staticmethod
     def _holdings(
         resolved: pd.DataFrame,
-        source_keys: set[tuple[str, str, str]],
+        sources: tuple[SourceDependency, ...],
     ) -> pd.DataFrame:
         columns = sorted(REQUIRED_ARTIFACT_COLUMNS["fund_holdings_observed"])
         if resolved.empty:
             return pd.DataFrame(columns=columns)
+        source_by_key: dict[tuple[str, str], list[SourceDependency]] = {}
+        for source in sources:
+            if source.dataset == "fund_holdings_observed":
+                source_by_key.setdefault(
+                    (source.source_id, source.object_sha256), []
+                ).append(source)
         rows = []
         for row in resolved.to_dict(orient="records"):
-            key = (str(row["source_id"]), "fund_holdings_observed", str(row["content_sha256"]))
-            if key not in source_keys:
-                raise ReviewWorkspaceError("normalized holding is not bound to a supplied source batch")
+            key = (str(row["source_id"]), str(row["content_sha256"]))
+            candidates = source_by_key.get(key, [])
+            if len(candidates) != 1:
+                raise ReviewWorkspaceError(
+                    "normalized holding is not uniquely bound to a supplied source"
+                )
+            source = candidates[0]
             rows.append(
                 {
-                    "as_of_date": row["as_of_date"],
-                    "published_at": row["published_at"],
-                    "observed_at": row["observed_at"],
-                    "url": row["url"],
-                    "source_version": row["source_version"],
+                    "as_of_date": source.as_of_date,
+                    "published_at": source.published_at,
+                    "observed_at": source.observed_at,
+                    "url": source.url,
+                    "source_version": source.source_version,
                     "content_sha256": row["content_sha256"],
                     "evidence_role": row["evidence_role"],
                     "security_id": row["security_id"],
@@ -720,7 +1066,9 @@ class USPITReviewWorkspaceAssembler:
         ).reset_index(drop=True)
 
     @staticmethod
-    def _listing_aliases(resolved: pd.DataFrame) -> pd.DataFrame:
+    def _listing_aliases(
+        resolved: pd.DataFrame, alias_review: pd.DataFrame | None = None
+    ) -> pd.DataFrame:
         # LISTING-ALIASES-TDX-EV1 (approved): TDX vendor aliases are derived from
         # the official security identity (ticker + exchange vetted from iShares/
         # SEC candidates), not from whether a holding row was a validation anchor.
@@ -734,9 +1082,15 @@ class USPITReviewWorkspaceAssembler:
         columns = sorted(REQUIRED_ARTIFACT_COLUMNS["listing_aliases"])
         exchange_map = {
             "NYSE": "XNYS",
+            "NEWYORKSTOCKEXCHANGE": "XNYS",
+            "XNYS": "XNYS",
             "NASDAQ": "XNAS",
-            "NYSE ARCA": "XNYS",
-            "CBOE BZX": "XNAS",
+            "NASDAQSTOCKMARKET": "XNAS",
+            "XNAS": "XNAS",
+            "NYSEARCA": "ARCX",
+            "ARCX": "ARCX",
+            "CBOEBZX": "BATS",
+            "BATS": "BATS",
         }
 
         def _ts(value: object) -> pd.Timestamp | None:
@@ -751,21 +1105,42 @@ class USPITReviewWorkspaceAssembler:
                 return None
 
         by_security: dict[str, list[tuple[str, str, object, object]]] = {}
+
+        def _first(*values: object) -> object:
+            for value in values:
+                if value is None:
+                    continue
+                try:
+                    if pd.isna(value):
+                        continue
+                except (TypeError, ValueError):
+                    pass
+                return value
+            return None
+
         for row in resolved.to_dict(orient="records"):
-            ticker = _clean_text(row.get("ticker") or row.get("ticker_resolved"))
+            # Review-approved ticker/exchange live on the *_review suffix when
+            # the holding candidate itself lacks them (e.g. SEC N-PORT anchors).
+            ticker_raw = _first(
+                row.get("ticker"), row.get("ticker_review"), row.get("ticker_resolved")
+            )
+            ticker = _clean_text(ticker_raw)
             if ticker is None:
                 continue
-            exchange = _clean_text(
-                row.get("exchange") or row.get("exchange_resolved")
+            exchange_raw = _first(
+                row.get("exchange"), row.get("exchange_review"), row.get("exchange_resolved")
             )
+            exchange = _clean_text(exchange_raw)
             exchange_handle = exchange_map.get(
                 "".join(str(exchange or "").upper().split())
             )
             if exchange_handle is None:
                 continue
             sid = str(row["security_id"])
-            valid_from = row.get("valid_from_resolved") or row.get("valid_from")
-            valid_to = row.get("valid_to_resolved") or row.get("valid_to")
+            valid_from = _first(
+                row.get("valid_from_resolved"), row.get("valid_from")
+            )
+            valid_to = _first(row.get("valid_to_resolved"), row.get("valid_to"))
             by_security.setdefault(sid, []).append(
                 (ticker, exchange_handle, valid_from, valid_to)
             )
@@ -824,9 +1199,37 @@ class USPITReviewWorkspaceAssembler:
                     }
                 )
         frame = pd.DataFrame(rows, columns=columns).drop_duplicates()
+        if alias_review is not None and not alias_review.empty:
+            reviewed_ids = set(alias_review["security_id"].astype(str))
+            frame = frame.loc[~frame["security_id"].astype(str).isin(reviewed_ids)]
+            reviewed = alias_review.rename(
+                columns={"exchange_mic": "exchange"}
+            )[["security_id", "ticker", "vendor_code", "exchange", "valid_from", "valid_to"]]
+            frame = pd.concat([frame, reviewed], ignore_index=True)
         if frame.empty:
-            return frame
-        return frame.sort_values(
+            return pd.DataFrame(columns=columns)
+        frame["valid_from"] = pd.to_datetime(
+            frame["valid_from"], errors="coerce"
+        ).dt.normalize()
+        frame["valid_to"] = pd.to_datetime(
+            frame["valid_to"], errors="coerce"
+        ).dt.normalize()
+        if frame["valid_from"].isna().any():
+            raise ReviewWorkspaceError("listing alias valid_from is required")
+        for sid, group in frame.groupby("security_id", sort=False):
+            ordered = group.sort_values("valid_from", kind="stable")
+            prior_to: pd.Timestamp | None = None
+            for item in ordered.itertuples(index=False):
+                if prior_to is not None and pd.Timestamp(item.valid_from) <= prior_to:
+                    raise ReviewWorkspaceError(
+                        f"listing alias intervals overlap for {sid}"
+                    )
+                prior_to = (
+                    pd.Timestamp.max.normalize()
+                    if pd.isna(item.valid_to)
+                    else pd.Timestamp(item.valid_to)
+                )
+        return frame[columns].drop_duplicates().sort_values(
             ["security_id", "valid_from", "ticker"], kind="stable"
         ).reset_index(drop=True)
 
@@ -1227,11 +1630,24 @@ class USPITReviewWorkspaceAssembler:
         approved_at: datetime,
     ) -> dict[str, dict[str, Any]]:
         receipts: dict[str, dict[str, Any]] = {}
-        for path in sorted(root.glob("*.parquet")):
+        paths = list(root.glob("*.parquet"))
+        for manifest_name in (
+            _ALIAS_REVIEW_MANIFEST,
+            _ACTION_AMENDMENT_MANIFEST,
+        ):
+            manifest_path = root / manifest_name
+            if manifest_path.is_file():
+                paths.append(manifest_path)
+        for path in sorted(paths):
             if not path.is_file():
                 continue
+            media_type = (
+                "application/json"
+                if path.suffix.lower() == ".json"
+                else "application/vnd.apache.parquet"
+            )
             reference = self.store.put_bytes(
-                path.read_bytes(), media_type="application/vnd.apache.parquet"
+                path.read_bytes(), media_type=media_type
             )
             receipts[path.name] = {
                 "object_sha256": reference.sha256,

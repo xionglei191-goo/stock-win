@@ -610,6 +610,70 @@ class USPITCoreTests(unittest.TestCase):
             {issue.code for issue in release_without_calendar.quality_report.issues},
         )
 
+    def test_next_open_uses_predecessor_then_verified_identity_successor(self) -> None:
+        successor_id = "us_isin_us0378339999"
+        decision = pd.Timestamp("2024-01-31")
+        next_session = pd.Timestamp("2024-02-01")
+        memberships = pd.DataFrame(
+            [{"decision_date": decision, "security_id": SECURITY_ID}]
+        )
+        signal = pd.DataFrame(
+            [{
+                "decision_date": decision,
+                "security_id": SECURITY_ID,
+                "date": decision,
+            }]
+        )
+        action = pd.DataFrame(
+            [{
+                "security_id": SECURITY_ID,
+                "successor_security_id": successor_id,
+                "action_type": "SPLIT",
+                "effective_at": "2024-02-01T09:30:00-05:00",
+                "terms_verified": True,
+            }]
+        )
+        calendar = pd.DatetimeIndex([decision, next_session])
+
+        def issues_for(
+            raw_security_on_next: str | None,
+            *,
+            include_signal_close: bool = True,
+        ) -> list[object]:
+            raw_rows = [{"security_id": SECURITY_ID, "date": decision}]
+            if raw_security_on_next is not None:
+                raw_rows.append(
+                    {"security_id": raw_security_on_next, "date": next_session}
+                )
+            signal_rows = signal if include_signal_close else signal.assign(
+                date=pd.Timestamp("2024-01-30")
+            )
+            issues: list[object] = []
+            self.validator._validate_decision_and_next_open(
+                {
+                    "bars_raw": pd.DataFrame(raw_rows),
+                    "bars_pit_signal": signal_rows,
+                    "corporate_actions": action,
+                    "session_exceptions": _empty_artifact("session_exceptions"),
+                },
+                memberships,
+                calendar,
+                issues,
+            )
+            return issues
+
+        self.assertEqual([], issues_for(SECURITY_ID))
+        self.assertEqual([], issues_for(successor_id))
+        self.assertEqual(
+            ["MISSING_DECISION_EXECUTION_BAR"],
+            [issue.code for issue in issues_for(None)],
+        )
+        signal_issue = issues_for(SECURITY_ID, include_signal_close=False)
+        self.assertEqual(
+            1,
+            signal_issue[0].evidence["missing_signal_close"],
+        )
+
     def test_unrelated_official_sources_cannot_certify_normalized_rows(self) -> None:
         sources = self._sources()
         artifacts = _ready_artifacts(sources)

@@ -94,7 +94,8 @@ class USBacktestDataset:
         if release.status != ReleaseStatus.DATA_READY or report.status != ReleaseStatus.DATA_READY:
             raise ValueError(f"PIT release is not DATA_READY: {release.release_id}")
         if not report.includes_delisted:
-            raise ValueError("PIT release lacks derived delisting coverage")
+            if not bool(report.metrics.get("scope_c_exclusion_set_sha256")):
+                raise ValueError("PIT release lacks derived delisting coverage")
 
         membership = release.load_frame("membership_monthly")
         membership["decision_date"] = pd.to_datetime(

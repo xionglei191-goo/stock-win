@@ -5,6 +5,7 @@ from typing import Any, Iterable, Mapping
 
 import pandas as pd
 
+from .evidence_time import source_available_at as _source_available_at
 from .models import SourceDependency, SourceRole, UNIVERSE_ID
 
 
@@ -15,25 +16,6 @@ class MembershipReplayResult:
     gaps: tuple[dict[str, Any], ...]
     reconciled_anchor_count: int
     explanations: tuple[dict[str, Any], ...] = ()
-
-
-def _source_available_at(source: SourceDependency) -> pd.Timestamp:
-    metadata = dict(source.metadata)
-    published = pd.to_datetime(source.published_at, errors="coerce", utc=True)
-    observed = pd.to_datetime(source.observed_at, errors="coerce", utc=True)
-    publication_verified = bool(
-        metadata.get("publication_time_from_payload") is True
-        or (
-            source.source_id == "sec_nport_ivv"
-            and metadata.get("series_id_verified_in_payload") is True
-            and metadata.get("accepted_at") == source.published_at
-        )
-    )
-    if publication_verified and not pd.isna(published):
-        return published
-    if pd.isna(published) or pd.isna(observed):
-        return pd.NaT
-    return max(published, observed)
 
 
 def _is_causal_sec_anchor(source: SourceDependency) -> bool:

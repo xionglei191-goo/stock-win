@@ -18,7 +18,7 @@ from research_platform.us_pit import (
     USPITStore,
     stable_security_id,
 )
-from research_platform.us_pit.hashing import canonical_json_bytes, sha256_file
+from research_platform.us_pit.hashing import canonical_json_bytes, sha256_file, sha256_json
 from research_platform.us_pit.official_normalize import OfficialNormalizationResult
 from research_platform.us_pit.quality import REQUIRED_ARTIFACT_COLUMNS
 
@@ -257,6 +257,150 @@ class ReviewWorkspaceTests(unittest.TestCase):
         resolved = _candidate_identity_components(values)
         self.assertEqual(resolved["old"], "us_isin_us0378331005")
         self.assertEqual(resolved["new"], "us_isin_us0378331005")
+
+    def test_review_suffix_and_real_exchange_mic_create_cboe_alias(self) -> None:
+        resolved = pd.DataFrame(
+            [
+                {
+                    "security_id": "us_isin_us12503m1080",
+                    "ticker": pd.NA,
+                    "ticker_review": "CBOE",
+                    "exchange": pd.NA,
+                    "exchange_review": "Cboe BZX",
+                    "valid_from_resolved": pd.Timestamp("2018-01-31"),
+                    "valid_to_resolved": pd.NaT,
+                },
+                {
+                    "security_id": "us_isin_us78462f1030",
+                    "ticker": "SPY",
+                    "exchange": "NYSE Arca",
+                    "valid_from_resolved": pd.Timestamp("1993-01-29"),
+                    "valid_to_resolved": pd.NaT,
+                },
+            ]
+        )
+
+        aliases = USPITReviewWorkspaceAssembler._listing_aliases(resolved)
+        cboe = aliases.loc[
+            aliases["security_id"].eq("us_isin_us12503m1080")
+        ].iloc[0]
+        spy = aliases.loc[
+            aliases["security_id"].eq("us_isin_us78462f1030")
+        ].iloc[0]
+        self.assertEqual((cboe["vendor_code"], cboe["exchange"]), ("CBOE.US", "BATS"))
+        self.assertEqual("ARCX", spy["exchange"])
+
+    def test_reviewed_aliases_replace_automatic_lineage_intervals(self) -> None:
+        resolved = pd.DataFrame(
+            [
+                {
+                    "security_id": "us_isin_us3696043013",
+                    "ticker": "GE",
+                    "exchange": "NYSE",
+                    "valid_from_resolved": pd.Timestamp("2021-08-31"),
+                    "valid_to_resolved": pd.NaT,
+                }
+            ]
+        )
+        review = pd.DataFrame(
+            [
+                {
+                    "security_id": "us_isin_us3696041033",
+                    "ticker": "GE",
+                    "vendor_code": "GE.US",
+                    "exchange_mic": "XNYS",
+                    "valid_from": "2018-08-17",
+                    "valid_to": "2021-07-30",
+                },
+                {
+                    "security_id": "us_isin_us3696043013",
+                    "ticker": "GE",
+                    "vendor_code": "GE.US",
+                    "exchange_mic": "XNYS",
+                    "valid_from": "2021-08-02",
+                    "valid_to": None,
+                },
+            ]
+        )
+
+        aliases = USPITReviewWorkspaceAssembler._listing_aliases(resolved, review)
+        self.assertEqual(2, len(aliases))
+        successor = aliases.loc[
+            aliases["security_id"].eq("us_isin_us3696043013")
+        ].iloc[0]
+        self.assertEqual(pd.Timestamp("2021-08-02"), successor["valid_from"])
+
+    def test_listing_alias_review_requires_hash_bound_package(self) -> None:
+        path = self.root / "listing_alias_review.parquet"
+        manifest_path = self.root / "listing_alias_review_manifest.json"
+        columns = [
+            "alias_review_id", "binding_type", "security_id", "ticker",
+            "vendor_code", "exchange_mic", "valid_from", "valid_to",
+            "action_id", "evidence_source_id", "evidence_sha256", "approved",
+            "review_note", "approved_by", "approved_at", "approval_id",
+        ]
+        pd.DataFrame(columns=columns).to_parquet(path, index=False)
+        assembler = USPITReviewWorkspaceAssembler(self.store)
+        with self.assertRaisesRegex(ReviewWorkspaceError, "package manifest"):
+            assembler._read_listing_alias_review(
+                path, manifest_path, (), pd.DataFrame()
+            )
+
+        identity = {
+            "format_version": "us-pit-listing-alias-review-package-v1",
+            "listing_alias_review_sha256": sha256_file(path),
+            "row_count": 0,
+            "approved_by": "reviewer",
+            "approved_at": "2026-08-29T00:00:00+00:00",
+        }
+        manifest = {**identity, "package_id": sha256_json(identity)}
+        manifest_path.write_bytes(canonical_json_bytes(manifest))
+        accepted = assembler._read_listing_alias_review(
+            path, manifest_path, (), pd.DataFrame()
+        )
+        self.assertTrue(accepted.empty)
+
+        manifest["row_count"] = 1
+        manifest_path.write_bytes(canonical_json_bytes(manifest))
+        with self.assertRaisesRegex(ReviewWorkspaceError, "identity"):
+            assembler._read_listing_alias_review(
+                path, manifest_path, (), pd.DataFrame()
+            )
+
+    def test_listing_alias_intervals_reject_overlap(self) -> None:
+        resolved = pd.DataFrame(
+            [
+                {
+                    "security_id": "us_isin_us0378331005",
+                    "ticker": "AAPL",
+                    "exchange": "XNAS",
+                    "valid_from_resolved": pd.Timestamp("2020-01-01"),
+                    "valid_to_resolved": pd.NaT,
+                }
+            ]
+        )
+        review = pd.DataFrame(
+            [
+                {
+                    "security_id": "us_isin_us0378331005",
+                    "ticker": "AAPL",
+                    "vendor_code": "AAPL.US",
+                    "exchange_mic": "XNAS",
+                    "valid_from": "2020-01-01",
+                    "valid_to": "2024-01-31",
+                },
+                {
+                    "security_id": "us_isin_us0378331005",
+                    "ticker": "AAPL",
+                    "vendor_code": "AAPL.US",
+                    "exchange_mic": "XNAS",
+                    "valid_from": "2024-01-31",
+                    "valid_to": None,
+                },
+            ]
+        )
+        with self.assertRaisesRegex(ReviewWorkspaceError, "overlap"):
+            USPITReviewWorkspaceAssembler._listing_aliases(resolved, review)
 
     def test_missing_review_produces_immutable_blocked_workspace(self) -> None:
         dependency = self._dependency()
